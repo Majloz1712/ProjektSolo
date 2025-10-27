@@ -1,0 +1,12 @@
+# Node.js
+node_modules/
+.env
+*.log
+
+# Systemowe
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
