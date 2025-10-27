@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Aplikacja Sondowa – Panel</title>
+  <link rel="stylesheet" href="/styl/styles.css" />
+
+  <!-- Minimalne style layoutu (nie gryzą się z Twoim styles.css) -->
+  
+</head>
+<body class="app">
+  <header class="app-header">
+    <div class="app-brand">
+      <button class="app-hamburger" id="btnHamburger" aria-label="Menu">&#9776;</button>
+      <div class="app-logo">LOGO</div>
+      <div>Aplikacja Sondowa</div>
+    </div>
+
+    <div class="app-userbox">
+      <div class="app-name" id="currentUser">Jan Kowalski</div>
+      <button class="app-avatar-btn" id="btnUser" aria-haspopup="menu" aria-expanded="false">👤</button>
+      <div class="app-usermenu" id="userMenu" role="menu" aria-label="Menu użytkownika">
+        <button data-action="change-password">Zmień hasło</button>
+        <button data-action="account-settings">Ustawienia konta</button>
+        <button data-action="logout">Wyloguj</button>
+      </div>
+    </div>
+  </header>
+
+   <div class="app-layout">
+    <aside class="app-sidebar" id="sidebar">
+      <button class="app-nav-btn" data-view="moje-sondy">Moje sondy</button>
+      <button class="app-nav-btn" data-view="dodaj-sonde">Dodaj sondę</button>
+      <button class="app-nav-btn" data-view="edytuj-sonde">Edytuj sondę</button>
+      <button class="app-nav-btn" data-view="usun-sonde">Usuń sondę</button>
+      <button class="app-nav-btn" data-view="statystyki">Statystyki</button>
+      <button class="app-nav-btn app-nav-btn--logout" data-view="wyloguj">Wyloguj</button>
+    </aside>
+
+    <main id="content" class="app-content" aria-live="polite">Wczytywanie…</main>
+  </div>
+
+  <!-- FOOTER -->
+  <footer class="app-footer">© 2025 Twoja Aplikacja Sondowa • <a class="link" href="#">Kontakt</a></footer>
+</body>
+
+  <script src="/skrypt/app.js"></script>
+<script>
+  // ====== USTAWIENIA UŻYTKOWNIKA (imię z localStorage) ======
+  (function fillUserName(){
+    try {
+      const name = localStorage.getItem("userFullname") || "Jan Kowalski";
+      document.getElementById("currentUser").textContent = name;
+    } catch {}
+  })();
+
+  // ====== MENU UŻYTKOWNIKA ======
+  (function userMenu(){
+    const btn = document.getElementById("btnUser");
+    const menu = document.getElementById("userMenu");
+    btn.addEventListener("click", () => {
+      const open = menu.classList.toggle("open");
+      btn.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+    document.addEventListener("click", (e) => {
+      if (!menu.contains(e.target) && e.target !== btn) menu.classList.remove("open");
+    });
+
+    menu.addEventListener("click", (e) => {
+      const act = e.target?.dataset?.action;
+      if (!act) return;
+      if (act === "logout") logoutUser();
+      if (act === "change-password") window.location.href = "/resetHasla.html";
+      if (act === "account-settings") alert("Ustawienia konta – w przygotowaniu.");
+    });
+  })();
+
+  // ====== SIDEBAR / HAMBURGER ======
+  (function sidebar(){
+    const sidebar = document.getElementById("sidebar");
+    const burger = document.getElementById("btnHamburger");
+    burger.addEventListener("click", () => sidebar.classList.toggle("open"));
+    sidebar.addEventListener("click", (e) => {
+      if (e.target.matches(".app-nav-btn")) sidebar.classList.remove("open");
+    });
+  })();
+
+  // ====== FUNKCJA INICJALIZUJĄCA FORMULARZ "DODAJ SONDĘ" ======
+  function initDodajSonde(root) {
+    const form      = root.querySelector('#formAddProbe');
+    if (!form) return;
+
+    const nameEl    = root.querySelector('#probeName');
+    const urlEl     = root.querySelector('#probeUrl');
+    const intValEl  = root.querySelector('#intervalValue');
+    const intUnitEl = root.querySelector('#intervalUnit');
+    const promptEl  = root.querySelector('#llmPrompt');
+    const msgEl     = root.querySelector('#formMessages');
+    const counterEl = root.querySelector('#promptCounter');
+    const btnAdd    = root.querySelector('#btnAdd');
+
+    // licznik znaków
+    const updateCounter = () => {
+      counterEl.textContent = (promptEl.value?.length || 0) + ' / ' + promptEl.maxLength;
+    };
+    promptEl?.addEventListener('input', updateCounter);
+    updateCounter();
+
+    const isValidUrl = (v) => {
+      try { const u = new URL(v); return u.protocol === 'http:' || u.protocol === 'https:'; }
+      catch { return false; }
+    };
+    const showMessage = (t, ok=false) => {
+      msgEl.textContent = t;
+      msgEl.className = 'messages ' + (ok ? 'msg-ok' : 'msg-error');
+    };
+    const clearErrors = () => {
+      [nameEl, urlEl, intValEl, intUnitEl].forEach(el => el?.classList.remove('error'));
+      showMessage('');
+    };
+
+    form.addEventListener('reset', () => setTimeout(() => { updateCounter(); clearErrors(); }, 0));
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      clearErrors();
+
+      const nazwa = nameEl.value.trim();
+      const url   = urlEl.value.trim();
+      const val   = Number(intValEl.value);
+      const unit  = intUnitEl.value; // 'second' | 'minute' | 'hour'
+      const llm_prompt = (promptEl.value || '').trim() || null;
+
+      if (!nazwa) { nameEl.classList.add('error'); return showMessage('Podaj nazwę sondy.'); }
+      if (!isValidUrl(url)) { urlEl.classList.add('error'); return showMessage('Podaj poprawny URL (http/https).'); }
+      if (!val || val < 1) { intValEl.classList.add('error'); return showMessage('Częstotliwość musi być ≥ 1.'); }
+      if (!unit) { intUnitEl.classList.add('error'); return showMessage('Wybierz jednostkę czasu.'); }
+
+      const multiplier = unit === 'hour' ? 3600 : (unit === 'minute' ? 60 : 1);
+      const interval_seconds = val * multiplier;
+
+      const payload = { name: nazwa, url, interval_seconds, prompt: llm_prompt };
+
+      try {
+        btnAdd.disabled = true;
+        const res = await fetch('/api/monitory', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }, // JWT doda się automatycznie
+          body: JSON.stringify(payload)
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err?.message || 'Nie udało się dodać sondy.');
+        }
+        showMessage('Sonda została dodana.', true);
+        form.reset(); updateCounter();
+      } catch (err) {
+        showMessage(err.message || 'Wystąpił błąd. Spróbuj ponownie.');
+      } finally {
+        btnAdd.disabled = false;
+      }
+    });
+  }
+  function msRenderCard(item){
+    const interval = (s) => {
+      if (!s || s < 60) return `${s ?? '?'} s`;
+      if (s < 3600) return `${Math.round(s/60)} min`;
+      return `${(s/3600).toFixed(1)} h`;
+    };
+    const last = item.last_check_at ? new Date(item.last_check_at).toLocaleString() : '—';
+    const statusBadge =
+      item.status === 'paused' ? 'Wstrzymana' :
+      item.status === 'error'  ? 'Błąd' :
+      'Aktywna';
+
+    return `
+      <div class="card" data-id="${item.id}">
+        <div class="card-body" style="padding:18px">
+          <div style="display:flex; justify-content:space-between; gap:12px; align-items:center;">
+            <div>
+              <div style="font-weight:700; font-size:1.05rem">${item.name}</div>
+              <div class="hint" style="margin-top:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${item.url}</div>
+            </div>
+            <div class="hint" style="text-align:right; min-width:180px;">
+              <div><strong>Interwał:</strong> ${interval(item.interval_seconds)}</div>
+              <div><strong>Ostatnie sprawdz.</strong> ${last}</div>
+              <div><strong>Status:</strong> ${statusBadge}</div>
+            </div>
+          </div>
+
+          <div class="row" style="margin-top:14px; display:flex; justify-content:flex-end; gap:10px;">
+            <button class="btn" data-action="toggle">${item.status==='paused' ? 'Uruchom' : 'Wstrzymaj'}</button>
+            <button class="btn" data-action="logs">Logi</button>
+            <button class="btn" data-action="delete" style="background:linear-gradient(135deg, var(--accent-red), #ff8a80)">Usuń</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // ==== Inicjalizacja widoku "Moje sondy" ====
+  function initMojeSondy(root){
+    const listEl   = root.querySelector('#msList');
+    if (!listEl) return; // nie jesteśmy na tym widoku
+
+    const emptyEl  = root.querySelector('#msEmpty');
+    const infoEl   = root.querySelector('#msInfo');
+    const searchEl = root.querySelector('#msSearch');
+    const statusEl = root.querySelector('#msStatus');
+    const limitEl  = root.querySelector('#msLimit');
+    const refresh  = root.querySelector('#msRefresh');
+    const prevBtn  = root.querySelector('#msPrev');
+    const nextBtn  = root.querySelector('#msNext');
+
+    let page = 1;
+    let total = 0;
+    let pageSize = Number(limitEl?.value || 20);
+
+    const qs = () => {
+      const p = new URLSearchParams();
+      p.set('mine', '1');                     // backend zwraca tylko bieżącego użytkownika
+      if (searchEl.value.trim()) p.set('q', searchEl.value.trim());
+      if (statusEl.value) p.set('status', statusEl.value);
+      p.set('page', String(page));
+      p.set('limit', String(pageSize));
+      return p.toString();
+    };
+
+    const setLoading = (on) => {
+      if (on) { infoEl.textContent = 'Ładowanie…'; }
+      else    { infoEl.textContent = ''; }
+      [refresh, prevBtn, nextBtn, searchEl, statusEl, limitEl].forEach(b => b && (b.disabled = !!on));
+    };
+
+    async function load(){
+      setLoading(true);
+      try {
+        const res = await fetch('/api/monitory?' + qs(), { cache: 'no-store' });
+        if (!res.ok) throw new Error('Nie udało się pobrać listy.');
+        // Oczekiwany kształt: { items: [...], total: N, page: 1, pageSize: 20 }
+        const data = await res.json();
+        const items = Array.isArray(data?.items) ? data.items : (Array.isArray(data) ? data : []);
+        total = Number(data?.total ?? items.length);
+        pageSize = Number(data?.pageSize ?? pageSize);
+
+        listEl.innerHTML = items.map(msRenderCard).join('');
+        emptyEl.style.display = items.length ? 'none' : 'block';
+
+        const from = (page-1)*pageSize + 1;
+        const to   = (page-1)*pageSize + items.length;
+        infoEl.textContent = items.length ? `Pozycje ${from}–${to} z ${total}` : '';
+        prevBtn.disabled = page <= 1;
+        nextBtn.disabled = to >= total;
+      } catch (e){
+        listEl.innerHTML = `<div class="hint">Błąd: ${e.message || e}</div>`;
+        emptyEl.style.display = 'none';
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    // Zdarzenia
+    refresh?.addEventListener('click', () => load());
+    searchEl?.addEventListener('input', () => { page = 1; load(); });
+    statusEl?.addEventListener('change', () => { page = 1; load(); });
+    limitEl?.addEventListener('change', () => { page = 1; pageSize = Number(limitEl.value||20); load(); });
+    prevBtn?.addEventListener('click', () => { if (page>1){ page--; load(); }});
+    nextBtn?.addEventListener('click', () => { page++; load(); });
+
+    // Akcje na listcie (delegacja)
+    listEl.addEventListener('click', async (e) => {
+      const btn = e.target.closest('button[data-action]');
+      if (!btn) return;
+      const card = btn.closest('.card[data-id]');
+      const id = card?.dataset?.id;
+      const action = btn.dataset.action;
+
+      try {
+        if (action === 'delete'){
+          if (!confirm('Na pewno usunąć sondę?')) return;
+          const r = await fetch(`/api/monitory/${id}`, { method: 'DELETE' });
+          if (!r.ok) throw new Error('Nie udało się usunąć.');
+          await load();
+          return;
+        }
+        if (action === 'toggle'){
+          // przełączenie active/paused
+          const r = await fetch(`/api/monitory/${id}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ toggle: true })
+          });
+          if (!r.ok) throw new Error('Nie udało się zmienić statusu.');
+          await load();
+          return;
+        }
+        if (action === 'logs'){
+          // prosty podgląd logów—jeśli masz endpoint, otworzy nowe okno
+          window.open(`/api/monitory/${id}/logs`, '_blank');
+        }
+      } catch (err){
+        alert(err.message || 'Operacja nie powiodła się.');
+      }
+    });
+
+    // Start
+    load();
+  }
+  // ====== DYNAMICZNE WIDOKI ======
+  async function loadView(name){
+    const content = document.getElementById("content");
+    content.textContent = "Wczytywanie…";
+    try {
+      if (name === "wyloguj") { logoutUser(); return; }
+
+      const res = await fetch(`/widoki/${name}.html`, { cache: "no-store" });
+      if (!res.ok) throw new Error("Brak widoku");
+
+      const html = await res.text();
+      content.innerHTML = html;
+
+      // podłączanie logik do widoków
+      initDodajSonde(content); // już było
+      initMojeSondy(content);  // ⬅ NOWE
+
+      // aktywny przycisk + hash
+      document.querySelectorAll(".app-nav-btn")
+        .forEach(b => b.dataset.active = (b.dataset.view === name));
+      history.replaceState(null, "", `#view=${encodeURIComponent(name)}`);
+    } catch (e) {
+      console.error("Błąd ładowania widoku:", e);
+      content.innerHTML = `<div class="card"><p>Nie udało się wczytać widoku <strong>${name}</strong>.</p></div>`;
+    }
+  }
+
+
+  // ====== OBSŁUGA KLIKNIĘĆ W SIDEBAR ======
+  document.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-view]");
+    if (!btn) return;
+    const view = btn.getAttribute("data-view");
+    loadView(view);
+  });
+
+  // ====== START: wczytaj widok z hash lub domyślnie „moje-sondy” ======
+  (function boot(){
+    const fromHash = location.hash.match(/view=([^&]+)/)?.[1];
+    loadView(fromHash || "moje-sondy");
+  })();
+</script>
+</html>
+
+

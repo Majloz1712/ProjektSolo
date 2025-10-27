@@ -1,0 +1,32 @@
+.
+|____readme.txt
+|____.env
+|____styl
+| |____styles.css
+|____package.json
+|____.git
+|____strona
+| |____resetHasla.html
+| |____panel.html
+| |____widoki
+| | |____dodaj-sonde.html
+| | |____moje-sondy.html
+| |____rejestracja.html
+| |____logowanie.html
+|____app
+|____logs
+|____package-lock.json
+|____src
+|____skrypt
+| |____.env
+| |____serwerStart.js
+| |____jwt.js
+| |____routes
+| | |____jwt.js
+| | |____monitory.js
+| | |____auth.js
+| |____app.js
+| |____polaczeniePG.js
+| |____polaczenieMDB.js
+|____img
+|____struktura_czysta.txt

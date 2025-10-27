@@ -1,0 +1,397 @@
+:root {
+  --bg: #121212;           /* Tło ciemne */
+  --text: #eeeeee;         /* Tekst jasny */
+  --accent-blue: #00bcd4;  /* Niebieski akcent */
+  --accent-purple: #e040fb;/* Purpurowy akcent */
+  --accent-red: #ef5350;   /* Czerwony akcent */
+  --muted: #1e1e1e;        /* Dodatkowy ciemny */
+  --muted-2: #2a2a2a;      /* Obramowania */
+  --ok: #00e676;           /* Zielony komunikat */
+  --shadow: 0 10px 30px rgba(0,0,0,.45);
+  --radius: 16px;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Inter, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji";
+  background: radial-gradient(1200px 1200px at 85% -10%, rgba(224,64,251,.15), transparent 60%),
+              radial-gradient(1000px 1000px at -10% 100%, rgba(0,188,212,.12), transparent 60%),
+              var(--bg);
+  color: var(--text);
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.card {
+  width: 100%;
+  max-width: 420px;
+  background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02));
+  border: 1px solid var(--muted-2);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  position: relative;
+  isolation: isolate;
+}
+
+.card::before {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  background: linear-gradient(135deg, rgba(0,188,212,.35), rgba(224,64,251,.35));
+  filter: blur(24px);
+  z-index: -1;
+}
+
+header {
+  padding: 28px 28px 0 28px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logo {
+  width: 36px;
+  height: 36px;
+  border-radius: 9px;
+  background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+  display: grid;
+  place-items: center;
+  font-weight: 800;
+  color: #001015;
+  letter-spacing: .5px;
+}
+
+.title {
+  margin: 0;
+  font-size: 1.15rem;
+  font-weight: 700;
+}
+
+.subtitle {
+  margin: 2px 0 0 0;
+  font-size: .9rem;
+  color: #cfcfcf;
+}
+
+form { padding: 22px 28px 28px 28px; }
+.field { margin-top: 16px; }
+label {
+  display: block;
+  font-size: .9rem;
+  margin-bottom: 8px;
+  color: #dcdcdc;
+}
+
+.input {
+  width: 100%;
+  background: var(--muted);
+  border: 1px solid var(--muted-2);
+  color: var(--text);
+  padding: 14px 14px;
+  border-radius: 12px;
+  outline: none;
+  transition: border-color .2s ease, box-shadow .2s ease, transform .06s ease;
+}
+.input:focus {
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 4px rgba(0,188,212,.2);
+}
+.input.error {
+  border-color: var(--accent-red);
+  box-shadow: 0 0 0 4px rgba(239,83,80,.18);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  user-select: none;
+  cursor: pointer;
+}
+.checkbox input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent-purple);
+}
+
+.link {
+  color: var(--accent-blue);
+  text-decoration: none;
+  font-size: .9rem;
+}
+.link:hover { text-decoration: underline; }
+
+.btn {
+  width: 100%;
+  margin-top: 18px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  border: none;
+  font-weight: 700;
+  letter-spacing: .2px;
+  color: #001015;
+  background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+  cursor: pointer;
+  transition: transform .06s ease, filter .2s ease;
+}
+.btn:hover { filter: brightness(1.05); }
+.btn:active { transform: translateY(1px); }
+.btn:disabled { opacity: .6; cursor: not-allowed; }
+
+.messages {
+  margin-top: 14px;
+  min-height: 22px;
+  font-size: .92rem;
+}
+.msg-error { color: var(--accent-red); }
+.msg-ok { color: var(--ok); }
+
+.footer {
+  padding: 18px 24px 26px 24px;
+  border-top: 1px dashed var(--muted-2);
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  flex-wrap: wrap;
+  font-size: .9rem;
+  color: #cfcfcf;
+}
+
+.toggle-pass {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: none;
+  color: #cfcfcf;
+  cursor: pointer;
+  font-size: .95rem;
+}
+
+.rel { position: relative; }
+
+.hint {
+  margin-top: 8px;
+  font-size: .85rem;
+  color: #bdbdbd;
+}
+
+@media (max-width: 480px) {
+  .card { max-width: 100%; }
+  header { padding: 22px 22px 0 22px; }
+  form { padding: 18px 22px 22px 22px; }
+  .footer { padding: 16px 18px 22px 18px; }
+}
+
+/* ====== APP LAYOUT (NAMESPACED) ====== */
+/* Włącza pełnoekranowy layout TYLKO na stronach z klasą <body class="app"> */
+body.app {
+  margin: 0;
+  padding: 0;
+  display: block;              /* nadpisuje grid+center z auth */
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+/* Siatka: sidebar + content */
+.app-layout {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  min-height: calc(100vh - 56px); /* 56px = wysokość nagłówka */
+}
+
+/* Pasek u góry */
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: var(--muted);
+  border-bottom: 1px solid var(--muted-2);
+  height: 56px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.app-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 700;
+  letter-spacing: .5px;
+}
+
+/* Unikamy kolizji z .logo -> osobna klasa na logo w panelu */
+.app-logo {
+  background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+  color: #001015;
+  padding: 6px 10px;
+  border: 1px solid #00bcd440;
+  border-radius: 10px;
+  font-weight: 800;
+}
+
+/* Prawy box użytkownika */
+.app-userbox { display: flex; align-items: center; gap: 10px; position: relative; }
+.app-userbox .app-name { opacity: .9; }
+.app-avatar-btn { cursor: pointer; border: none; background: transparent; font-size: 22px; line-height: 1; color: var(--text); }
+.app-usermenu {
+  position: absolute; right: 0; top: calc(100% + 8px);
+  background: var(--muted); border: 1px solid var(--muted-2);
+  border-radius: 12px; overflow: hidden; display: none; min-width: 190px; z-index: 20;
+}
+.app-usermenu.open { display: block; }
+.app-usermenu button, .app-usermenu a {
+  display: block; width: 100%; text-align: left; padding: 10px 12px;
+  background: none; border: none; color: var(--text); cursor: pointer;
+}
+.app-usermenu button:hover, .app-usermenu a:hover { background: #ffffff14; }
+
+/* Sidebar – pełna wysokość + „Wyloguj” na dole */
+.app-sidebar {
+  background: var(--muted);
+  border-right: 1px solid var(--muted-2);
+  padding: 12px;
+  height: calc(100vh - 56px);
+  position: sticky;
+  top: 56px;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-nav-btn {
+  width: 100%;
+  display: block;
+  padding: 10px 12px;
+  margin: 6px 0;
+  border-radius: 10px;
+  border: 1px solid var(--muted-2);
+  background: #181818;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+.app-nav-btn:hover { background: #00bcd410; border-color: var(--accent-blue); }
+.app-nav-btn[data-active="true"] { background: #00bcd420; border-color: var(--accent-blue); }
+
+/* „Wyloguj” zawsze na dole */
+.app-nav-btn--logout {
+  margin-top: auto;       /* spycha do dołu w kolumnie */
+  position: sticky;
+  bottom: 12px;           /* lekki odstęp od dolnej krawędzi */
+}
+
+/* Główna treść */
+.app-content .card{
+  max-width: 66.666%;
+  margin: 16px auto;  /* center */
+}
+
+/* Hamburger (mobile) */
+.app-hamburger { display: none; margin-right: 8px; font-size: 22px; border: none; background: transparent; color: var(--text); cursor: pointer; }
+
+/* Responsywność */
+@media (max-width: 980px) {
+  .app-layout { grid-template-columns: 1fr; }
+  .app-sidebar {
+    position: fixed; left: 0; top: 56px; width: 260px;
+    height: calc(100vh - 56px); transform: translateX(-100%);
+    transition: transform .2s ease; z-index: 15;
+  }
+  .app-sidebar.open { transform: translateX(0); }
+  .app-hamburger { display: inline-block; }
+}
+
+/* Stopka panelu */
+.app-footer {
+  border-top: 1px solid var(--muted-2);
+  padding: 12px 16px;
+  color: #bbb;
+  background: var(--muted);
+}
+
+
+/* karta dalej na całą szerokość obszaru treści */
+.card.card--full{
+  width: 100%;
+  max-width: none;
+  /* nic nie zmieniamy w tle/kolorach – zostaje */
+}
+
+/* FORMULARZ: wyśrodkowany i ~2/3 szerokości */
+.card.card--full .card-body{
+  width: 66.666%;      /* ~2/3 pola */
+  margin-left: auto;   /* wyśrodkowanie */
+  margin-right: auto;  /* wyśrodkowanie */
+}
+
+/* na średnich ekranach lekko szerzej, na małych 100% */
+@media (max-width: 1200px){
+  .card.card--full .card-body{ width: 80%; }
+  .app-content .card{ max-width: 80%; }
+}
+@media (max-width: 900px){
+  .card.card--full .card-body{ width: 100%; }
+  .app-content .card{ max-width: 100%; }
+}
+
+
+
+/* upewnij się, że inputy rozciągają się do szerokości wrappera */
+.card.card--full .field .input,
+.card.card--full .field textarea,
+.card.card--full .row > .input,
+.card.card--full .row select{
+  width: 100%;
+}
+
+.app-content .card .input,
+.app-content .card textarea,
+.app-content .card .row > .input,
+.app-content .card .row select{
+  width: 100%;
+}
+
+/* rząd: liczba + jednostka */
+.card.card--full .row{
+  display: grid;
+  grid-template-columns: 1fr 180px; /* szerzej dla selecta */
+  gap: 12px;
+}
+
+/* przyciski – trzymajmy przy prawej, ale w obrębie 2/3 */
+.card.card--full .row:last-child{
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.app-content .card .row{
+  display: grid;
+  grid-template-columns: 1fr 180px; /* input liczbowy + select */
+  gap: 12px;
+}
+
+/* Przyciski na dole przy prawej krawędzi karty */
+.app-content .card .row:last-child{
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
