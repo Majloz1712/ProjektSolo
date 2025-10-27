@@ -3,25 +3,25 @@
   <div class="card-body">
     <h2 style="margin:0 0 12px 0;">Moje sondy</h2>
 
-    <div class="row" style="margin: 12px 0 6px 0;">
-      <input id="msSearch" class="input" placeholder="Szukaj po nazwie lub URL…" />
-      <select id="msStatus" class="input" style="max-width:180px">
-        <option value="">Wszystkie</option>
-        <option value="active">Aktywne</option>
-        <option value="paused">Wstrzymane</option>
-        <option value="error">Z błędem</option>
-      </select>
-    </div>
+<div class="row" style="margin: 12px 0 6px 0; align-items: center;">
+  <input id="msSearch" class="input" placeholder="Szukaj po nazwie lub URL…" />
+  <select id="msStatus" class="input" style="max-width:180px">
+    <option value="">Wszystkie</option>
+    <option value="active">Aktywne</option>
+    <option value="paused">Wstrzymane</option>
+    <option value="error">Z błędem</option>
+  </select>
+</div>
 
-    <div class="row" style="margin: 6px 0 16px 0;">
-      <button id="msRefresh" class="btn" style="max-width:220px">Odśwież</button>
-      <select id="msLimit" class="input" style="max-width:180px">
-        <option value="10">10 / stronę</option>
-        <option value="20" selected>20 / stronę</option>
-        <option value="50">50 / stronę</option>
-      </select>
-    </div>
-
+<!-- WYRÓWNANIE DO PRAWEJ: select + przycisk w jednym wierszu -->
+<div class="row" style="margin: 6px 0 16px 0; justify-content: flex-end; gap: 12px;">
+  <select id="msLimit" class="input" style="max-width:180px">
+    <option value="10">10 / stronę</option>
+    <option value="20" selected>20 / stronę</option>
+    <option value="50">50 / stronę</option>
+  </select>
+  <button id="msRefresh" class="btn" style="max-width:220px">Odśwież</button>
+</div>
     <div id="msInfo" class="hint"></div>
 
     <div id="msList" style="display:grid; gap:12px;"></div>

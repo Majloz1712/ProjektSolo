@@ -395,3 +395,24 @@ body.app {
   gap: 12px;
 }
 
+/* --- Moje sondy: idealne wyrównanie kart --- */
+#msList {
+  display: grid;
+  gap: 12px;
+}
+/* Karty mają być równo z inputem */
+.card-body > #msList,
+.card > #msList {
+  margin-left: 0 !important;
+  padding-left: 0 !important;
+}
+
+/* Sama karta bez automatycznych marginesów */
+#msList .card {
+  margin: 0 !important;
+  justify-self: stretch;
+  width: 100% !important;
+  max-width: 100% !important;
+  box-sizing: border-box;
+}
+

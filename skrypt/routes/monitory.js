@@ -1,158 +1,130 @@
-// skrypt/routes/monitory.js
-const express = require('express');
-const { verifyJwt } = require('../jwt');
+const express = require("express");
 const router = express.Router();
+const { verifyJwt } = require("../jwt");
 
-function isValidUrl(value) {
-  try { const u = new URL(value); return u.protocol === 'http:' || u.protocol === 'https:'; }
-  catch { return false; }
-}
-
-// Każda trasa poniżej wymaga JWT
-// PRZYKŁADOWY handler GET /api/monitory
+// 🔐 Middleware – wymaga JWT
 router.use(verifyJwt);
-router.get('/', async (req, res) => {
+
+// 📋 Pobierz listę sond użytkownika
+router.get("/", async (req, res) => {
+  const userId = req.user.id;
+  const { q, status } = req.query;
+
+  // BEZPIECZNE liczby
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const limit = Math.max(1, Math.min(100, parseInt(req.query.limit, 10) || 20));
+  const offset = (page - 1) * limit;
+
   try {
-    // 1) Autoryzowany użytkownik
-    const authUserId = req.user?.id;
-    if (!authUserId) {
-      return res.status(401).json({ ok:false, message:'Brak user.id w tokenie.' });
-    }
+    const conds = ["uzytkownik_id = $1"];
+    const params = [userId];
+    let i = 2;
 
-    // 2) Filtry i paginacja
-    const q       = (req.query.q || '').trim();
-    const status  = (req.query.status || '').trim(); // 'active' | 'paused' | 'error' | ''
-    const page    = Math.max(1, parseInt(req.query.page || '1', 10));
-    const limit   = Math.min(100, Math.max(1, parseInt(req.query.limit || '20', 10)));
-    const offset  = (page - 1) * limit;
-
-    // 3) WHERE i parametry
-    const where = ['uzytkownik_id = $1'];
-    const params = [authUserId];
-
-    if (q) {
-      params.push(`%${q}%`);
-      where.push(`(name ILIKE $${params.length} OR url ILIKE $${params.length})`);
-    }
+    if (q) { conds.push(`(nazwa ILIKE $${i} OR url ILIKE $${i})`); params.push(`%${q}%`); i++; }
     if (status) {
-      params.push(status);
-      where.push(`status = $${params.length}`);
+      if (status === "active") conds.push("aktywny = true");
+      if (status === "paused") conds.push("aktywny = false");
+      if (status === "error")  conds.push("aktywny = true"); // placeholder
     }
+    const where = `WHERE ${conds.join(" AND ")}`;
 
-    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
-
-    // 4) Licznik
-    const countSql = `SELECT COUNT(*)::int AS cnt FROM monitory ${whereSql}`;
-    const { rows: cntRows } = await req.pg.query(countSql, params);
-    const total = cntRows[0]?.cnt ?? 0;
-
-    // 5) Dane
-    params.push(limit);
-    params.push(offset);
-    const dataSql = `
-      SELECT id, name, url, interval_seconds, status, last_check_at
+    const listSql = `
+      SELECT 
+        id,
+        nazwa AS name,
+        url,
+        interwal_sec AS interval_seconds,
+        CASE WHEN aktywny THEN 'active' ELSE 'paused' END AS status,
+        utworzono_at AS last_check_at
       FROM monitory
-      ${whereSql}
-      ORDER BY id DESC
-      LIMIT $${params.length-1} OFFSET $${params.length}
+      ${where}
+      ORDER BY utworzono_at DESC
+      LIMIT $${i}::int OFFSET $${i+1}::int
     `;
-    const { rows } = await req.pg.query(dataSql, params);
+    const { rows } = await req.pg.query(listSql, [...params, limit, offset]);
 
-    return res.json({ ok:true, items: rows, total, page, pageSize: limit });
+    const countSql = `SELECT COUNT(*)::int AS total FROM monitory ${where}`;
+    const { rows: cnt } = await req.pg.query(countSql, params);
+
+    res.json({ items: rows, total: cnt[0].total, page, pageSize: limit });
   } catch (err) {
-    console.error('GET /api/monitory error:', err);
-    return res.status(500).json({
-      ok:false,
-      message:'Nie udało się pobrać listy.',
-      // w dev możesz ujawnić więcej:
-      detail: process.env.NODE_ENV === 'production' ? undefined : String(err)
-    });
+    console.error("Błąd GET /monitory:", err);
+    res.status(500).json({ message: "Błąd serwera przy pobieraniu sond." });
   }
 });
 
 
-router.delete('/:id', async (req, res) => {
+// ➕ Dodaj sondę
+router.post("/", async (req, res) => {
+  const userId = req.user.id;
+  const { name, url, interval_seconds, prompt } = req.body;
+
+  if (!name || !url || !interval_seconds)
+    return res.status(400).json({ message: "Brak wymaganych pól." });
+
   try {
-    const { id } = req.params;
-    const uid = req.user?.id;
-    const r = await req.pg.query('DELETE FROM monitory WHERE id = $1 AND user_id = $2 RETURNING id', [id, uid]);
-    if (!r.rowCount) return res.status(404).json({ ok: false, message: 'Nie znaleziono.' });
-    res.json({ ok: true });
+    const { rows } = await req.pg.query(
+      `
+      INSERT INTO monitory (uzytkownik_id, nazwa, url, llm_prompt, interwal_sec, aktywny)
+      VALUES ($1, $2, $3, $4, $5, true)
+      RETURNING id, nazwa AS name, url, interwal_sec AS interval_seconds, aktywny AS active
+      `,
+      [userId, name, url, prompt || null, interval_seconds]
+    );
+    res.status(201).json(rows[0]);
   } catch (err) {
-    console.error('DELETE /api/monitory/:id error:', err);
-    res.status(500).json({ ok: false, message: 'Nie udało się usunąć.' });
+    console.error("Błąd POST /monitory:", err);
+    res.status(500).json({ message: "Nie udało się dodać sondy." });
   }
 });
 
-router.patch('/:id', async (req, res) => {
+// 🔄 Zmień status (toggle)
+router.patch("/:id", async (req, res) => {
+  const userId = req.user.id;
+  const { id } = req.params;
+
   try {
-    const { id } = req.params;
-    const uid = req.user?.id;
-
-    if (req.body?.toggle) {
-      const cur = await req.pg.query('SELECT status FROM monitory WHERE id = $1 AND user_id = $2', [id, uid]);
-      if (!cur.rowCount) return res.status(404).json({ ok: false, message: 'Nie znaleziono.' });
-      const next = cur.rows[0].status === 'paused' ? 'active' : 'paused';
-      const upd = await req.pg.query(
-        'UPDATE monitory SET status = $1 WHERE id = $2 AND user_id = $3 RETURNING id, status',
-        [next, id, uid]
-      );
-      return res.json({ ok: true, monitor: upd.rows[0] });
-    }
-
-    res.status(400).json({ ok: false, message: 'Brak wspieranej operacji.' });
-  } catch (err) {
-    console.error('PATCH /api/monitory/:id error:', err);
-    res.status(500).json({ ok: false, message: 'Nie udało się zaktualizować.' });
-  }
-});
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// POST /api/monitory
-router.post('/', async (req, res) => {
-  try {
-    const pg = req.pg;
-    const userId = req.user.id; // ← z JWT
-
-    const { name, url, interval_seconds, prompt } = req.body || {};
-    if (!name || String(name).trim().length < 2)
-      return res.status(400).json({ ok: false, message: 'Podaj nazwę sondy.' });
-    if (!isValidUrl(url))
-      return res.status(400).json({ ok: false, message: 'Podaj poprawny URL (http/https).' });
-
-    const interwal = Number(interval_seconds);
-    if (!interwal || interwal < 1 || !Number.isFinite(interwal))
-      return res.status(400).json({ ok: false, message: 'Częstotliwość musi być liczbą dodatnią (sekundy).' });
-
-    const { rows } = await pg.query(
-      `INSERT INTO public.monitory
-         (uzytkownik_id, nazwa, url, llm_prompt, interwal_sec)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, uzytkownik_id, nazwa, url, llm_prompt, interwal_sec, aktywny, utworzono_at`,
-      [userId, String(name).trim(), String(url).trim(), (prompt?.trim() || null), interwal]
+    const { rows } = await req.pg.query(
+      `
+      UPDATE monitory
+      SET aktywny = NOT aktywny
+      WHERE id = $1 AND uzytkownik_id = $2
+      RETURNING id, nazwa AS name, aktywny AS active
+      `,
+      [id, userId]
     );
 
-    return res.status(201).json({ ok: true, monitor: rows[0] });
+    if (rows.length === 0)
+      return res.status(404).json({ message: "Nie znaleziono sondy." });
+
+    res.json({
+      message: "Zmieniono status sondy.",
+      item: rows[0],
+    });
   } catch (err) {
-    if (err?.code === '23503') {
-      return res.status(400).json({ ok: false, message: 'Nieprawidłowy uzytkownik_id (FK).' });
-    }
-    console.error('Add monitor error:', err);
-    return res.status(500).json({ ok: false, message: 'Nie udało się dodać sondy.' });
+    console.error("Błąd PATCH /monitory:", err);
+    res.status(500).json({ message: "Nie udało się zmienić statusu." });
+  }
+});
+
+// ❌ Usuń sondę
+router.delete("/:id", async (req, res) => {
+  const userId = req.user.id;
+  const { id } = req.params;
+
+  try {
+    const r = await req.pg.query(
+      `DELETE FROM monitory WHERE id = $1 AND uzytkownik_id = $2`,
+      [id, userId]
+    );
+
+    if (r.rowCount === 0)
+      return res.status(404).json({ message: "Nie znaleziono sondy." });
+
+    res.json({ message: "Usunięto sondę." });
+  } catch (err) {
+    console.error("Błąd DELETE /monitory:", err);
+    res.status(500).json({ message: "Nie udało się usunąć sondy." });
   }
 });
 

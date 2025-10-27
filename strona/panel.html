@@ -33,7 +33,6 @@
       <button class="app-nav-btn" data-view="moje-sondy">Moje sondy</button>
       <button class="app-nav-btn" data-view="dodaj-sonde">Dodaj sondę</button>
       <button class="app-nav-btn" data-view="edytuj-sonde">Edytuj sondę</button>
-      <button class="app-nav-btn" data-view="usun-sonde">Usuń sondę</button>
       <button class="app-nav-btn" data-view="statystyki">Statystyki</button>
       <button class="app-nav-btn app-nav-btn--logout" data-view="wyloguj">Wyloguj</button>
     </aside>
@@ -215,11 +214,11 @@
 
     let page = 1;
     let total = 0;
-    let pageSize = Number(limitEl?.value || 20);
+    let pageSize = Number(limitEl?.value || 20); // start z aktualnej wartości selecta
 
     const qs = () => {
       const p = new URLSearchParams();
-      p.set('mine', '1');                     // backend zwraca tylko bieżącego użytkownika
+      p.set('mine', '1');
       if (searchEl.value.trim()) p.set('q', searchEl.value.trim());
       if (statusEl.value) p.set('status', statusEl.value);
       p.set('page', String(page));
@@ -228,9 +227,22 @@
     };
 
     const setLoading = (on) => {
-      if (on) { infoEl.textContent = 'Ładowanie…'; }
-      else    { infoEl.textContent = ''; }
+      infoEl.textContent = on ? 'Ładowanie…' : '';
       [refresh, prevBtn, nextBtn, searchEl, statusEl, limitEl].forEach(b => b && (b.disabled = !!on));
+    };
+
+    const renderItems = (items) => {
+      listEl.textContent = '';
+      const frag = document.createDocumentFragment();
+      for (const it of items){
+        const wrap = document.createElement('div');
+        wrap.innerHTML = msRenderCard(it).trim();
+        frag.appendChild(wrap.firstElementChild);
+      }
+      listEl.appendChild(frag);
+      listEl.style.display = 'grid';
+      listEl.style.visibility = 'visible';
+      listEl.style.opacity = '1';
     };
 
     async function load(){
@@ -238,20 +250,29 @@
       try {
         const res = await fetch('/api/monitory?' + qs(), { cache: 'no-store' });
         if (!res.ok) throw new Error('Nie udało się pobrać listy.');
-        // Oczekiwany kształt: { items: [...], total: N, page: 1, pageSize: 20 }
-        const data = await res.json();
-        const items = Array.isArray(data?.items) ? data.items : (Array.isArray(data) ? data : []);
-        total = Number(data?.total ?? items.length);
-        pageSize = Number(data?.pageSize ?? pageSize);
+        const data  = await res.json();
 
-        listEl.innerHTML = items.map(msRenderCard).join('');
+        // Dane z backendu (obsłuż obie formy: {items,total,pageSize} albo sama tablica)
+        const rawItems = Array.isArray(data?.items) ? data.items : (Array.isArray(data) ? data : []);
+        total   = Number(data?.total ?? rawItems.length);
+
+        // Fallback: jeśli backend zwrócił więcej niż prosiliśmy – przytnij po stronie frontu
+        const targetLimit = Number(limitEl?.value || pageSize || 20);
+        const items = rawItems.length > targetLimit ? rawItems.slice(0, targetLimit) : rawItems;
+
+        renderItems(items);
+
+        // Info + pager
+        const pageSizeGuess = Number(data?.pageSize ?? targetLimit);
+        const from = (page-1)*pageSizeGuess + (items.length ? 1 : 0);
+        const to   = (page-1)*pageSizeGuess + items.length;
         emptyEl.style.display = items.length ? 'none' : 'block';
-
-        const from = (page-1)*pageSize + 1;
-        const to   = (page-1)*pageSize + items.length;
         infoEl.textContent = items.length ? `Pozycje ${from}–${to} z ${total}` : '';
+
         prevBtn.disabled = page <= 1;
         nextBtn.disabled = to >= total;
+
+        console.log('[Moje sondy] wyrenderowane karty:', listEl.children.length);
       } catch (e){
         listEl.innerHTML = `<div class="hint">Błąd: ${e.message || e}</div>`;
         emptyEl.style.display = 'none';
@@ -260,48 +281,27 @@
       }
     }
 
-    // Zdarzenia
-    refresh?.addEventListener('click', () => load());
-    searchEl?.addEventListener('input', () => { page = 1; load(); });
+    // --- Handlery (tego brakowało) ---
+    const debounce = (fn, ms=300) => {
+      let t; return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+    };
+
+    limitEl?.addEventListener('change', () => {
+      pageSize = Number(limitEl.value) || 10; // aktualizuj zmienną
+      page = 1;
+      load();
+    });
+
+    searchEl?.addEventListener('input', debounce(() => { page = 1; load(); }, 300));
     statusEl?.addEventListener('change', () => { page = 1; load(); });
-    limitEl?.addEventListener('change', () => { page = 1; pageSize = Number(limitEl.value||20); load(); });
-    prevBtn?.addEventListener('click', () => { if (page>1){ page--; load(); }});
-    nextBtn?.addEventListener('click', () => { page++; load(); });
+    refresh?.addEventListener('click', () => load());
 
-    // Akcje na listcie (delegacja)
-    listEl.addEventListener('click', async (e) => {
-      const btn = e.target.closest('button[data-action]');
-      if (!btn) return;
-      const card = btn.closest('.card[data-id]');
-      const id = card?.dataset?.id;
-      const action = btn.dataset.action;
-
-      try {
-        if (action === 'delete'){
-          if (!confirm('Na pewno usunąć sondę?')) return;
-          const r = await fetch(`/api/monitory/${id}`, { method: 'DELETE' });
-          if (!r.ok) throw new Error('Nie udało się usunąć.');
-          await load();
-          return;
-        }
-        if (action === 'toggle'){
-          // przełączenie active/paused
-          const r = await fetch(`/api/monitory/${id}`, {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ toggle: true })
-          });
-          if (!r.ok) throw new Error('Nie udało się zmienić statusu.');
-          await load();
-          return;
-        }
-        if (action === 'logs'){
-          // prosty podgląd logów—jeśli masz endpoint, otworzy nowe okno
-          window.open(`/api/monitory/${id}/logs`, '_blank');
-        }
-      } catch (err){
-        alert(err.message || 'Operacja nie powiodła się.');
-      }
+    prevBtn?.addEventListener('click', () => {
+      if (page > 1) { page--; load(); }
+    });
+    nextBtn?.addEventListener('click', () => {
+      // sprawdzenie "to >= total" robimy w load(), tu tylko inkrement
+      page++; load();
     });
 
     // Start
