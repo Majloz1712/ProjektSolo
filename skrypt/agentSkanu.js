@@ -42,6 +42,11 @@ const BROWSER_TIMEOUT_MS = Number(process.env.BROWSER_TIMEOUT_MS || 45_000);
 const MAX_RETRIES = Number(process.env.MAX_RETRIES || 2);
 const TEXT_TRUNCATE_AT = Number(process.env.TEXT_TRUNCATE_AT || 2_000_000);
 const USE_STEALTH = process.env.PUP_STEALTH === '1';
+const BROWSER_MAX_PAGES = Math.max(Number(process.env.BROWSER_MAX_PAGES || MAX_CONCURRENCY), 1);
+const BROWSER_DEFAULT_WAIT_UNTIL = process.env.BROWSER_DEFAULT_WAIT_UNTIL || 'networkidle2';
+const BROWSER_EXTRA_WAIT_MS = Number(process.env.BROWSER_EXTRA_WAIT_MS || 800);
+const DEFAULT_WAIT_FOR_SELECTOR_TIMEOUT = Number(process.env.DEFAULT_WAIT_FOR_SELECTOR_TIMEOUT || 5_000);
+const DEFAULT_SCROLL_DELAY_MS = Number(process.env.DEFAULT_SCROLL_DELAY_MS || 250);
 
 // ---- Stan globalny Puppeteer ----
 
@@ -109,6 +114,51 @@ function normalizeUrl(u) {
   }
 }
 
+function ensureObject(val) {
+  if (!val || typeof val !== 'object') return {};
+  return val;
+}
+
+// css_selector może być zwykłym selektorem lub JSON-em np.:
+// { "selector": "#app", "browserOptions": { "waitForSelector": "#loaded", "scrollToBottom": true } }
+function parseMonitorBehavior(rawSelector) {
+  const config = {
+    selector: rawSelector || null,
+    staticOptions: {},
+    browserOptions: {},
+  };
+
+  if (!rawSelector) {
+    return config;
+  }
+
+  const trimmed = String(rawSelector).trim();
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (typeof parsed === 'string') {
+        config.selector = parsed;
+        return config;
+      }
+      const browser = ensureObject(parsed.browser || parsed.browserOptions);
+      const statik = ensureObject(parsed.static || parsed.staticOptions);
+      config.selector = parsed.selector ?? parsed.css_selector ?? null;
+      config.staticOptions = { ...statik };
+      config.browserOptions = { ...browser };
+      if (!config.selector && typeof parsed.cssSelector === 'string') {
+        config.selector = parsed.cssSelector;
+      }
+      if (!config.selector && typeof parsed.selector === 'string') {
+        config.selector = parsed.selector;
+      }
+    } catch (_) {
+      config.selector = trimmed;
+    }
+  }
+
+  return config;
+}
+
 function pickMetaFromDocument(document) {
   const byName = (n) => document.querySelector(`meta[name="${n}"]`)?.getAttribute('content')?.trim() || null;
   const byProp = (p) => document.querySelector(`meta[property="${p}"]`)?.getAttribute('content')?.trim() || null;
@@ -125,39 +175,287 @@ function pickMetaFromDocument(document) {
 // ---- Stan globalny Puppeteer ----
 let puppeteer = null;
 let isStealth = false;
+let browserPromise = null;
+const pagePool = [];
+const waitingResolvers = [];
+let allocatedPages = 0;
 
 async function ensurePuppeteer() {
   if (puppeteer) return { puppeteer, isStealth };
-  const puppeteerExtra = require('puppeteer-extra');
-  const stealth = require('puppeteer-extra-plugin-stealth')();
-  puppeteerExtra.use(stealth);
-  puppeteer = puppeteerExtra;
-  isStealth = true;
+  if (USE_STEALTH) {
+    const puppeteerExtra = require('puppeteer-extra');
+    const stealth = require('puppeteer-extra-plugin-stealth')();
+    puppeteerExtra.use(stealth);
+    puppeteer = puppeteerExtra;
+    isStealth = true;
+    return { puppeteer, isStealth };
+  }
+  puppeteer = require('puppeteer');
+  isStealth = false;
   return { puppeteer, isStealth };
+}
+
+function buildLaunchOptions() {
+  const extraArgs = [];
+  if (process.env.PUPPETEER_PROXY) {
+    extraArgs.push(`--proxy-server=${process.env.PUPPETEER_PROXY}`);
+  }
+
+  return {
+    headless: 'new',
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--lang=pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+      ...extraArgs,
+    ],
+    defaultViewport: { width: 1366, height: 900 },
+  };
+}
+
+async function getBrowser() {
+  if (!browserPromise) {
+    const { puppeteer: pptr } = await ensurePuppeteer();
+    browserPromise = pptr
+      .launch(buildLaunchOptions())
+      .catch((err) => {
+        browserPromise = null;
+        throw err;
+      });
+  }
+  return browserPromise;
+}
+
+async function configurePage(page) {
+  try {
+    await page.emulateTimezone('Europe/Warsaw');
+  } catch (_) {}
+  await page.setUserAgent(
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+      + 'AppleWebKit/537.36 (KHTML, like Gecko) '
+      + 'Chrome/123.0.0.0 Safari/537.36'
+  );
+  await page.setExtraHTTPHeaders({
+    'accept-language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+  });
+  page.setDefaultNavigationTimeout(BROWSER_TIMEOUT_MS);
+  page.setDefaultTimeout(BROWSER_TIMEOUT_MS);
+}
+
+async function createPage() {
+  const browser = await getBrowser();
+  const page = await browser.newPage();
+  await configurePage(page);
+  allocatedPages += 1;
+  return page;
+}
+
+async function acquirePage() {
+  if (pagePool.length) {
+    return pagePool.pop();
+  }
+
+  if (allocatedPages < BROWSER_MAX_PAGES) {
+    return createPage();
+  }
+
+  return new Promise((resolve) => {
+    waitingResolvers.push(resolve);
+  });
+}
+
+function cleanupPageListeners(page) {
+  if (!page || typeof page.removeAllListeners !== 'function') return;
+  page.removeAllListeners('response');
+  page.removeAllListeners('console');
+  page.removeAllListeners('requestfailed');
+}
+
+async function resetPage(page) {
+  if (!page || page.isClosed()) return;
+  try {
+    await page.goto('about:blank', { waitUntil: 'load', timeout: 10_000 });
+  } catch (_) {}
+}
+
+async function releasePage(page) {
+  if (!page) return;
+  if (page.isClosed?.()) {
+    allocatedPages = Math.max(allocatedPages - 1, 0);
+    return;
+  }
+
+  cleanupPageListeners(page);
+
+  await resetPage(page);
+
+  if (waitingResolvers.length) {
+    const resolve = waitingResolvers.shift();
+    resolve(page);
+    return;
+  }
+
+  pagePool.push(page);
+}
+
+async function closeBrowser() {
+  if (!browserPromise) return;
+  let browser = null;
+  try {
+    browser = await browserPromise;
+  } catch (_) {}
+
+  browserPromise = null;
+
+  await Promise.allSettled(pagePool.splice(0).map((p) => p.close().catch(() => {})));
+  allocatedPages = 0;
+
+  if (browser) {
+    try {
+      await browser.close();
+    } catch (_) {}
+  }
+}
+
+['SIGINT', 'SIGTERM', 'beforeExit', 'exit'].forEach((eventName) => {
+  process.once(eventName, () => {
+    closeBrowser().catch(() => {});
+  });
+});
+
+async function autoScroll(page, {
+  stepPx = 400,
+  delayMs = DEFAULT_SCROLL_DELAY_MS,
+  maxScrolls = 15,
+} = {}) {
+  let previousHeight = -1;
+  for (let i = 0; i < maxScrolls; i++) {
+    const currentHeight = await page.evaluate(() => document.body?.scrollHeight || 0).catch(() => 0);
+    if (currentHeight === previousHeight) break;
+    previousHeight = currentHeight;
+    await page.evaluate((step) => {
+      window.scrollBy(0, step);
+    }, stepPx).catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+}
+
+async function waitForPageReadiness(page, options = {}) {
+  const {
+    waitForSelector,
+    waitForSelectors,
+    waitForSelectorTimeoutMs = DEFAULT_WAIT_FOR_SELECTOR_TIMEOUT,
+    waitForSelectorVisible = true,
+    waitForFunction,
+    waitForFunctionTimeoutMs = BROWSER_TIMEOUT_MS,
+    waitForResponseIncludes,
+    waitForResponseTimeoutMs = BROWSER_TIMEOUT_MS,
+    waitAfterMs = 0,
+    scrollToBottom: shouldScroll = false,
+    scrollConfig = {},
+    evaluateAfterNavigationScripts,
+  } = options;
+
+  const selectors = [];
+  if (typeof waitForSelector === 'string' && waitForSelector.trim()) {
+    selectors.push(waitForSelector.trim());
+  }
+  if (Array.isArray(waitForSelectors)) {
+    selectors.push(...waitForSelectors.filter((s) => typeof s === 'string' && s.trim()));
+  }
+
+  for (const selector of selectors) {
+    try {
+      await page.waitForSelector(selector, {
+        timeout: waitForSelectorTimeoutMs,
+        visible: waitForSelectorVisible,
+      });
+    } catch (_) {}
+  }
+
+  const functions = [];
+  if (typeof waitForFunction === 'string' && waitForFunction.trim()) {
+    functions.push(waitForFunction.trim());
+  }
+  if (Array.isArray(waitForFunction)) {
+    functions.push(
+      ...waitForFunction.filter((fn) => typeof fn === 'string' && fn.trim())
+    );
+  }
+
+  for (const fnSource of functions) {
+    try {
+      await page.waitForFunction(fnSource, { timeout: waitForFunctionTimeoutMs });
+    } catch (_) {}
+  }
+
+  const responseIncludes = [];
+  if (typeof waitForResponseIncludes === 'string' && waitForResponseIncludes.trim()) {
+    responseIncludes.push(waitForResponseIncludes.trim());
+  }
+  if (Array.isArray(waitForResponseIncludes)) {
+    responseIncludes.push(
+      ...waitForResponseIncludes.filter((v) => typeof v === 'string' && v.trim())
+    );
+  }
+
+  for (const fragment of responseIncludes) {
+    try {
+      await page.waitForResponse((resp) => {
+        try {
+          return resp.url().includes(fragment);
+        } catch (_) {
+          return false;
+        }
+      }, { timeout: waitForResponseTimeoutMs });
+    } catch (_) {}
+  }
+
+  if (Array.isArray(evaluateAfterNavigationScripts)) {
+    for (const script of evaluateAfterNavigationScripts) {
+      if (typeof script !== 'string' || !script.trim()) continue;
+      try {
+        await page.evaluate((source) => {
+          try {
+            return window.eval(source);
+          } catch (_) {
+            return null;
+          }
+        }, script);
+      } catch (_) {}
+    }
+  }
+
+  if (shouldScroll) {
+    await autoScroll(page, scrollConfig);
+  }
+
+  if (waitAfterMs > 0) {
+    await sleep(waitAfterMs);
+  }
 }
 
 
 // ---- Tryb STATIC ----
-async function fetchStatic(url, { selector } = {}) {
-
-    
-
-
-
-    const startedAt = Date.now(); 
-    const res = await fetchWithTimeout(
-      url,
-      {
-        redirect: 'follow',
-        headers: {
-          'user-agent': USER_AGENT,
-          'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        },
+async function fetchStatic(url, { selector, headers = {}, fetchOptions = {} } = {}) {
+  const startedAt = Date.now();
+  const res = await fetchWithTimeout(
+    url,
+    {
+      redirect: 'follow',
+      headers: {
+        'user-agent': USER_AGENT,
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        ...headers,
       },
-      STATIC_TIMEOUT_MS,
-      'Static timeout'
-    );
-
+      ...fetchOptions,
+    },
+    STATIC_TIMEOUT_MS,
+    'Static timeout'
+  );
 
   const finalUrl = res.url || url;
   const status = res.status;
@@ -191,65 +489,63 @@ async function fetchStatic(url, { selector } = {}) {
   };
 }
 
-// ---- Tryb BROWSER (Puppeteer) ----
-// ---- Tryb BROWSER (Puppeteer + stealth + heurystyka bot-wall) ----
 // ---- Tryb BROWSER (Puppeteer + stealth + heurystyka bot-wall + screenshot) ----
-async function fetchBrowser(url, { selector } = {}) {
+async function fetchBrowser(url, { selector, browserOptions = {} } = {}) {
   const startedAt = Date.now();
 
-  const { puppeteer } = await ensurePuppeteer();
-
-  // opcjonalny proxy: wpisz w .env PUPPETEER_PROXY=http://user:pass@host:port
-  const extraArgs = [];
-  if (process.env.PUPPETEER_PROXY) {
-    extraArgs.push(`--proxy-server=${process.env.PUPPETEER_PROXY}`);
-  }
-
-  const browser = await puppeteer.launch({
-    headless: 'new',
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--lang=pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
-      ...extraArgs,
-    ],
-    defaultViewport: { width: 1366, height: 900 },
-  });
+  await ensurePuppeteer();
 
   let page = null;
+  let navStatus = null;
+  const navigationTimeout = browserOptions.navigationTimeoutMs || browserOptions.timeoutMs || BROWSER_TIMEOUT_MS;
+  let waitUntil = browserOptions.waitUntil || browserOptions.navigationWaitUntil || BROWSER_DEFAULT_WAIT_UNTIL;
+
+  if (Array.isArray(waitUntil) && waitUntil.length === 0) {
+    waitUntil = BROWSER_DEFAULT_WAIT_UNTIL;
+  }
+
+  const gotoOptions = {
+    timeout: navigationTimeout,
+  };
+  if (Array.isArray(waitUntil)) {
+    gotoOptions.waitUntil = waitUntil;
+  } else if (typeof waitUntil === 'string') {
+    const trimmed = waitUntil.trim();
+    if (trimmed && trimmed !== 'manual' && trimmed !== 'none') {
+      gotoOptions.waitUntil = trimmed;
+    }
+  } else {
+    gotoOptions.waitUntil = BROWSER_DEFAULT_WAIT_UNTIL;
+  }
+
+  const waitAfterMs =
+    typeof browserOptions.waitAfterMs === 'number'
+      ? browserOptions.waitAfterMs
+      : typeof browserOptions.extraWaitMs === 'number'
+        ? browserOptions.extraWaitMs
+        : BROWSER_EXTRA_WAIT_MS;
+
   try {
-    page = await browser.newPage();
+    page = await acquirePage();
 
-    // Realistyczne środowisko
-    await page.emulateTimezone('Europe/Warsaw');
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
-      'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-      'Chrome/123.0.0.0 Safari/537.36'
-    );
-    await page.setExtraHTTPHeaders({
-      'accept-language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
-    });
-
-    // Złap status dokumentu
-    let navStatus = null;
-    page.on('response', (resp) => {
+    const onResponse = (resp) => {
       try {
         if (resp.request().resourceType() === 'document' && navStatus === null) {
           navStatus = resp.status();
         }
       } catch (_) {}
+    };
+    page.on('response', onResponse);
+
+    await page.goto(url, gotoOptions);
+
+    await waitForPageReadiness(page, {
+      ...browserOptions,
+      waitAfterMs,
     });
 
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: BROWSER_TIMEOUT_MS });
-
-    // krótki „oddech” dla SPA/challenge (użyj setTimeout dla kompatybilności)
-    await new Promise((r) => setTimeout(r, 800));
-
     if (selector) {
-      try { await page.waitForSelector(selector, { timeout: 3000 }); } catch (_) {}
+      try { await page.waitForSelector(selector, { timeout: browserOptions.fragmentTimeoutMs || 3_000 }); } catch (_) {}
     }
 
     // Heurystyka wykrywania ściany bot-protection (DataDome/Cloudflare itp.)
@@ -315,23 +611,23 @@ async function fetchBrowser(url, { selector } = {}) {
       screenshot_b64,
     };
   } finally {
-    try { if (page) await page.close(); } catch (_) {}
-    try { await browser.close(); } catch (_) {}
+    if (page) {
+      await releasePage(page);
+    }
   }
 }
 
-
 // ---- Warstwa retry ----
-async function scanUrl({ url, tryb, selector }) {
+async function scanUrl({ url, tryb, selector, browserOptions = {}, staticOptions = {} }) {
   const normUrl = normalizeUrl(url);
   let lastErr = null;
 
   for (let i = 0; i <= MAX_RETRIES; i++) {
     try {
       if (tryb === 'browser') {
-        return await fetchBrowser(normUrl, { selector });
+        return await fetchBrowser(normUrl, { selector, browserOptions });
       }
-      return await fetchStatic(normUrl, { selector });
+      return await fetchStatic(normUrl, { selector, ...staticOptions });
     } catch (e) {
       lastErr = e;
       if (i < MAX_RETRIES) await sleep(500 + i * 300);
@@ -478,10 +774,10 @@ async function processTask(task) {
 
   const url = monitor.url;
   const tryb = (monitor.tryb_skanu || 'static').toLowerCase() === 'browser' ? 'browser' : 'static';
-  const selector = monitor.css_selector || null;
+  const { selector, staticOptions, browserOptions } = parseMonitorBehavior(monitor.css_selector || null);
 
   try {
-    const result = await scanUrl({ url, tryb, selector });
+    const result = await scanUrl({ url, tryb, selector, browserOptions, staticOptions });
 
     const snapshotId = await saveSnapshotToMongo({
       monitor_id,
