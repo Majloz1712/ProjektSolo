@@ -1,22 +1,34 @@
-// skrypt/db_mongo.js
-const { MongoClient } = require("mongodb");
+// skrypt/polaczenieMDB.js
+require('dotenv').config({ path: require('path').resolve(__dirname, '..', '.env') });
+const { MongoClient } = require('mongodb');
 
-const url = "mongodb://127.0.0.1:27017";
-const dbName = "inzynierka";
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017';
+const DB_NAME   = process.env.MONGO_DB || 'inzynierka';
 
+// Wspólny klient dla całej aplikacji (serwer + agent)
+const mongoClient = new MongoClient(MONGO_URI);
+
+// Cache db po pierwszym połączeniu
+let dbCache = null;
+
+/**
+ * Używane przez serwerStart.js
+ * Łączy (jeśli potrzeba) i zwraca instancję DB.
+ */
 async function connectMongo() {
-  const client = await MongoClient.connect(url, { useUnifiedTopology: true });
-  const db = client.db(dbName);
-
-  console.log("✅ Połączono z MongoDB");
-
-  // Tworzymy indeks unikalny na e-mailu
-  try {
-    await db.collection("users").createIndex({ email: 1 }, { unique: true });
-  } catch (_) {}
-
-  return db;
+  if (!dbCache) {
+    await mongoClient.connect();
+    dbCache = mongoClient.db(DB_NAME);
+  }
+  return dbCache;
 }
 
-module.exports = { connectMongo };
+/**
+ * Opcjonalny helper – jeśli już połączeni, zwróci db.
+ */
+function getDb() {
+  return dbCache || mongoClient.db(DB_NAME);
+}
+
+module.exports = { mongoClient, connectMongo, getDb };
 
