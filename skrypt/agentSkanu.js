@@ -15,7 +15,8 @@
  *   node agentSkanu.js --monitor-id <UUID> --once   # pojedynczy scan konkretnego monitora (pomija planowanie)
  *   node agentSkanu.js --reset        # TRUNCATE zadania_skanu + drop snapshotów w Mongo
  */
-
+require('dns').setDefaultResultOrder('ipv4first');
+require('dns').setDefaultResultOrder('ipv4first');
 require('dotenv').config({ path: require('path').resolve(__dirname, '.env') });
 
 const path = require('path');
@@ -124,17 +125,17 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 20_000, message =
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetchFn(url, { ...options, signal: controller.signal });
-    return res;
+    return await fetchFn(url, { ...options, signal: controller.signal });
   } catch (e) {
-    if (e && (e.name === 'AbortError' || e.code === 'ABORT_ERR')) {
-      throw new Error(message);
-    }
-    throw e;
+    const enriched = new Error(e?.message || 'fetch failed');
+    enriched.code = e?.code;
+    enriched.cause = e?.cause;
+    throw enriched.name === 'AbortError' ? new Error(message) : enriched;
   } finally {
     clearTimeout(id);
   }
 }
+
 
 
 
@@ -691,6 +692,7 @@ async function collectBrowserSnapshot(page, {
         `//input[(${keywordValueConditions})]`,
       ];
 
+<<<<<<< HEAD
       let clickedConsent = false;
 
       for (const xpath of consentXPaths) {
@@ -740,6 +742,51 @@ async function collectBrowserSnapshot(page, {
       if (!clickedConsent) {
         console.log('[cookie-consent] no consent buttons found');
       }
+=======
+      const candidates = await page.$$(
+  'button, a, div, span, p, label, input[type="button"], input[type="submit"]'
+);
+
+let clickedConsent = false;
+
+for (const handle of candidates) {
+  // eslint-disable-next-line no-await-in-loop
+  const info = await handle.evaluate((el) => {
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    const hidden =
+      style.visibility === 'hidden' ||
+      style.display === 'none' ||
+      rect.width === 0 ||
+      rect.height === 0;
+
+    const label = (el.innerText || el.textContent || el.value || '').trim();
+    return { hidden, label };
+  }).catch(() => ({ hidden: true, label: '' }));
+
+  if (info.hidden) continue;
+
+  const lower = info.label.toLowerCase();
+  const match = ['zgadzam', 'akceptuj', 'akceptuję', 'ok', 'accept', 'i agree', 'consent']
+    .some(k => lower.includes(k));
+
+  if (!match) continue;
+
+  try {
+    // eslint-disable-next-line no-await-in-loop
+    await handle.click();
+    console.log(`[cookie-consent] clicked: "${info.label || 'unknown'}"`);
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise(r => setTimeout(r, 1500));
+    clickedConsent = true;
+    break;
+  } catch { /* szukaj dalej */ }
+}
+
+if (!clickedConsent) {
+  console.log('[cookie-consent] no consent buttons found');
+}
+>>>>>>> c60b347 (Poprawka akceptowania cookies by miec wglad do strony i scrap danych)
     } catch (err) {
       console.log(`[cookie-consent] handler error: ${err?.message || err}`);
     }
