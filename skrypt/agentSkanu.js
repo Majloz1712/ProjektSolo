@@ -928,73 +928,6 @@ logger) {
       });
       throw err;
     }
-      let clickedConsent = false;
-
-      for (const xpath of consentXPaths) {
-        if (clickedConsent) break;
-        // eslint-disable-next-line no-await-in-loop
-        const handles = await page.$x(xpath);
-        for (const handle of handles) {
-          // eslint-disable-next-line no-await-in-loop
-          const isVisible = await handle
-            .evaluate((el) => {
-              const style = window.getComputedStyle(el);
-              const rect = el.getBoundingClientRect();
-              if (!rect) return false;
-              const hidden =
-                style.visibility === 'hidden' ||
-                style.display === 'none' ||
-                rect.width === 0 ||
-                rect.height === 0;
-              return !hidden;
-            })
-            .catch(() => false);
-
-          if (!isVisible) {
-            // eslint-disable-next-line no-continue
-            continue;
-          }
-
-          // eslint-disable-next-line no-await-in-loop
-          const label = await handle
-            .evaluate((el) => (el.innerText || el.textContent || el.value || '').trim())
-            .catch(() => '');
-
-          try {
-            // eslint-disable-next-line no-await-in-loop
-            await handle.click();
-            console.log(`[cookie-consent] clicked: "${label || 'unknown'}"`);
-            // eslint-disable-next-line no-await-in-loop
-            await new Promise((resolve) => setTimeout(resolve, 1_500));
-            clickedConsent = true;
-            break;
-          } catch (_) {
-            // Continue searching other candidates if clicking failed
-          }
-        }
-      }
-
-      if (!clickedConsent) {
-        console.log('[cookie-consent] no consent buttons found');
-      }
-    } catch (err) {
-      console.log(`[cookie-consent] handler error: ${err?.message || err}`);
-    }
-
-    await waitForPageReadiness(page, {
-      ...opts,
-      waitAfterMs,
-    });
-
-    if (selector) {
-      try {
-        await page.waitForSelector(selector, { timeout: opts.fragmentTimeoutMs || 3_000 });
-      } catch (_) {}
-    }
-
-    const blocked = await detectBotWall(page);
-    const finalUrl = page.url();
-    const html = await extractHtml(page, selector);
     const meta = await page.evaluate(() => {
       const byName = (n) => document.querySelector(`meta[name="${n}"]`)?.getAttribute('content')?.trim() || null;
       const byProp = (p) => document.querySelector(`meta[property="${p}"]`)?.getAttribute('content')?.trim() || null;
@@ -1031,6 +964,8 @@ logger) {
       screenshot_b64,
       hash: sha256(html || ''),
     };
+  } catch (err) {
+    throw err;
   } finally {
     page.off('response', onResponse);
   }
@@ -1231,6 +1166,8 @@ async function fetchBrowser(url, { selector, browserOptions = {}, logger } = {})
       block_reason: snapshot.blocked ? 'BOT_PROTECTION' : null,
       screenshot_b64: snapshot.screenshot_b64,
     };
+  } catch (err) {
+    throw err;
   } finally {
     if (page) {
       logger?.stageStart('browser:release-page', {});
@@ -1297,6 +1234,8 @@ async function withPg(tx) {
   const client = await pool.connect();
   try {
     return await tx(client);
+  } catch (err) {
+    throw err;
   } finally {
     client.release();
   }
