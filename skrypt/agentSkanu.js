@@ -15,7 +15,8 @@
  *   node agentSkanu.js --monitor-id <UUID> --once   # pojedynczy scan konkretnego monitora (pomija planowanie)
  *   node agentSkanu.js --reset        # TRUNCATE zadania_skanu + drop snapshotów w Mongo
  */
-
+require('dns').setDefaultResultOrder('ipv4first');
+require('dns').setDefaultResultOrder('ipv4first');
 require('dotenv').config({ path: require('path').resolve(__dirname, '.env') });
 
 const path = require('path');
@@ -134,17 +135,17 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 20_000, message =
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetchFn(url, { ...options, signal: controller.signal });
-    return res;
+    return await fetchFn(url, { ...options, signal: controller.signal });
   } catch (e) {
-    if (e && (e.name === 'AbortError' || e.code === 'ABORT_ERR')) {
-      throw new Error(message);
-    }
-    throw e;
+    const enriched = new Error(e?.message || 'fetch failed');
+    enriched.code = e?.code;
+    enriched.cause = e?.cause;
+    throw enriched.name === 'AbortError' ? new Error(message) : enriched;
   } finally {
     clearTimeout(id);
   }
 }
+
 
 
 
@@ -927,6 +928,73 @@ logger) {
       });
       throw err;
     }
+      let clickedConsent = false;
+
+      for (const xpath of consentXPaths) {
+        if (clickedConsent) break;
+        // eslint-disable-next-line no-await-in-loop
+        const handles = await page.$x(xpath);
+        for (const handle of handles) {
+          // eslint-disable-next-line no-await-in-loop
+          const isVisible = await handle
+            .evaluate((el) => {
+              const style = window.getComputedStyle(el);
+              const rect = el.getBoundingClientRect();
+              if (!rect) return false;
+              const hidden =
+                style.visibility === 'hidden' ||
+                style.display === 'none' ||
+                rect.width === 0 ||
+                rect.height === 0;
+              return !hidden;
+            })
+            .catch(() => false);
+
+          if (!isVisible) {
+            // eslint-disable-next-line no-continue
+            continue;
+          }
+
+          // eslint-disable-next-line no-await-in-loop
+          const label = await handle
+            .evaluate((el) => (el.innerText || el.textContent || el.value || '').trim())
+            .catch(() => '');
+
+          try {
+            // eslint-disable-next-line no-await-in-loop
+            await handle.click();
+            console.log(`[cookie-consent] clicked: "${label || 'unknown'}"`);
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise((resolve) => setTimeout(resolve, 1_500));
+            clickedConsent = true;
+            break;
+          } catch (_) {
+            // Continue searching other candidates if clicking failed
+          }
+        }
+      }
+
+      if (!clickedConsent) {
+        console.log('[cookie-consent] no consent buttons found');
+      }
+    } catch (err) {
+      console.log(`[cookie-consent] handler error: ${err?.message || err}`);
+    }
+
+    await waitForPageReadiness(page, {
+      ...opts,
+      waitAfterMs,
+    });
+
+    if (selector) {
+      try {
+        await page.waitForSelector(selector, { timeout: opts.fragmentTimeoutMs || 3_000 });
+      } catch (_) {}
+    }
+
+    const blocked = await detectBotWall(page);
+    const finalUrl = page.url();
+    const html = await extractHtml(page, selector);
     const meta = await page.evaluate(() => {
       const byName = (n) => document.querySelector(`meta[name="${n}"]`)?.getAttribute('content')?.trim() || null;
       const byProp = (p) => document.querySelector(`meta[property="${p}"]`)?.getAttribute('content')?.trim() || null;
