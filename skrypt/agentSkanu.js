@@ -41,7 +41,51 @@ const STATIC_TIMEOUT_MS = Number(process.env.STATIC_TIMEOUT_MS || 20_000);
 const BROWSER_TIMEOUT_MS = Number(process.env.BROWSER_TIMEOUT_MS || 45_000);
 const MAX_RETRIES = Number(process.env.MAX_RETRIES || 2);
 const TEXT_TRUNCATE_AT = Number(process.env.TEXT_TRUNCATE_AT || 2_000_000);
-const USE_STEALTH = process.env.PUP_STEALTH === '1';
+const USE_STEALTH = process.env.PUP_STEALTH !== '0';
+const BROWSER_MAX_PAGES = Math.max(Number(process.env.BROWSER_MAX_PAGES || MAX_CONCURRENCY), 1);
+const BROWSER_DEFAULT_WAIT_UNTIL = process.env.BROWSER_DEFAULT_WAIT_UNTIL || 'networkidle2';
+const BROWSER_EXTRA_WAIT_MS = Number(process.env.BROWSER_EXTRA_WAIT_MS || 800);
+const DEFAULT_WAIT_FOR_SELECTOR_TIMEOUT = Number(process.env.DEFAULT_WAIT_FOR_SELECTOR_TIMEOUT || 5_000);
+const DEFAULT_SCROLL_DELAY_MS = Number(process.env.DEFAULT_SCROLL_DELAY_MS || 250);
+const BOT_BYPASS_WAIT_RANGE_MS = [400, 900];
+
+const DESKTOP_PROFILES = [
+  {
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+      + 'AppleWebKit/537.36 (KHTML, like Gecko) '
+      + 'Chrome/123.0.0.0 Safari/537.36',
+    viewport: { width: 1366, height: 900 },
+    acceptLanguage: 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+    secChUa:
+      '"Not.A/Brand";v="8", "Chromium";v="123", "Google Chrome";v="123"',
+    secChUaPlatform: 'Windows',
+    timezone: 'Europe/Warsaw',
+  },
+  {
+    userAgent:
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_3) '
+      + 'AppleWebKit/605.1.15 (KHTML, like Gecko) '
+      + 'Version/17.4 Safari/605.1.15',
+    viewport: { width: 1440, height: 900 },
+    acceptLanguage: 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+    secChUa: '"Not A(Brand";v="99", "Safari";v="17"',
+    secChUaPlatform: 'macOS',
+    timezone: 'Europe/Warsaw',
+  },
+  {
+    userAgent:
+      'Mozilla/5.0 (X11; Linux x86_64) '
+      + 'AppleWebKit/537.36 (KHTML, like Gecko) '
+      + 'Chrome/122.0.0.0 Safari/537.36',
+    viewport: { width: 1600, height: 900 },
+    acceptLanguage: 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+    secChUa:
+      '"Not A(Brand";v="24", "Chromium";v="122", "Google Chrome";v="122"',
+    secChUaPlatform: 'Linux',
+    timezone: 'Europe/Warsaw',
+  },
+];
 
 // ---- Stan globalny Puppeteer ----
 
@@ -109,6 +153,59 @@ function normalizeUrl(u) {
   }
 }
 
+function ensureObject(val) {
+  if (!val || typeof val !== 'object') return {};
+  return val;
+}
+
+function randomInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function pickRandomProfile() {
+  return { ...DESKTOP_PROFILES[randomInt(0, DESKTOP_PROFILES.length - 1)] };
+}
+
+// css_selector może być zwykłym selektorem lub JSON-em np.:
+// { "selector": "#app", "browserOptions": { "waitForSelector": "#loaded", "scrollToBottom": true } }
+function parseMonitorBehavior(rawSelector) {
+  const config = {
+    selector: rawSelector || null,
+    staticOptions: {},
+    browserOptions: {},
+  };
+
+  if (!rawSelector) {
+    return config;
+  }
+
+  const trimmed = String(rawSelector).trim();
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (typeof parsed === 'string') {
+        config.selector = parsed;
+        return config;
+      }
+      const browser = ensureObject(parsed.browser || parsed.browserOptions);
+      const statik = ensureObject(parsed.static || parsed.staticOptions);
+      config.selector = parsed.selector ?? parsed.css_selector ?? null;
+      config.staticOptions = { ...statik };
+      config.browserOptions = { ...browser };
+      if (!config.selector && typeof parsed.cssSelector === 'string') {
+        config.selector = parsed.cssSelector;
+      }
+      if (!config.selector && typeof parsed.selector === 'string') {
+        config.selector = parsed.selector;
+      }
+    } catch (_) {
+      config.selector = trimmed;
+    }
+  }
+
+  return config;
+}
+
 function pickMetaFromDocument(document) {
   const byName = (n) => document.querySelector(`meta[name="${n}"]`)?.getAttribute('content')?.trim() || null;
   const byProp = (p) => document.querySelector(`meta[property="${p}"]`)?.getAttribute('content')?.trim() || null;
@@ -125,39 +222,366 @@ function pickMetaFromDocument(document) {
 // ---- Stan globalny Puppeteer ----
 let puppeteer = null;
 let isStealth = false;
+let browserPromise = null;
+const pagePool = [];
+const waitingResolvers = [];
+let allocatedPages = 0;
+
+async function setPageProfile(page, profile) {
+  if (!profile) return null;
+  try {
+    if (profile.timezone) {
+      await page.emulateTimezone(profile.timezone).catch(() => {});
+    }
+    if (profile.viewport) {
+      await page.setViewport({ ...profile.viewport }).catch(() => {});
+    }
+    if (profile.userAgent) {
+      await page.setUserAgent(profile.userAgent).catch(() => {});
+    }
+    const headers = {
+      'accept-language': profile.acceptLanguage || 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+      'upgrade-insecure-requests': '1',
+      'sec-ch-ua-mobile': '?0',
+    };
+    if (profile.secChUa) headers['sec-ch-ua'] = profile.secChUa;
+    if (profile.secChUaPlatform) headers['sec-ch-ua-platform'] = `"${profile.secChUaPlatform}"`;
+    if (profile.extraHeaders) Object.assign(headers, profile.extraHeaders);
+    await page.setExtraHTTPHeaders(headers).catch(() => {});
+    page.__profileHeaders = headers;
+  } catch (_) {}
+  page.__profile = profile;
+  return profile;
+}
+
+async function ensurePageProfile(page) {
+  if (!page.__profile) {
+    return setPageProfile(page, pickRandomProfile());
+  }
+  return setPageProfile(page, page.__profile);
+}
+
+async function rotatePageProfile(page) {
+  return setPageProfile(page, pickRandomProfile());
+}
+
+async function applyNavigationHeaders(page, extraHeaders = {}) {
+  const base = page.__profileHeaders || {};
+  const merged = { ...base, ...extraHeaders };
+  try {
+    await page.setExtraHTTPHeaders(merged);
+  } catch (_) {}
+  return merged;
+}
+
+async function humanizePageInteractions(page, viewport = {}) {
+  const width = viewport.width || 1366;
+  const height = viewport.height || 900;
+  const steps = randomInt(12, 24);
+  try {
+    await page.mouse.move(randomInt(50, width - 50), randomInt(50, height - 50), { steps }).catch(() => {});
+  } catch (_) {}
+  await sleep(randomInt(120, 280));
+  try {
+    await page.mouse.move(randomInt(30, width - 30), randomInt(30, height - 30), { steps: randomInt(10, 20) }).catch(() => {});
+  } catch (_) {}
+  await sleep(randomInt(140, 320));
+  try {
+    await page.keyboard.press('Tab', { delay: randomInt(35, 120) });
+  } catch (_) {}
+  await sleep(randomInt(120, 260));
+}
+
+async function warmUpOrigin(page, url, gotoOptions) {
+  try {
+    const parsed = new URL(url);
+    const origin = `${parsed.protocol}//${parsed.host}/`;
+    if (!origin || origin === url) return false;
+    await page.goto(origin, {
+      ...gotoOptions,
+      waitUntil: 'domcontentloaded',
+      timeout: Math.min(gotoOptions?.timeout ?? BROWSER_TIMEOUT_MS, 15_000),
+    });
+    await sleep(randomInt(200, 350));
+    await humanizePageInteractions(page, page.__profile?.viewport);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
 
 async function ensurePuppeteer() {
   if (puppeteer) return { puppeteer, isStealth };
-  const puppeteerExtra = require('puppeteer-extra');
-  const stealth = require('puppeteer-extra-plugin-stealth')();
-  puppeteerExtra.use(stealth);
-  puppeteer = puppeteerExtra;
-  isStealth = true;
+  if (USE_STEALTH) {
+    const puppeteerExtra = require('puppeteer-extra');
+    const stealth = require('puppeteer-extra-plugin-stealth')();
+    puppeteerExtra.use(stealth);
+    puppeteer = puppeteerExtra;
+    isStealth = true;
+    return { puppeteer, isStealth };
+  }
+  puppeteer = require('puppeteer');
+  isStealth = false;
   return { puppeteer, isStealth };
+}
+
+function buildLaunchOptions() {
+  const extraArgs = [];
+  if (process.env.PUPPETEER_PROXY) {
+    extraArgs.push(`--proxy-server=${process.env.PUPPETEER_PROXY}`);
+  }
+
+  return {
+    headless: 'new',
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--lang=pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+      ...extraArgs,
+    ],
+    defaultViewport: { width: 1366, height: 900 },
+  };
+}
+
+async function getBrowser() {
+  if (!browserPromise) {
+    const { puppeteer: pptr } = await ensurePuppeteer();
+    browserPromise = pptr
+      .launch(buildLaunchOptions())
+      .catch((err) => {
+        browserPromise = null;
+        throw err;
+      });
+  }
+  return browserPromise;
+}
+
+async function configurePage(page) {
+  try {
+    await page.setJavaScriptEnabled(true);
+  } catch (_) {}
+  try {
+    await page.setBypassCSP(true);
+  } catch (_) {}
+  page.setDefaultNavigationTimeout(BROWSER_TIMEOUT_MS);
+  page.setDefaultTimeout(BROWSER_TIMEOUT_MS);
+}
+
+async function createPage() {
+  const browser = await getBrowser();
+  const page = await browser.newPage();
+  await configurePage(page);
+  await rotatePageProfile(page);
+  allocatedPages += 1;
+  return page;
+}
+
+async function acquirePage() {
+  if (pagePool.length) {
+    return pagePool.pop();
+  }
+
+  if (allocatedPages < BROWSER_MAX_PAGES) {
+    return createPage();
+  }
+
+  return new Promise((resolve) => {
+    waitingResolvers.push(resolve);
+  });
+}
+
+function cleanupPageListeners(page) {
+  if (!page || typeof page.removeAllListeners !== 'function') return;
+  page.removeAllListeners('response');
+  page.removeAllListeners('console');
+  page.removeAllListeners('requestfailed');
+}
+
+async function resetPage(page) {
+  if (!page || page.isClosed()) return;
+  try {
+    await page.goto('about:blank', { waitUntil: 'load', timeout: 10_000 });
+  } catch (_) {}
+}
+
+async function releasePage(page) {
+  if (!page) return;
+  if (page.isClosed?.()) {
+    allocatedPages = Math.max(allocatedPages - 1, 0);
+    return;
+  }
+
+  cleanupPageListeners(page);
+
+  await resetPage(page);
+
+  if (waitingResolvers.length) {
+    const resolve = waitingResolvers.shift();
+    resolve(page);
+    return;
+  }
+
+  pagePool.push(page);
+}
+
+async function closeBrowser() {
+  if (!browserPromise) return;
+  let browser = null;
+  try {
+    browser = await browserPromise;
+  } catch (_) {}
+
+  browserPromise = null;
+
+  await Promise.allSettled(pagePool.splice(0).map((p) => p.close().catch(() => {})));
+  allocatedPages = 0;
+
+  if (browser) {
+    try {
+      await browser.close();
+    } catch (_) {}
+  }
+}
+
+['SIGINT', 'SIGTERM', 'beforeExit', 'exit'].forEach((eventName) => {
+  process.once(eventName, () => {
+    closeBrowser().catch(() => {});
+  });
+});
+
+async function autoScroll(page, {
+  stepPx = 400,
+  delayMs = DEFAULT_SCROLL_DELAY_MS,
+  maxScrolls = 15,
+} = {}) {
+  let previousHeight = -1;
+  for (let i = 0; i < maxScrolls; i++) {
+    const currentHeight = await page.evaluate(() => document.body?.scrollHeight || 0).catch(() => 0);
+    if (currentHeight === previousHeight) break;
+    previousHeight = currentHeight;
+    await page.evaluate((step) => {
+      window.scrollBy(0, step);
+    }, stepPx).catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+}
+
+async function waitForPageReadiness(page, options = {}) {
+  const {
+    waitForSelector,
+    waitForSelectors,
+    waitForSelectorTimeoutMs = DEFAULT_WAIT_FOR_SELECTOR_TIMEOUT,
+    waitForSelectorVisible = true,
+    waitForFunction,
+    waitForFunctionTimeoutMs = BROWSER_TIMEOUT_MS,
+    waitForResponseIncludes,
+    waitForResponseTimeoutMs = BROWSER_TIMEOUT_MS,
+    waitAfterMs = 0,
+    scrollToBottom: shouldScroll = false,
+    scrollConfig = {},
+    evaluateAfterNavigationScripts,
+  } = options;
+
+  const selectors = [];
+  if (typeof waitForSelector === 'string' && waitForSelector.trim()) {
+    selectors.push(waitForSelector.trim());
+  }
+  if (Array.isArray(waitForSelectors)) {
+    selectors.push(...waitForSelectors.filter((s) => typeof s === 'string' && s.trim()));
+  }
+
+  for (const selector of selectors) {
+    try {
+      await page.waitForSelector(selector, {
+        timeout: waitForSelectorTimeoutMs,
+        visible: waitForSelectorVisible,
+      });
+    } catch (_) {}
+  }
+
+  const functions = [];
+  if (typeof waitForFunction === 'string' && waitForFunction.trim()) {
+    functions.push(waitForFunction.trim());
+  }
+  if (Array.isArray(waitForFunction)) {
+    functions.push(
+      ...waitForFunction.filter((fn) => typeof fn === 'string' && fn.trim())
+    );
+  }
+
+  for (const fnSource of functions) {
+    try {
+      await page.waitForFunction(fnSource, { timeout: waitForFunctionTimeoutMs });
+    } catch (_) {}
+  }
+
+  const responseIncludes = [];
+  if (typeof waitForResponseIncludes === 'string' && waitForResponseIncludes.trim()) {
+    responseIncludes.push(waitForResponseIncludes.trim());
+  }
+  if (Array.isArray(waitForResponseIncludes)) {
+    responseIncludes.push(
+      ...waitForResponseIncludes.filter((v) => typeof v === 'string' && v.trim())
+    );
+  }
+
+  for (const fragment of responseIncludes) {
+    try {
+      await page.waitForResponse((resp) => {
+        try {
+          return resp.url().includes(fragment);
+        } catch (_) {
+          return false;
+        }
+      }, { timeout: waitForResponseTimeoutMs });
+    } catch (_) {}
+  }
+
+  if (Array.isArray(evaluateAfterNavigationScripts)) {
+    for (const script of evaluateAfterNavigationScripts) {
+      if (typeof script !== 'string' || !script.trim()) continue;
+      try {
+        await page.evaluate((source) => {
+          try {
+            return window.eval(source);
+          } catch (_) {
+            return null;
+          }
+        }, script);
+      } catch (_) {}
+    }
+  }
+
+  if (shouldScroll) {
+    await autoScroll(page, scrollConfig);
+  }
+
+  if (waitAfterMs > 0) {
+    await sleep(waitAfterMs);
+  }
 }
 
 
 // ---- Tryb STATIC ----
-async function fetchStatic(url, { selector } = {}) {
-
-    
-
-
-
-    const startedAt = Date.now(); 
-    const res = await fetchWithTimeout(
-      url,
-      {
-        redirect: 'follow',
-        headers: {
-          'user-agent': USER_AGENT,
-          'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        },
+async function fetchStatic(url, { selector, headers = {}, fetchOptions = {} } = {}) {
+  const startedAt = Date.now();
+  const res = await fetchWithTimeout(
+    url,
+    {
+      redirect: 'follow',
+      headers: {
+        'user-agent': USER_AGENT,
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        ...headers,
       },
-      STATIC_TIMEOUT_MS,
-      'Static timeout'
-    );
-
+      ...fetchOptions,
+    },
+    STATIC_TIMEOUT_MS,
+    'Static timeout'
+  );
 
   const finalUrl = res.url || url;
   const status = res.status;
@@ -191,94 +615,149 @@ async function fetchStatic(url, { selector } = {}) {
   };
 }
 
-// ---- Tryb BROWSER (Puppeteer) ----
-// ---- Tryb BROWSER (Puppeteer + stealth + heurystyka bot-wall) ----
 // ---- Tryb BROWSER (Puppeteer + stealth + heurystyka bot-wall + screenshot) ----
-async function fetchBrowser(url, { selector } = {}) {
-  const startedAt = Date.now();
-
-  const { puppeteer } = await ensurePuppeteer();
-
-  // opcjonalny proxy: wpisz w .env PUPPETEER_PROXY=http://user:pass@host:port
-  const extraArgs = [];
-  if (process.env.PUPPETEER_PROXY) {
-    extraArgs.push(`--proxy-server=${process.env.PUPPETEER_PROXY}`);
-  }
-
-  const browser = await puppeteer.launch({
-    headless: 'new',
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--lang=pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
-      ...extraArgs,
-    ],
-    defaultViewport: { width: 1366, height: 900 },
-  });
-
-  let page = null;
+async function detectBotWall(page) {
   try {
-    page = await browser.newPage();
-
-    // Realistyczne środowisko
-    await page.emulateTimezone('Europe/Warsaw');
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
-      'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-      'Chrome/123.0.0.0 Safari/537.36'
-    );
-    await page.setExtraHTTPHeaders({
-      'accept-language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
-    });
-
-    // Złap status dokumentu
-    let navStatus = null;
-    page.on('response', (resp) => {
-      try {
-        if (resp.request().resourceType() === 'document' && navStatus === null) {
-          navStatus = resp.status();
-        }
-      } catch (_) {}
-    });
-
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: BROWSER_TIMEOUT_MS });
-
-    // krótki „oddech” dla SPA/challenge (użyj setTimeout dla kompatybilności)
-    await new Promise((r) => setTimeout(r, 800));
-
-    if (selector) {
-      try { await page.waitForSelector(selector, { timeout: 3000 }); } catch (_) {}
-    }
-
-    // Heurystyka wykrywania ściany bot-protection (DataDome/Cloudflare itp.)
-    const botWall = await page.evaluate(() => {
+    return await page.evaluate(() => {
       const txt = (document.body?.innerText || '').toLowerCase();
       const title = (document.title || '').toLowerCase();
-      const hasCMsg = !!document.querySelector('#cmsg'); // "Please enable JS ..."
-      const hasCaptchaDelivery = !!document.querySelector('script[src*="captcha-delivery.com"],script[src*="ct.captcha-delivery.com"]');
+      const hasCMsg = !!document.querySelector('#cmsg');
+      const hasCaptchaDelivery = !!document.querySelector(
+        'script[src*="captcha-delivery.com"],script[src*="ct.captcha-delivery.com"]'
+      );
+      const hasAllegroShield = !!document.querySelector('div[data-box-name="allegro.guard"]');
       return (
         hasCMsg ||
         hasCaptchaDelivery ||
+        hasAllegroShield ||
         title.includes('enable js') ||
         txt.includes('enable js') ||
         txt.includes('captcha') ||
-        txt.includes('bot protection')
+        txt.includes('bot protection') ||
+        txt.includes('access denied') ||
+        txt.includes('protect our site')
       );
     });
+  } catch (_) {
+    return false;
+  }
+}
 
-    const finalUrl = page.url();
-
-    // Pobierz treść (fragment lub całość)
-    let html = null;
-    if (selector) {
-      html = await page.$eval(selector, (el) => el.outerHTML).catch(() => null);
+async function extractHtml(page, selector) {
+  if (selector) {
+    const fragment = await page.$eval(selector, (el) => el.outerHTML).catch(() => null);
+    if (fragment) {
+      return fragment.length > TEXT_TRUNCATE_AT ? fragment.slice(0, TEXT_TRUNCATE_AT) : fragment;
     }
-    if (!html) html = await page.content();
-    if (html.length > TEXT_TRUNCATE_AT) html = html.slice(0, TEXT_TRUNCATE_AT);
+  }
+  let html = await page.content();
+  if (html.length > TEXT_TRUNCATE_AT) html = html.slice(0, TEXT_TRUNCATE_AT);
+  return html;
+}
 
-    // Metadane
+async function collectBrowserSnapshot(page, {
+  url,
+  gotoOptions,
+  selector,
+  waitAfterMs,
+  browserOptions,
+  includeScreenshot = true,
+}) {
+  const opts = browserOptions || {};
+  let navStatus = null;
+  const onResponse = (resp) => {
+    try {
+      if (resp.request().resourceType() === 'document' && navStatus === null) {
+        navStatus = resp.status();
+      }
+    } catch (_) {}
+  };
+  page.on('response', onResponse);
+  try {
+    await page.goto(url, gotoOptions);
+
+    try {
+      const lowerFrom = 'ABCDEFGHIJKLMNOPQRSTUVWXYZĄĆĘŁŃÓŚŹŻ';
+      const lowerTo = 'abcdefghijklmnopqrstuvwxyząćęłńóśźż';
+      const keywords = ['zgadzam', 'akceptuj', 'akceptuję', 'ok', 'accept', 'i agree', 'consent'];
+      const keywordConditions = keywords
+        .map((word) => `contains(translate(normalize-space(.), "${lowerFrom}", "${lowerTo}"), "${word}")`)
+        .join(' or ');
+      const keywordValueConditions = keywords
+        .map((word) => `contains(translate(normalize-space(@value), "${lowerFrom}", "${lowerTo}"), "${word}")`)
+        .join(' or ');
+      const consentXPaths = [
+        `//*[self::button or self::a or self::div or self::span or self::p or self::label][${keywordConditions}]`,
+        `//input[(${keywordValueConditions})]`,
+      ];
+
+      let clickedConsent = false;
+
+      for (const xpath of consentXPaths) {
+        if (clickedConsent) break;
+        // eslint-disable-next-line no-await-in-loop
+        const handles = await page.$x(xpath);
+        for (const handle of handles) {
+          // eslint-disable-next-line no-await-in-loop
+          const isVisible = await handle
+            .evaluate((el) => {
+              const style = window.getComputedStyle(el);
+              const rect = el.getBoundingClientRect();
+              if (!rect) return false;
+              const hidden =
+                style.visibility === 'hidden' ||
+                style.display === 'none' ||
+                rect.width === 0 ||
+                rect.height === 0;
+              return !hidden;
+            })
+            .catch(() => false);
+
+          if (!isVisible) {
+            // eslint-disable-next-line no-continue
+            continue;
+          }
+
+          // eslint-disable-next-line no-await-in-loop
+          const label = await handle
+            .evaluate((el) => (el.innerText || el.textContent || el.value || '').trim())
+            .catch(() => '');
+
+          try {
+            // eslint-disable-next-line no-await-in-loop
+            await handle.click();
+            console.log(`[cookie-consent] clicked: "${label || 'unknown'}"`);
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise((resolve) => setTimeout(resolve, 1_500));
+            clickedConsent = true;
+            break;
+          } catch (_) {
+            // Continue searching other candidates if clicking failed
+          }
+        }
+      }
+
+      if (!clickedConsent) {
+        console.log('[cookie-consent] no consent buttons found');
+      }
+    } catch (err) {
+      console.log(`[cookie-consent] handler error: ${err?.message || err}`);
+    }
+
+    await waitForPageReadiness(page, {
+      ...opts,
+      waitAfterMs,
+    });
+
+    if (selector) {
+      try {
+        await page.waitForSelector(selector, { timeout: opts.fragmentTimeoutMs || 3_000 });
+      } catch (_) {}
+    }
+
+    const blocked = await detectBotWall(page);
+    const finalUrl = page.url();
+    const html = await extractHtml(page, selector);
     const meta = await page.evaluate(() => {
       const byName = (n) => document.querySelector(`meta[name="${n}"]`)?.getAttribute('content')?.trim() || null;
       const byProp = (p) => document.querySelector(`meta[property="${p}"]`)?.getAttribute('content')?.trim() || null;
@@ -291,47 +770,175 @@ async function fetchBrowser(url, { selector } = {}) {
       return { title, desc, canonical, h1, linksCount, textLen };
     });
 
-    // Screenshot (pomaga w debugowaniu bot-wall)
     let screenshot_b64 = null;
-    try {
-      const png = await page.screenshot({ fullPage: true });
-      screenshot_b64 = png.toString('base64');
-    } catch (_) {}
+    if (includeScreenshot) {
+      try {
+        const png = await page.screenshot({ fullPage: true });
+        screenshot_b64 = png.toString('base64');
+      } catch (_) {}
+    }
 
-    const http_status = navStatus || 200;
-    const hash = sha256(html);
+    return {
+      navStatus,
+      finalUrl,
+      blocked,
+      html,
+      meta,
+      screenshot_b64,
+      hash: sha256(html || ''),
+    };
+  } finally {
+    page.off('response', onResponse);
+  }
+}
+
+async function prepareForBotBypass(page) {
+  try {
+    const client = await page.target().createCDPSession();
+    await client.send('Network.clearBrowserCookies').catch(() => {});
+    await client.send('Network.clearBrowserCache').catch(() => {});
+  } catch (_) {}
+  await rotatePageProfile(page);
+  await sleep(randomInt(...BOT_BYPASS_WAIT_RANGE_MS));
+}
+
+async function attemptBotBypass(page, {
+  url,
+  gotoOptions,
+  selector,
+  waitAfterMs,
+  browserOptions,
+  includeScreenshot,
+}) {
+  const opts = browserOptions || {};
+  await prepareForBotBypass(page);
+  await applyNavigationHeaders(page, opts.headers || {});
+  await warmUpOrigin(page, url, gotoOptions);
+  await sleep(randomInt(...BOT_BYPASS_WAIT_RANGE_MS));
+
+  const relaxedGoto = {
+    ...gotoOptions,
+    waitUntil: opts.retryWaitUntil || gotoOptions.waitUntil || 'domcontentloaded',
+  };
+
+  await humanizePageInteractions(page, page.__profile?.viewport);
+
+  return collectBrowserSnapshot(page, {
+    url,
+    gotoOptions: relaxedGoto,
+    selector,
+    waitAfterMs,
+    browserOptions: opts,
+    includeScreenshot,
+  });
+}
+
+async function fetchBrowser(url, { selector, browserOptions = {} } = {}) {
+  const startedAt = Date.now();
+
+  await ensurePuppeteer();
+
+  let page = null;
+  const navigationTimeout = browserOptions.navigationTimeoutMs || browserOptions.timeoutMs || BROWSER_TIMEOUT_MS;
+  let waitUntil = browserOptions.waitUntil || browserOptions.navigationWaitUntil || BROWSER_DEFAULT_WAIT_UNTIL;
+  const opts = browserOptions || {};
+
+  if (Array.isArray(waitUntil) && waitUntil.length === 0) {
+    waitUntil = BROWSER_DEFAULT_WAIT_UNTIL;
+  }
+
+  const gotoOptions = {
+    timeout: navigationTimeout,
+  };
+  if (Array.isArray(waitUntil)) {
+    gotoOptions.waitUntil = waitUntil;
+  } else if (typeof waitUntil === 'string') {
+    const trimmed = waitUntil.trim();
+    if (trimmed && trimmed !== 'manual' && trimmed !== 'none') {
+      gotoOptions.waitUntil = trimmed;
+    }
+  } else {
+    gotoOptions.waitUntil = BROWSER_DEFAULT_WAIT_UNTIL;
+  }
+
+  const waitAfterMs =
+    typeof browserOptions.waitAfterMs === 'number'
+      ? browserOptions.waitAfterMs
+      : typeof browserOptions.extraWaitMs === 'number'
+        ? browserOptions.extraWaitMs
+        : BROWSER_EXTRA_WAIT_MS;
+
+  try {
+    page = await acquirePage();
+    await ensurePageProfile(page);
+    await applyNavigationHeaders(page, opts.headers || {});
+
+    const includeScreenshot = opts.captureScreenshot !== false;
+
+    let snapshot = await collectBrowserSnapshot(page, {
+      url,
+      gotoOptions,
+      selector,
+      waitAfterMs,
+      browserOptions: opts,
+      includeScreenshot,
+    });
+
+    const needsBypass =
+      snapshot.blocked ||
+      (snapshot.navStatus && [401, 403, 429].includes(snapshot.navStatus)) ||
+      (opts.forceBotBypass === true && snapshot.navStatus && snapshot.navStatus >= 300);
+
+    if (needsBypass && opts.disableBotBypass !== true) {
+      try {
+        snapshot = await attemptBotBypass(page, {
+          url,
+          gotoOptions,
+          selector,
+          waitAfterMs,
+          browserOptions: opts,
+          includeScreenshot,
+        });
+      } catch (err) {
+        if (!snapshot.blocked) {
+          throw err;
+        }
+      }
+    }
+
+    const http_status = snapshot.navStatus || 200;
 
     return {
       mode: 'browser',
       startedAt,
       finishedAt: Date.now(),
-      final_url: finalUrl,
+      final_url: snapshot.finalUrl || url,
       http_status,
-      html,
-      meta,
-      hash,
-      blocked: !!botWall,
-      block_reason: botWall ? 'BOT_PROTECTION' : null,
-      screenshot_b64,
+      html: snapshot.html,
+      meta: snapshot.meta,
+      hash: snapshot.hash,
+      blocked: !!snapshot.blocked,
+      block_reason: snapshot.blocked ? 'BOT_PROTECTION' : null,
+      screenshot_b64: snapshot.screenshot_b64,
     };
   } finally {
-    try { if (page) await page.close(); } catch (_) {}
-    try { await browser.close(); } catch (_) {}
+    if (page) {
+      await releasePage(page);
+    }
   }
 }
 
-
 // ---- Warstwa retry ----
-async function scanUrl({ url, tryb, selector }) {
+async function scanUrl({ url, tryb, selector, browserOptions = {}, staticOptions = {} }) {
   const normUrl = normalizeUrl(url);
   let lastErr = null;
 
   for (let i = 0; i <= MAX_RETRIES; i++) {
     try {
       if (tryb === 'browser') {
-        return await fetchBrowser(normUrl, { selector });
+        return await fetchBrowser(normUrl, { selector, browserOptions });
       }
-      return await fetchStatic(normUrl, { selector });
+      return await fetchStatic(normUrl, { selector, ...staticOptions });
     } catch (e) {
       lastErr = e;
       if (i < MAX_RETRIES) await sleep(500 + i * 300);
@@ -478,10 +1085,10 @@ async function processTask(task) {
 
   const url = monitor.url;
   const tryb = (monitor.tryb_skanu || 'static').toLowerCase() === 'browser' ? 'browser' : 'static';
-  const selector = monitor.css_selector || null;
+  const { selector, staticOptions, browserOptions } = parseMonitorBehavior(monitor.css_selector || null);
 
   try {
-    const result = await scanUrl({ url, tryb, selector });
+    const result = await scanUrl({ url, tryb, selector, browserOptions, staticOptions });
 
     const snapshotId = await saveSnapshotToMongo({
       monitor_id,
