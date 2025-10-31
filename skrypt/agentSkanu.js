@@ -88,6 +88,16 @@ const DESKTOP_PROFILES = [
   },
 ];
 
+const COOKIE_CONSENT_KEYWORDS = [
+  'zgadzam',
+  'akceptuj',
+  'akceptuję',
+  'ok',
+  'accept',
+  'i agree',
+  'consent',
+];
+
 // ---- Stan globalny Puppeteer ----
 
 // ---- Mongo ----
@@ -165,6 +175,70 @@ function randomInt(min, max) {
 
 function pickRandomProfile() {
   return { ...DESKTOP_PROFILES[randomInt(0, DESKTOP_PROFILES.length - 1)] };
+}
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isUuid(value) {
+  return typeof value === 'string' && UUID_REGEX.test(value);
+}
+
+function createRunId(taskId, monitorId) {
+  const base = taskId ? taskId.slice(0, 8) : 'manual';
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `${base}-${rand}-${monitorId ? monitorId.slice(0, 4) : 'ctx'}`;
+}
+
+function createRunLogger({ taskId, monitorId }) {
+  const runId = createRunId(taskId, monitorId);
+  const base = `[scan:${runId}]`;
+  const timestamp = () => new Date().toISOString();
+  const formatExtra = (extra) => {
+    if (!extra || (typeof extra === 'object' && Object.keys(extra).length === 0)) {
+      return '';
+    }
+    try {
+      return ` | data=${JSON.stringify(extra)}`;
+    } catch (_) {
+      return '';
+    }
+  };
+  const emit = (level, stage, message, extra, channel = 'log') => {
+    const stagePart = stage ? ` | stage=${stage}` : '';
+    const extraPart = formatExtra(extra);
+    const line = `${timestamp()} ${base} | level=${level}${stagePart} | ${message}${extraPart}`;
+    if (channel === 'warn') {
+      console.warn(line);
+    } else if (channel === 'error') {
+      console.error(line);
+    } else {
+      console.log(line);
+    }
+  };
+  return {
+    runId,
+    headerStart(meta) {
+      emit('HEADER', 'run', 'START', meta);
+    },
+    headerEnd(meta) {
+      emit('HEADER', 'run', 'END', meta);
+    },
+    stageStart(stage, meta) {
+      emit('STAGE', stage, 'START', meta);
+    },
+    stageEnd(stage, meta) {
+      emit('STAGE', stage, 'END', meta);
+    },
+    info(stage, message, meta) {
+      emit('INFO', stage, message, meta);
+    },
+    warn(stage, message, meta) {
+      emit('WARN', stage, message, meta, 'warn');
+    },
+    error(stage, message, meta) {
+      emit('ERROR', stage, message, meta, 'error');
+    },
+  };
 }
 
 // css_selector może być zwykłym selektorem lub JSON-em np.:
@@ -567,42 +641,83 @@ async function waitForPageReadiness(page, options = {}) {
 
 
 // ---- Tryb STATIC ----
-async function fetchStatic(url, { selector, headers = {}, fetchOptions = {} } = {}) {
+async function fetchStatic(url, { selector, headers = {}, fetchOptions = {}, logger } = {}) {
   const startedAt = Date.now();
-  const res = await fetchWithTimeout(
+  logger?.stageStart('static:request', {
     url,
-    {
-      redirect: 'follow',
-      headers: {
-        'user-agent': USER_AGENT,
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        ...headers,
+    timeoutMs: STATIC_TIMEOUT_MS,
+    headers: Object.keys(headers || {}),
+  });
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      url,
+      {
+        redirect: 'follow',
+        headers: {
+          'user-agent': USER_AGENT,
+          'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          ...headers,
+        },
+        ...fetchOptions,
       },
-      ...fetchOptions,
-    },
-    STATIC_TIMEOUT_MS,
-    'Static timeout'
-  );
+      STATIC_TIMEOUT_MS,
+      'Static timeout'
+    );
+  } catch (err) {
+    logger?.stageEnd('static:request', {
+      finalUrl: url,
+      status: null,
+      error: err?.message || String(err),
+    });
+    throw err;
+  }
 
   const finalUrl = res.url || url;
   const status = res.status;
+  logger?.stageEnd('static:request', { finalUrl, status });
 
-  const buffer = await res.arrayBuffer();
+  logger?.stageStart('static:read-body', {});
+  let buffer;
+  try {
+    buffer = await res.arrayBuffer();
+  } catch (err) {
+    logger?.stageEnd('static:read-body', { error: err?.message || String(err) });
+    throw err;
+  }
   let html = Buffer.from(buffer).toString('utf8');
   if (html.length > TEXT_TRUNCATE_AT) html = html.slice(0, TEXT_TRUNCATE_AT);
+  logger?.stageEnd('static:read-body', { length: html.length });
 
-  const dom = new JSDOM(html);
-  const { document } = dom.window;
-
+  logger?.stageStart('static:parse', { selector: !!selector });
   let fragmentHtml = null;
-  if (selector) {
-    const node = document.querySelector(selector);
-    fragmentHtml = node ? node.outerHTML : null;
-  }
+  let meta;
+  let content;
+  let hash;
+  try {
+    const dom = new JSDOM(html);
+    const { document } = dom.window;
 
-  const meta = pickMetaFromDocument(document);
-  const content = fragmentHtml || html;
-  const hash = sha256(content);
+    if (selector) {
+      const node = document.querySelector(selector);
+      fragmentHtml = node ? node.outerHTML : null;
+    }
+
+    meta = pickMetaFromDocument(document);
+    content = fragmentHtml || html;
+    hash = sha256(content);
+  } catch (err) {
+    logger?.stageEnd('static:parse', {
+      fragmentFound: !!fragmentHtml,
+      error: err?.message || String(err),
+    });
+    throw err;
+  }
+  logger?.stageEnd('static:parse', {
+    fragmentFound: !!fragmentHtml,
+    metaKeys: Object.keys(meta || {}),
+    hash,
+  });
 
   return {
     mode: 'static',
@@ -656,6 +771,76 @@ async function extractHtml(page, selector) {
   return html;
 }
 
+async function handleCookieConsent(page, logger) {
+  logger?.stageStart('browser:cookie-consent', {});
+  try {
+    const result = await page.evaluate((keywords) => {
+      const normalize = (text) => {
+        if (!text) return '';
+        return text.toString().trim().toLocaleLowerCase('pl-PL');
+      };
+      const matches = (text) => {
+        const normalized = normalize(text);
+        if (!normalized) return false;
+        return keywords.some((keyword) => normalized.includes(keyword));
+      };
+      const elements = Array.from(
+        document.querySelectorAll('button, a, div, span, p, label, input')
+      );
+      for (const el of elements) {
+        const label = el.innerText || el.textContent || el.value || '';
+        if (!matches(label)) {
+          continue;
+        }
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        const hidden =
+          !rect ||
+          rect.width === 0 ||
+          rect.height === 0 ||
+          style.visibility === 'hidden' ||
+          style.display === 'none' ||
+          style.opacity === '0';
+        if (hidden) {
+          continue;
+        }
+        if (typeof el.click === 'function') {
+          el.click();
+          return { clicked: true, label: label.trim() };
+        }
+      }
+      return { clicked: false };
+    }, COOKIE_CONSENT_KEYWORDS);
+
+    if (result?.clicked) {
+      const label = result.label || 'unknown';
+      if (!logger) {
+        console.log(`[cookie-consent] clicked: "${label}"`);
+      }
+      logger?.info('browser:cookie-consent', '[cookie-consent] clicked', { label });
+      await sleep(1_500);
+      logger?.stageEnd('browser:cookie-consent', { clicked: true, label });
+    } else {
+      if (!logger) {
+        console.log('[cookie-consent] no consent buttons found');
+      }
+      logger?.info('browser:cookie-consent', '[cookie-consent] no consent buttons found');
+      logger?.stageEnd('browser:cookie-consent', { clicked: false });
+    }
+  } catch (err) {
+    if (!logger) {
+      console.log(`[cookie-consent] handler error: ${err?.message || err}`);
+    }
+    logger?.warn('browser:cookie-consent', '[cookie-consent] handler error', {
+      message: err?.message || String(err),
+    });
+    logger?.stageEnd('browser:cookie-consent', {
+      clicked: false,
+      error: err?.message || String(err),
+    });
+  }
+}
+
 async function collectBrowserSnapshot(page, {
   url,
   gotoOptions,
@@ -663,7 +848,8 @@ async function collectBrowserSnapshot(page, {
   waitAfterMs,
   browserOptions,
   includeScreenshot = true,
-}) {
+},
+logger) {
   const opts = browserOptions || {};
   let navStatus = null;
   const onResponse = (resp) => {
@@ -675,24 +861,73 @@ async function collectBrowserSnapshot(page, {
   };
   page.on('response', onResponse);
   try {
-    await page.goto(url, gotoOptions);
-
+    logger?.stageStart('browser:navigate', {
+      url,
+      waitUntil: gotoOptions.waitUntil,
+      timeout: gotoOptions.timeout,
+    });
     try {
-      const lowerFrom = 'ABCDEFGHIJKLMNOPQRSTUVWXYZĄĆĘŁŃÓŚŹŻ';
-      const lowerTo = 'abcdefghijklmnopqrstuvwxyząćęłńóśźż';
-      const keywords = ['zgadzam', 'akceptuj', 'akceptuję', 'ok', 'accept', 'i agree', 'consent'];
-      const keywordConditions = keywords
-        .map((word) => `contains(translate(normalize-space(.), "${lowerFrom}", "${lowerTo}"), "${word}")`)
-        .join(' or ');
-      const keywordValueConditions = keywords
-        .map((word) => `contains(translate(normalize-space(@value), "${lowerFrom}", "${lowerTo}"), "${word}")`)
-        .join(' or ');
-      const consentXPaths = [
-        `//*[self::button or self::a or self::div or self::span or self::p or self::label][${keywordConditions}]`,
-        `//input[(${keywordValueConditions})]`,
-      ];
+      await page.goto(url, gotoOptions);
+      logger?.stageEnd('browser:navigate', { status: navStatus });
+    } catch (err) {
+      logger?.stageEnd('browser:navigate', {
+        status: navStatus,
+        error: err?.message || String(err),
+      });
+      throw err;
+    }
 
-<<<<<<< HEAD
+    await handleCookieConsent(page, logger);
+
+    logger?.stageStart('browser:wait-readiness', {
+      waitAfterMs,
+      waitUntil: gotoOptions.waitUntil,
+    });
+    try {
+      await waitForPageReadiness(page, {
+        ...opts,
+        waitAfterMs,
+      });
+      logger?.stageEnd('browser:wait-readiness', {});
+    } catch (err) {
+      logger?.stageEnd('browser:wait-readiness', {
+        error: err?.message || String(err),
+      });
+      throw err;
+    }
+
+    if (selector) {
+      logger?.stageStart('browser:wait-selector', {
+        selector,
+        timeout: opts.fragmentTimeoutMs || 3_000,
+      });
+      try {
+        await page.waitForSelector(selector, { timeout: opts.fragmentTimeoutMs || 3_000 });
+        logger?.stageEnd('browser:wait-selector', { found: true });
+      } catch (err) {
+        logger?.stageEnd('browser:wait-selector', {
+          found: false,
+          message: err?.message || String(err),
+        });
+      }
+    }
+
+    logger?.stageStart('browser:detect-botwall', {});
+    const blocked = await detectBotWall(page);
+    logger?.stageEnd('browser:detect-botwall', { blocked });
+    const finalUrl = page.url();
+    logger?.stageStart('browser:extract-html', { selector: !!selector });
+    let html;
+    try {
+      html = await extractHtml(page, selector);
+      logger?.stageEnd('browser:extract-html', { length: html?.length || 0 });
+    } catch (err) {
+      logger?.stageEnd('browser:extract-html', {
+        length: 0,
+        error: err?.message || String(err),
+      });
+      throw err;
+    }
       let clickedConsent = false;
 
       for (const xpath of consentXPaths) {
@@ -742,51 +977,6 @@ async function collectBrowserSnapshot(page, {
       if (!clickedConsent) {
         console.log('[cookie-consent] no consent buttons found');
       }
-=======
-      const candidates = await page.$$(
-  'button, a, div, span, p, label, input[type="button"], input[type="submit"]'
-);
-
-let clickedConsent = false;
-
-for (const handle of candidates) {
-  // eslint-disable-next-line no-await-in-loop
-  const info = await handle.evaluate((el) => {
-    const style = window.getComputedStyle(el);
-    const rect = el.getBoundingClientRect();
-    const hidden =
-      style.visibility === 'hidden' ||
-      style.display === 'none' ||
-      rect.width === 0 ||
-      rect.height === 0;
-
-    const label = (el.innerText || el.textContent || el.value || '').trim();
-    return { hidden, label };
-  }).catch(() => ({ hidden: true, label: '' }));
-
-  if (info.hidden) continue;
-
-  const lower = info.label.toLowerCase();
-  const match = ['zgadzam', 'akceptuj', 'akceptuję', 'ok', 'accept', 'i agree', 'consent']
-    .some(k => lower.includes(k));
-
-  if (!match) continue;
-
-  try {
-    // eslint-disable-next-line no-await-in-loop
-    await handle.click();
-    console.log(`[cookie-consent] clicked: "${info.label || 'unknown'}"`);
-    // eslint-disable-next-line no-await-in-loop
-    await new Promise(r => setTimeout(r, 1500));
-    clickedConsent = true;
-    break;
-  } catch { /* szukaj dalej */ }
-}
-
-if (!clickedConsent) {
-  console.log('[cookie-consent] no consent buttons found');
-}
->>>>>>> c60b347 (Poprawka akceptowania cookies by miec wglad do strony i scrap danych)
     } catch (err) {
       console.log(`[cookie-consent] handler error: ${err?.message || err}`);
     }
@@ -819,10 +1009,17 @@ if (!clickedConsent) {
 
     let screenshot_b64 = null;
     if (includeScreenshot) {
+      logger?.stageStart('browser:screenshot', {});
       try {
         const png = await page.screenshot({ fullPage: true });
         screenshot_b64 = png.toString('base64');
-      } catch (_) {}
+        logger?.stageEnd('browser:screenshot', { captured: true, length: screenshot_b64.length });
+      } catch (err) {
+        logger?.stageEnd('browser:screenshot', {
+          captured: false,
+          message: err?.message || String(err),
+        });
+      }
     }
 
     return {
@@ -856,31 +1053,44 @@ async function attemptBotBypass(page, {
   waitAfterMs,
   browserOptions,
   includeScreenshot,
+  logger,
 }) {
   const opts = browserOptions || {};
-  await prepareForBotBypass(page);
-  await applyNavigationHeaders(page, opts.headers || {});
-  await warmUpOrigin(page, url, gotoOptions);
-  await sleep(randomInt(...BOT_BYPASS_WAIT_RANGE_MS));
+  logger?.stageStart('browser:bot-bypass', { url });
+  try {
+    await prepareForBotBypass(page);
+    await applyNavigationHeaders(page, opts.headers || {});
+    await warmUpOrigin(page, url, gotoOptions);
+    await sleep(randomInt(...BOT_BYPASS_WAIT_RANGE_MS));
 
-  const relaxedGoto = {
-    ...gotoOptions,
-    waitUntil: opts.retryWaitUntil || gotoOptions.waitUntil || 'domcontentloaded',
-  };
+    const relaxedGoto = {
+      ...gotoOptions,
+      waitUntil: opts.retryWaitUntil || gotoOptions.waitUntil || 'domcontentloaded',
+    };
 
-  await humanizePageInteractions(page, page.__profile?.viewport);
+    await humanizePageInteractions(page, page.__profile?.viewport);
 
-  return collectBrowserSnapshot(page, {
-    url,
-    gotoOptions: relaxedGoto,
-    selector,
-    waitAfterMs,
-    browserOptions: opts,
-    includeScreenshot,
-  });
+    const snapshot = await collectBrowserSnapshot(page, {
+      url,
+      gotoOptions: relaxedGoto,
+      selector,
+      waitAfterMs,
+      browserOptions: opts,
+      includeScreenshot,
+    }, logger);
+    logger?.stageEnd('browser:bot-bypass', { blocked: snapshot.blocked, status: snapshot.navStatus });
+    return snapshot;
+  } catch (err) {
+    logger?.stageEnd('browser:bot-bypass', {
+      blocked: null,
+      status: null,
+      error: err?.message || String(err),
+    });
+    throw err;
+  }
 }
 
-async function fetchBrowser(url, { selector, browserOptions = {} } = {}) {
+async function fetchBrowser(url, { selector, browserOptions = {}, logger } = {}) {
   const startedAt = Date.now();
 
   await ensurePuppeteer();
@@ -916,20 +1126,65 @@ async function fetchBrowser(url, { selector, browserOptions = {} } = {}) {
         : BROWSER_EXTRA_WAIT_MS;
 
   try {
-    page = await acquirePage();
-    await ensurePageProfile(page);
-    await applyNavigationHeaders(page, opts.headers || {});
+    logger?.stageStart('browser:acquire-page', {});
+    try {
+      page = await acquirePage();
+      logger?.stageEnd('browser:acquire-page', { acquired: true });
+    } catch (err) {
+      logger?.stageEnd('browser:acquire-page', {
+        acquired: false,
+        error: err?.message || String(err),
+      });
+      throw err;
+    }
+
+    logger?.stageStart('browser:configure-page', {
+      headers: Object.keys(opts.headers || {}),
+    });
+    try {
+      await ensurePageProfile(page);
+      await applyNavigationHeaders(page, opts.headers || {});
+      logger?.stageEnd('browser:configure-page', {
+        viewport: page.__profile?.viewport || null,
+      });
+    } catch (err) {
+      logger?.stageEnd('browser:configure-page', {
+        viewport: page.__profile?.viewport || null,
+        error: err?.message || String(err),
+      });
+      throw err;
+    }
 
     const includeScreenshot = opts.captureScreenshot !== false;
 
-    let snapshot = await collectBrowserSnapshot(page, {
-      url,
-      gotoOptions,
-      selector,
-      waitAfterMs,
-      browserOptions: opts,
+    logger?.stageStart('browser:collect', {
       includeScreenshot,
+      waitAfterMs,
+      waitUntil: gotoOptions.waitUntil,
     });
+    let snapshot;
+    try {
+      snapshot = await collectBrowserSnapshot(page, {
+        url,
+        gotoOptions,
+        selector,
+        waitAfterMs,
+        browserOptions: opts,
+        includeScreenshot,
+      }, logger);
+      logger?.stageEnd('browser:collect', {
+        blocked: snapshot.blocked,
+        status: snapshot.navStatus,
+        finalUrl: snapshot.finalUrl,
+      });
+    } catch (err) {
+      logger?.stageEnd('browser:collect', {
+        blocked: null,
+        status: null,
+        error: err?.message || String(err),
+      });
+      throw err;
+    }
 
     const needsBypass =
       snapshot.blocked ||
@@ -937,6 +1192,10 @@ async function fetchBrowser(url, { selector, browserOptions = {} } = {}) {
       (opts.forceBotBypass === true && snapshot.navStatus && snapshot.navStatus >= 300);
 
     if (needsBypass && opts.disableBotBypass !== true) {
+      logger?.info('browser:collect', 'Attempting bot bypass', {
+        blocked: snapshot.blocked,
+        status: snapshot.navStatus,
+      });
       try {
         snapshot = await attemptBotBypass(page, {
           url,
@@ -945,8 +1204,12 @@ async function fetchBrowser(url, { selector, browserOptions = {} } = {}) {
           waitAfterMs,
           browserOptions: opts,
           includeScreenshot,
+          logger,
         });
       } catch (err) {
+        logger?.warn('browser:bot-bypass', 'Bypass attempt failed', {
+          message: err?.message || String(err),
+        });
         if (!snapshot.blocked) {
           throw err;
         }
@@ -970,27 +1233,62 @@ async function fetchBrowser(url, { selector, browserOptions = {} } = {}) {
     };
   } finally {
     if (page) {
-      await releasePage(page);
+      logger?.stageStart('browser:release-page', {});
+      try {
+        await releasePage(page);
+        logger?.stageEnd('browser:release-page', { released: true });
+      } catch (err) {
+        logger?.stageEnd('browser:release-page', {
+          released: false,
+          error: err?.message || String(err),
+        });
+      }
     }
   }
 }
 
 // ---- Warstwa retry ----
-async function scanUrl({ url, tryb, selector, browserOptions = {}, staticOptions = {} }) {
+async function scanUrl({ url, tryb, selector, browserOptions = {}, staticOptions = {}, logger }) {
   const normUrl = normalizeUrl(url);
   let lastErr = null;
 
   for (let i = 0; i <= MAX_RETRIES; i++) {
+    logger?.stageStart('scan-attempt', { attempt: i + 1, mode: tryb, url: normUrl });
     try {
       if (tryb === 'browser') {
-        return await fetchBrowser(normUrl, { selector, browserOptions });
+        const result = await fetchBrowser(normUrl, { selector, browserOptions, logger });
+        logger?.stageEnd('scan-attempt', {
+          attempt: i + 1,
+          outcome: 'success',
+          mode: result.mode,
+          status: result.http_status,
+          blocked: result.blocked,
+        });
+        return result;
       }
-      return await fetchStatic(normUrl, { selector, ...staticOptions });
+      const result = await fetchStatic(normUrl, { selector, ...staticOptions, logger });
+      logger?.stageEnd('scan-attempt', {
+        attempt: i + 1,
+        outcome: 'success',
+        mode: result.mode,
+        status: result.http_status,
+        blocked: false,
+      });
+      return result;
     } catch (e) {
       lastErr = e;
+      logger?.stageEnd('scan-attempt', {
+        attempt: i + 1,
+        outcome: 'error',
+        message: e?.message || String(e),
+      });
       if (i < MAX_RETRIES) await sleep(500 + i * 300);
     }
   }
+  logger?.error('scan', 'All attempts failed', {
+    attempts: MAX_RETRIES + 1,
+    lastError: lastErr?.message || String(lastErr),
+  });
   throw lastErr;
 }
 
@@ -1006,6 +1304,9 @@ async function withPg(tx) {
 
 // Planowanie: tworzymy zadania dla monitorów, którym minął interwał
 async function scheduleDue({ onlyMonitorId = null } = {}) {
+  if (onlyMonitorId && !isUuid(onlyMonitorId)) {
+    throw new Error('INVALID_MONITOR_ID');
+  }
   return withPg(async (pg) => {
     try {
       await pg.query('BEGIN');
@@ -1118,62 +1419,216 @@ const queue = new PQueue({ concurrency: MAX_CONCURRENCY });
 
 async function processTask(task) {
   const { id: taskId, monitor_id } = task;
+  const logger = createRunLogger({ taskId, monitorId: monitor_id });
+  const startedAt = Date.now();
+  let finalStatus = 'unknown';
+  let finalHash = null;
+  let finalSnapshotId = null;
+  let finalError = null;
 
-  const monitor = await withPg((pg) => loadMonitor(pg, monitor_id));
-  if (!monitor) {
-    await finishTask(taskId, {
-      status: 'blad',
-      blad_opis: 'MONITOR_NOT_FOUND',
-      tresc_hash: null,
-      snapshot_mongo_id: null,
-    });
-    return;
-  }
-
-  const url = monitor.url;
-  const tryb = (monitor.tryb_skanu || 'static').toLowerCase() === 'browser' ? 'browser' : 'static';
-  const { selector, staticOptions, browserOptions } = parseMonitorBehavior(monitor.css_selector || null);
+  logger.headerStart({ taskId, monitorId: monitor_id });
 
   try {
-    const result = await scanUrl({ url, tryb, selector, browserOptions, staticOptions });
+    logger.stageStart('validate-identifiers', { taskId, monitorId: monitor_id });
+    const validTaskId = isUuid(taskId);
+    const validMonitorId = isUuid(monitor_id);
+    if (!validTaskId || !validMonitorId) {
+      logger.stageEnd('validate-identifiers', { validTaskId, validMonitorId, outcome: 'invalid' });
+      finalStatus = 'blad';
+      finalError = 'INVALID_UUID';
+      logger.error('validate-identifiers', 'Invalid UUID detected', { validTaskId, validMonitorId });
+      logger.stageStart('pg:finish-task', { status: 'blad' });
+      try {
+        await finishTask(taskId, {
+          status: 'blad',
+          blad_opis: 'INVALID_UUID',
+          tresc_hash: null,
+          snapshot_mongo_id: null,
+        });
+        logger.stageEnd('pg:finish-task', { status: 'blad' });
+      } catch (finishErr) {
+        logger.stageEnd('pg:finish-task', {
+          status: 'blad',
+          error: finishErr?.message || String(finishErr),
+        });
+        logger.error('pg:finish-task', 'Failed to update task status', {
+          message: finishErr?.message || String(finishErr),
+        });
+      }
+      return;
+    }
+    logger.stageEnd('validate-identifiers', { validTaskId, validMonitorId, outcome: 'ok' });
 
-    const snapshotId = await saveSnapshotToMongo({
-      monitor_id,
-      url,
-      ts: new Date(),
-      mode: result.mode,
-      final_url: result.final_url,
-      html: result.html,
-      meta: result.meta,
-      hash: result.hash,
-      blocked: !!result.blocked,
-      block_reason: result.block_reason || null,
-      screenshot_b64: result.screenshot_b64 || null,
+    logger.stageStart('load-monitor', { monitorId: monitor_id });
+    const monitor = await withPg((pg) => loadMonitor(pg, monitor_id));
+    if (!monitor) {
+      logger.stageEnd('load-monitor', { outcome: 'not-found' });
+      finalStatus = 'blad';
+      finalError = 'MONITOR_NOT_FOUND';
+      logger.error('load-monitor', 'Monitor not found', {});
+      logger.stageStart('pg:finish-task', { status: 'blad' });
+      try {
+        await finishTask(taskId, {
+          status: 'blad',
+          blad_opis: 'MONITOR_NOT_FOUND',
+          tresc_hash: null,
+          snapshot_mongo_id: null,
+        });
+        logger.stageEnd('pg:finish-task', { status: 'blad' });
+      } catch (finishErr) {
+        logger.stageEnd('pg:finish-task', {
+          status: 'blad',
+          error: finishErr?.message || String(finishErr),
+        });
+        logger.error('pg:finish-task', 'Failed to update task status', {
+          message: finishErr?.message || String(finishErr),
+        });
+      }
+      return;
+    }
+    logger.stageEnd('load-monitor', {
+      outcome: 'found',
+      tryb_skanu: monitor.tryb_skanu,
+      url: monitor.url,
     });
 
-    if (result.blocked) {
-      await finishTask(taskId, {
-        status: 'blad',
-        blad_opis: 'BOT_PROTECTION',
-        tresc_hash: null,
-        snapshot_mongo_id: snapshotId,
+    logger.stageStart('parse-behavior', { hasSelector: !!monitor.css_selector });
+    const { selector, staticOptions, browserOptions } = parseMonitorBehavior(monitor.css_selector || null);
+    logger.stageEnd('parse-behavior', {
+      selectorPreview: selector ? selector.slice(0, 120) : null,
+      staticOptionKeys: Object.keys(staticOptions || {}),
+      browserOptionKeys: Object.keys(browserOptions || {}),
+    });
+
+    const tryb = (monitor.tryb_skanu || 'static').toLowerCase() === 'browser' ? 'browser' : 'static';
+    const url = monitor.url;
+    logger.info('determine-mode', 'Resolved scan mode', {
+      tryb,
+      url,
+      selectorPreview: selector ? selector.slice(0, 120) : null,
+    });
+
+    logger.stageStart('scan', { url, tryb });
+    const result = await scanUrl({ url, tryb, selector, browserOptions, staticOptions, logger });
+    logger.stageEnd('scan', {
+      mode: result.mode,
+      http_status: result.http_status,
+      blocked: result.blocked,
+      hash: result.hash,
+      finalUrl: result.final_url,
+    });
+
+    logger.stageStart('mongo:save-snapshot', { mode: result.mode });
+    let snapshotId;
+    try {
+      snapshotId = await saveSnapshotToMongo({
+        monitor_id,
+        url,
+        ts: new Date(),
+        mode: result.mode,
+        final_url: result.final_url,
+        html: result.html,
+        meta: result.meta,
+        hash: result.hash,
+        blocked: !!result.blocked,
+        block_reason: result.block_reason || null,
+        screenshot_b64: result.screenshot_b64 || null,
       });
+      logger.stageEnd('mongo:save-snapshot', {
+        snapshotId,
+        htmlLength: result.html ? result.html.length : 0,
+      });
+    } catch (err) {
+      logger.stageEnd('mongo:save-snapshot', {
+        snapshotId: null,
+        error: err?.message || String(err),
+      });
+      throw err;
+    }
+
+    finalSnapshotId = snapshotId;
+    finalHash = result.hash;
+
+    if (result.blocked) {
+      finalStatus = 'blad';
+      finalError = result.block_reason || 'BOT_PROTECTION';
+      logger.warn('scan', 'Result blocked by bot protection', {
+        reason: finalError,
+        status: result.http_status,
+      });
+      logger.stageStart('pg:finish-task', { status: 'blad' });
+      try {
+        await finishTask(taskId, {
+          status: 'blad',
+          blad_opis: result.block_reason || 'BOT_PROTECTION',
+          tresc_hash: null,
+          snapshot_mongo_id: snapshotId,
+        });
+        logger.stageEnd('pg:finish-task', { status: 'blad' });
+      } catch (finishErr) {
+        logger.stageEnd('pg:finish-task', {
+          status: 'blad',
+          error: finishErr?.message || String(finishErr),
+        });
+        logger.error('pg:finish-task', 'Failed to update task status', {
+          message: finishErr?.message || String(finishErr),
+        });
+      }
       return;
     }
 
-    await finishTask(taskId, {
-      status: 'ok',
-      blad_opis: null,
-      tresc_hash: result.hash,
-      snapshot_mongo_id: snapshotId,
-    });
+    logger.stageStart('pg:finish-task', { status: 'ok' });
+    try {
+      await finishTask(taskId, {
+        status: 'ok',
+        blad_opis: null,
+        tresc_hash: result.hash,
+        snapshot_mongo_id: snapshotId,
+      });
+      logger.stageEnd('pg:finish-task', { status: 'ok' });
+    } catch (finishErr) {
+      logger.stageEnd('pg:finish-task', {
+        status: 'ok',
+        error: finishErr?.message || String(finishErr),
+      });
+      logger.error('pg:finish-task', 'Failed to update task status', {
+        message: finishErr?.message || String(finishErr),
+      });
+      throw finishErr;
+    }
+    finalStatus = 'ok';
   } catch (e) {
-    console.error(`[task:${taskId}] error:`, e?.message || e);
-    await finishTask(taskId, {
-      status: 'blad',
-      blad_opis: (e && e.message) ? e.message.slice(0, 500) : 'Unknown error',
-      tresc_hash: null,
-      snapshot_mongo_id: null,
+    finalStatus = 'blad';
+    finalError = e?.message || String(e);
+    logger.error('run', 'Unhandled error during task', {
+      message: finalError,
+      stack: e?.stack,
+    });
+    try {
+      logger.stageStart('pg:finish-task', { status: 'blad' });
+      await finishTask(taskId, {
+        status: 'blad',
+        blad_opis: finalError.slice(0, 500),
+        tresc_hash: null,
+        snapshot_mongo_id: null,
+      });
+      logger.stageEnd('pg:finish-task', { status: 'blad' });
+    } catch (finishErr) {
+      logger.stageEnd('pg:finish-task', {
+        status: 'blad',
+        error: finishErr?.message || String(finishErr),
+      });
+      logger.error('pg:finish-task', 'Failed to update task status', {
+        message: finishErr?.message || String(finishErr),
+      });
+    }
+  } finally {
+    logger.headerEnd({
+      status: finalStatus,
+      durationMs: Date.now() - startedAt,
+      snapshotId: finalSnapshotId,
+      hash: finalHash,
+      error: finalError,
     });
   }
 }
@@ -1250,6 +1705,10 @@ async function main() {
 
   const once = has('--once');
   const monitorId = getArg('--monitor-id');
+  if (monitorId && !isUuid(monitorId)) {
+    console.error(`[cli] invalid monitor id: ${monitorId}`);
+    process.exit(1);
+  }
 
   if (once && monitorId) {
     // Jednorazowy scan konkretnego monitora (bez globalnego planowania)
