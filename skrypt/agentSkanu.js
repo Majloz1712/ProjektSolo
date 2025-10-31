@@ -676,6 +676,74 @@ async function collectBrowserSnapshot(page, {
   try {
     await page.goto(url, gotoOptions);
 
+    try {
+      const lowerFrom = 'ABCDEFGHIJKLMNOPQRSTUVWXYZĄĆĘŁŃÓŚŹŻ';
+      const lowerTo = 'abcdefghijklmnopqrstuvwxyząćęłńóśźż';
+      const keywords = ['zgadzam', 'akceptuj', 'akceptuję', 'ok', 'accept', 'i agree', 'consent'];
+      const keywordConditions = keywords
+        .map((word) => `contains(translate(normalize-space(.), "${lowerFrom}", "${lowerTo}"), "${word}")`)
+        .join(' or ');
+      const keywordValueConditions = keywords
+        .map((word) => `contains(translate(normalize-space(@value), "${lowerFrom}", "${lowerTo}"), "${word}")`)
+        .join(' or ');
+      const consentXPaths = [
+        `//*[self::button or self::a or self::div or self::span or self::p or self::label][${keywordConditions}]`,
+        `//input[(${keywordValueConditions})]`,
+      ];
+
+      let clickedConsent = false;
+
+      for (const xpath of consentXPaths) {
+        if (clickedConsent) break;
+        // eslint-disable-next-line no-await-in-loop
+        const handles = await page.$x(xpath);
+        for (const handle of handles) {
+          // eslint-disable-next-line no-await-in-loop
+          const isVisible = await handle
+            .evaluate((el) => {
+              const style = window.getComputedStyle(el);
+              const rect = el.getBoundingClientRect();
+              if (!rect) return false;
+              const hidden =
+                style.visibility === 'hidden' ||
+                style.display === 'none' ||
+                rect.width === 0 ||
+                rect.height === 0;
+              return !hidden;
+            })
+            .catch(() => false);
+
+          if (!isVisible) {
+            // eslint-disable-next-line no-continue
+            continue;
+          }
+
+          // eslint-disable-next-line no-await-in-loop
+          const label = await handle
+            .evaluate((el) => (el.innerText || el.textContent || el.value || '').trim())
+            .catch(() => '');
+
+          try {
+            // eslint-disable-next-line no-await-in-loop
+            await handle.click();
+            console.log(`[cookie-consent] clicked: "${label || 'unknown'}"`);
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise((resolve) => setTimeout(resolve, 1_500));
+            clickedConsent = true;
+            break;
+          } catch (_) {
+            // Continue searching other candidates if clicking failed
+          }
+        }
+      }
+
+      if (!clickedConsent) {
+        console.log('[cookie-consent] no consent buttons found');
+      }
+    } catch (err) {
+      console.log(`[cookie-consent] handler error: ${err?.message || err}`);
+    }
+
     await waitForPageReadiness(page, {
       ...opts,
       waitAfterMs,
