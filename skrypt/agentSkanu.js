@@ -164,6 +164,18 @@ function normalizeUrl(u) {
   }
 }
 
+function appendCacheBuster(url) { // ADD
+  const stamp = Date.now().toString(); // ADD
+  try { // ADD
+    const parsed = new URL(url); // ADD
+    parsed.searchParams.set('_t', stamp); // ADD
+    return parsed.toString(); // ADD
+  } catch (_) { // ADD
+    const joiner = url.includes('?') ? '&' : '?'; // ADD
+    return `${url}${joiner}_t=${stamp}`; // ADD
+  } // ADD
+} // ADD
+
 function ensureObject(val) {
   if (!val || typeof val !== 'object') return {};
   return val;
@@ -440,6 +452,7 @@ async function configurePage(page) {
   try {
     await page.setBypassCSP(true);
   } catch (_) {}
+  try { await page.setCacheEnabled(false); } catch (_) {} // FIX
   page.setDefaultNavigationTimeout(BROWSER_TIMEOUT_MS);
   page.setDefaultTimeout(BROWSER_TIMEOUT_MS);
 }
@@ -641,94 +654,119 @@ async function waitForPageReadiness(page, options = {}) {
 
 
 // ---- Tryb STATIC ----
-async function fetchStatic(url, { selector, headers = {}, fetchOptions = {}, logger } = {}) {
-  const startedAt = Date.now();
-  logger?.stageStart('static:request', {
-    url,
-    timeoutMs: STATIC_TIMEOUT_MS,
-    headers: Object.keys(headers || {}),
-  });
-  let res;
-  try {
-    res = await fetchWithTimeout(
-      url,
-      {
-        redirect: 'follow',
-        headers: {
-          'user-agent': USER_AGENT,
-          'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          ...headers,
-        },
-        ...fetchOptions,
-      },
-      STATIC_TIMEOUT_MS,
-      'Static timeout'
-    );
-  } catch (err) {
-    logger?.stageEnd('static:request', {
-      finalUrl: url,
-      status: null,
-      error: err?.message || String(err),
-    });
-    throw err;
-  }
+async function fetchStatic(url, { selector, headers = {}, fetchOptions = {}, logger } = {}) { // FIX
+  const startedAt = Date.now(); // FIX
+  const requestUrl = appendCacheBuster(url); // FIX
+  const staticHeaders = { // FIX
+    'user-agent': USER_AGENT, // FIX
+    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', // FIX
+    'accept-language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7', // FIX
+    'cache-control': 'no-cache', // FIX
+    'pragma': 'no-cache', // FIX
+    ...headers, // FIX
+  }; // FIX
+  logger?.stageStart('static:request', { // FIX
+    url: requestUrl, // FIX
+    timeoutMs: STATIC_TIMEOUT_MS, // FIX
+    headers: Object.keys(staticHeaders || {}), // FIX
+  }); // FIX
+  let res; // FIX
+  try { // FIX
+    res = await fetchWithTimeout( // FIX
+      requestUrl, // FIX
+      { // FIX
+        redirect: 'follow', // FIX
+        headers: staticHeaders, // FIX
+        ...fetchOptions, // FIX
+      }, // FIX
+      STATIC_TIMEOUT_MS, // FIX
+      'Static timeout' // FIX
+    ); // FIX
+  } catch (err) { // FIX
+    logger?.stageEnd('static:request', { // FIX
+      finalUrl: requestUrl, // FIX
+      status: null, // FIX
+      error: err?.message || String(err), // FIX
+    }); // FIX
+    throw err; // FIX
+  } // FIX
 
-  const finalUrl = res.url || url;
-  const status = res.status;
-  logger?.stageEnd('static:request', { finalUrl, status });
+  const finalUrl = res.url || requestUrl; // FIX
+  const status = res.status; // FIX
+  logger?.stageEnd('static:request', { finalUrl, status }); // FIX
 
-  logger?.stageStart('static:read-body', {});
-  let buffer;
-  try {
-    buffer = await res.arrayBuffer();
-  } catch (err) {
-    logger?.stageEnd('static:read-body', { error: err?.message || String(err) });
-    throw err;
-  }
-  let html = Buffer.from(buffer).toString('utf8');
-  if (html.length > TEXT_TRUNCATE_AT) html = html.slice(0, TEXT_TRUNCATE_AT);
-  logger?.stageEnd('static:read-body', { length: html.length });
+  logger?.stageStart('static:read-body', {}); // FIX
+  let buffer; // FIX
+  try { // FIX
+    buffer = await res.arrayBuffer(); // FIX
+  } catch (err) { // FIX
+    logger?.stageEnd('static:read-body', { error: err?.message || String(err) }); // FIX
+    throw err; // FIX
+  } // FIX
+  let html = Buffer.from(buffer).toString('utf8'); // FIX
+  if (html.length > TEXT_TRUNCATE_AT) html = html.slice(0, TEXT_TRUNCATE_AT); // FIX
+  logger?.stageEnd('static:read-body', { length: html.length }); // FIX
 
-  logger?.stageStart('static:parse', { selector: !!selector });
-  let fragmentHtml = null;
-  let meta;
-  let content;
-  let hash;
-  try {
-    const dom = new JSDOM(html);
-    const { document } = dom.window;
+  logger?.stageStart('static:parse', { selector: !!selector }); // FIX
+  let fragmentHtml = null; // FIX
+  let meta; // FIX
+  let content; // FIX
+  let hash; // FIX
+  try { // FIX
+    const dom = new JSDOM(html); // FIX
+    const { document } = dom.window; // FIX
 
-    if (selector) {
-      const node = document.querySelector(selector);
-      fragmentHtml = node ? node.outerHTML : null;
-    }
+    if (selector) { // FIX
+      const node = document.querySelector(selector); // FIX
+      fragmentHtml = node ? node.outerHTML : null; // FIX
+    } // FIX
 
-    meta = pickMetaFromDocument(document);
-    content = fragmentHtml || html;
-    hash = sha256(content);
-  } catch (err) {
-    logger?.stageEnd('static:parse', {
-      fragmentFound: !!fragmentHtml,
-      error: err?.message || String(err),
-    });
-    throw err;
-  }
-  logger?.stageEnd('static:parse', {
-    fragmentFound: !!fragmentHtml,
-    metaKeys: Object.keys(meta || {}),
-    hash,
-  });
+    meta = pickMetaFromDocument(document); // FIX
+    content = fragmentHtml || html; // FIX
+    hash = sha256(content); // FIX
+  } catch (err) { // FIX
+    logger?.stageEnd('static:parse', { // FIX
+      fragmentFound: !!fragmentHtml, // FIX
+      error: err?.message || String(err), // FIX
+    }); // FIX
+    throw err; // FIX
+  } // FIX
+  logger?.stageEnd('static:parse', { // FIX
+    fragmentFound: !!fragmentHtml, // FIX
+    metaKeys: Object.keys(meta || {}), // FIX
+    hash, // FIX
+  }); // FIX
 
-  return {
-    mode: 'static',
-    startedAt,
-    finishedAt: Date.now(),
-    final_url: finalUrl,
-    http_status: status,
-    html: content,
-    meta,
-    hash,
-  };
+  const htmlLower = (content || '').toLowerCase(); // FIX
+  let blocked = false; // FIX
+  let block_reason = null; // FIX
+  const checks = [ // FIX
+    { match: () => status === 403, reason: 'HTTP_403' }, // FIX
+    { match: () => htmlLower.includes('captcha') || finalUrl.toLowerCase().includes('captcha'), reason: 'CAPTCHA_DETECTED' }, // FIX
+    { match: () => htmlLower.includes('please enable javascript') || htmlLower.includes('please enable js'), reason: 'JS_REQUIRED' }, // FIX
+    { match: () => finalUrl.toLowerCase().includes('geo.captcha-delivery.com') || htmlLower.includes('geo.captcha-delivery.com'), reason: 'GEO_CAPTCHA' }, // FIX
+  ]; // FIX
+  for (const check of checks) { // FIX
+    if (check.match()) { // FIX
+      blocked = true; // FIX
+      if (!block_reason) block_reason = check.reason; // FIX
+    } // FIX
+  } // FIX
+
+  console.log(`FETCH static status=${status} blocked=${blocked} reason=${block_reason || 'none'} finalUrl=${finalUrl} length=${content.length}`); // LOG
+
+  return { // FIX
+    mode: 'static', // FIX
+    startedAt, // FIX
+    finishedAt: Date.now(), // FIX
+    final_url: finalUrl, // FIX
+    http_status: status, // FIX
+    html: content, // FIX
+    meta, // FIX
+    hash, // FIX
+    blocked, // FIX
+    block_reason, // FIX
+  }; // FIX
 }
 
 // ---- Tryb BROWSER (Puppeteer + stealth + heurystyka bot-wall + screenshot) ----
@@ -1151,9 +1189,12 @@ async function fetchBrowser(url, { selector, browserOptions = {}, logger } = {})
       }
     }
 
-    const http_status = snapshot.navStatus || 200;
+    const http_status = snapshot.navStatus || 200; // FIX
 
-    return {
+    const screenshotInfo = snapshot.screenshot_b64 ? snapshot.screenshot_b64.length : 0; // FIX
+    console.log(`BROWSER status=${http_status} blocked=${!!snapshot.blocked} finalUrl=${snapshot.finalUrl || url} screenshotLength=${screenshotInfo}`); // LOG
+
+    return { // FIX
       mode: 'browser',
       startedAt,
       finishedAt: Date.now(),
@@ -1203,15 +1244,37 @@ async function scanUrl({ url, tryb, selector, browserOptions = {}, staticOptions
         });
         return result;
       }
-      const result = await fetchStatic(normUrl, { selector, ...staticOptions, logger });
-      logger?.stageEnd('scan-attempt', {
-        attempt: i + 1,
-        outcome: 'success',
-        mode: result.mode,
-        status: result.http_status,
-        blocked: false,
-      });
-      return result;
+      let result = await fetchStatic(normUrl, { selector, ...staticOptions, logger }); // FIX
+      const htmlCheck = (result.html || '').toLowerCase(); // FIX
+      let fallbackTriggered = false; // FIX
+      let fallbackReason = null; // FIX
+      if (result.blocked) { // FIX
+        fallbackTriggered = true; // FIX
+        fallbackReason = result.block_reason || 'static-blocked'; // FIX
+      } else if (result.http_status === 403) { // FIX
+        fallbackTriggered = true; // FIX
+        fallbackReason = 'http-403'; // FIX
+      } else if (htmlCheck.includes('captcha')) { // FIX
+        fallbackTriggered = true; // FIX
+        fallbackReason = 'captcha-detected'; // FIX
+      } else if (htmlCheck.includes('please enable js') || htmlCheck.includes('please enable javascript')) { // FIX
+        fallbackTriggered = true; // FIX
+        fallbackReason = 'javascript-required'; // FIX
+      } // FIX
+      if (fallbackTriggered) { // FIX
+        console.log(`FALLBACK url=${normUrl} reason=${fallbackReason}`); // LOG
+        logger?.info('scan', 'Fallback to browser', { reason: fallbackReason, status: result.http_status }); // FIX
+        result = await fetchBrowser(normUrl, { selector, browserOptions, logger }); // FIX
+      } // FIX
+      logger?.stageEnd('scan-attempt', { // FIX
+        attempt: i + 1, // FIX
+        outcome: 'success', // FIX
+        mode: result.mode, // FIX
+        status: result.http_status, // FIX
+        blocked: !!result.blocked, // FIX
+        fallback: fallbackTriggered, // FIX
+      }); // FIX
+      return result; // FIX
     } catch (e) {
       lastErr = e;
       logger?.stageEnd('scan-attempt', {
@@ -1241,89 +1304,65 @@ async function withPg(tx) {
   }
 }
 
-// Planowanie: tworzymy zadania dla monitorów, którym minął interwał
-async function scheduleDue({ onlyMonitorId = null } = {}) {
-  if (onlyMonitorId && !isUuid(onlyMonitorId)) {
-    throw new Error('INVALID_MONITOR_ID');
-  }
-  return withPg(async (pg) => {
-    try {
-      await pg.query('BEGIN');
-
-      if (onlyMonitorId) {
-        const r = await pg.query(
-          `INSERT INTO zadania_skanu (id, monitor_id, zaplanowano_at, status)
-           VALUES (gen_random_uuid(), $1, NOW(), 'oczekuje')
-           RETURNING id`,
-          [onlyMonitorId]
-        );
-        await pg.query('COMMIT');
-        return r.rowCount || 0;
-      }
-
-      const dueSQL = `
-        WITH ostatnie AS (
-          SELECT m.id AS monitor_id,
-                 m.interwal_sec,
-                 MAX(z.zaplanowano_at) AS last_plan
-          FROM monitory m
-          LEFT JOIN zadania_skanu z ON z.monitor_id = m.id
-          WHERE m.aktywny = true
-          GROUP BY m.id, m.interwal_sec
-        ),
-        due AS (
-          SELECT o.monitor_id
-          FROM ostatnie o
-          WHERE o.last_plan IS NULL
-             OR EXTRACT(EPOCH FROM (NOW() - o.last_plan)) >= o.interwal_sec
-        )
-        INSERT INTO zadania_skanu (id, monitor_id, zaplanowano_at, status)
-        SELECT gen_random_uuid(), monitor_id, NOW(), 'oczekuje'
-        FROM due
-        LIMIT $1
-        RETURNING id
-      `;
-      const r = await pg.query(dueSQL, [SCHEDULE_BATCH_LIMIT]);
-      await pg.query('COMMIT');
-      return r.rowCount || 0;
-    } catch (e) {
-      try { await pg.query('ROLLBACK'); } catch {}
-      throw e;
-    }
-  });
-}
+// Planowanie: tworzymy zadania tylko dla wskazanego monitora
+async function scheduleMonitorDue(monitorId) { // FIX
+  if (!isUuid(monitorId)) { // FIX
+    throw new Error('INVALID_MONITOR_ID'); // FIX
+  } // FIX
+  return withPg(async (pg) => { // FIX
+    try { // FIX
+      await pg.query('BEGIN'); // FIX
+      const res = await pg.query( // FIX
+        `INSERT INTO zadania_skanu (id, monitor_id, zaplanowano_at, status)
+         VALUES (gen_random_uuid(), $1::uuid, NOW(), 'oczekuje')
+         RETURNING id`, // FIX
+        [monitorId] // FIX
+      ); // FIX
+      await pg.query('COMMIT'); // FIX
+      return res.rowCount || 0; // FIX
+    } catch (e) { // FIX
+      try { await pg.query('ROLLBACK'); } catch {} // FIX
+      throw e; // FIX
+    } // FIX
+  }); // FIX
+} // FIX
 
 
-// Pobierz paczkę do realizacji i zarezerwuj
-async function claimBatch(limit) {
-  return withPg(async (pg) => {
-    try {
-      await pg.query('BEGIN');
-      const res = await pg.query(
-        `
-        UPDATE zadania_skanu
-           SET status = 'przetwarzanie',
-               rozpoczecie_at = NOW()
-         WHERE id IN (
-           SELECT id
-             FROM zadania_skanu
-            WHERE status = 'oczekuje'
-            ORDER BY zaplanowano_at ASC
-            LIMIT $1
+// Pobierz paczkę tylko dla wybranego monitora i usuń duplikaty później
+async function claimMonitorBatch(monitorId, limit) { // FIX
+  if (!isUuid(monitorId)) { // FIX
+    throw new Error('INVALID_MONITOR_ID'); // FIX
+  } // FIX
+  return withPg(async (pg) => { // FIX
+    try { // FIX
+      await pg.query('BEGIN'); // FIX
+      const res = await pg.query( // FIX
+        `WITH picked AS (
+           SELECT z.id, m.url
+             FROM zadania_skanu z
+             JOIN monitory m ON m.id = z.monitor_id
+            WHERE z.status = 'oczekuje'
+              AND z.monitor_id = $1::uuid
+            ORDER BY z.zaplanowano_at ASC
+            LIMIT $2
             FOR UPDATE SKIP LOCKED
          )
-         RETURNING id, monitor_id
-        `,
-        [limit]
-      );
-      await pg.query('COMMIT');
-      return res.rows;
-    } catch (e) {
-      try { await pg.query('ROLLBACK'); } catch {}
-      throw e;
-    }
-  });
-}
+         UPDATE zadania_skanu z
+            SET status = 'przetwarzanie',
+                rozpoczecie_at = NOW()
+           FROM picked p
+          WHERE z.id = p.id
+          RETURNING z.id, z.monitor_id, p.url AS url`, // FIX
+        [monitorId, limit] // FIX
+      ); // FIX
+      await pg.query('COMMIT'); // FIX
+      return res.rows; // FIX
+    } catch (e) { // FIX
+      try { await pg.query('ROLLBACK'); } catch {} // FIX
+      throw e; // FIX
+    } // FIX
+  }); // FIX
+} // FIX
 
 
 // Wczytaj konfigurację monitora
@@ -1440,7 +1479,8 @@ async function processTask(task) {
     });
 
     const tryb = (monitor.tryb_skanu || 'static').toLowerCase() === 'browser' ? 'browser' : 'static';
-    const url = monitor.url;
+    const url = monitor.url; // FIX
+    console.log(`SCAN START monitor=${monitor_id} url=${url}`); // LOG
     logger.info('determine-mode', 'Resolved scan mode', {
       tryb,
       url,
@@ -1473,6 +1513,7 @@ async function processTask(task) {
         block_reason: result.block_reason || null,
         screenshot_b64: result.screenshot_b64 || null,
       });
+      console.log(`MONGO snapshot=${snapshotId} monitor=${monitor_id} blocked=${!!result.blocked}`); // LOG
       logger.stageEnd('mongo:save-snapshot', {
         snapshotId,
         htmlLength: result.html ? result.html.length : 0,
@@ -1562,9 +1603,11 @@ async function processTask(task) {
       });
     }
   } finally {
-    logger.headerEnd({
+    const duration = Date.now() - startedAt; // FIX
+    console.log(`SCAN END monitor=${monitor_id} status=${finalStatus} durationMs=${duration} error=${finalError || 'none'}`); // LOG
+    logger.headerEnd({ // FIX
       status: finalStatus,
-      durationMs: Date.now() - startedAt,
+      durationMs: duration, // FIX
       snapshotId: finalSnapshotId,
       hash: finalHash,
       error: finalError,
@@ -1574,32 +1617,52 @@ async function processTask(task) {
 
 
 
-async function runExecutionCycle() {
-  // 1) planowanie
-  try {
-    const planned = await scheduleDue();
-    if (planned) console.log(`[plan] dodano zadań: ${planned}`);
-  } catch (e) {
-    console.error('[plan] błąd planowania:', e.message);
-  }
+async function runExecutionCycle(monitorId) { // FIX
+  if (!isUuid(monitorId)) { // FIX
+    throw new Error('INVALID_MONITOR_ID'); // FIX
+  } // FIX
+  try { // FIX
+    const planned = await scheduleMonitorDue(monitorId); // FIX
+    if (planned) { // FIX
+      console.log(`PLAN scheduled=${planned} monitor=${monitorId}`); // LOG
+    } // FIX
+  } catch (e) { // FIX
+    console.error(`[PLAN] error=${e?.message || e}`); // LOG
+  } // FIX
 
-  // 2) pobranie paczki
-  let tasks = [];
-  try {
-    tasks = await claimBatch(MAX_CONCURRENCY);
-  } catch (e) {
-    console.error('[claim] błąd rezerwacji:', e.message);
-  }
+  let tasks = []; // FIX
+  try { // FIX
+    tasks = await claimMonitorBatch(monitorId, MAX_CONCURRENCY); // FIX
+  } catch (e) { // FIX
+    console.error(`[PLAN] claim-error=${e?.message || e}`); // LOG
+  } // FIX
 
-  // 3) wykonanie
-  for (const t of tasks) {
-    queue.add(() => processTask(t)).catch((e) =>
-      console.error('[task] błąd krytyczny:', e)
-    );
-  }
+  const uniqueByUrl = new Map(); // FIX
+  const duplicates = []; // FIX
+  for (const task of tasks) { // FIX
+    if (!task?.url) { // FIX
+      uniqueByUrl.set(`${task.id}`, task); // FIX
+      continue; // FIX
+    } // FIX
+    if (uniqueByUrl.has(task.url)) { // FIX
+      duplicates.push(task); // FIX
+    } else { // FIX
+      uniqueByUrl.set(task.url, task); // FIX
+    } // FIX
+  } // FIX
+  const uniqueTasks = Array.from(uniqueByUrl.values()); // FIX
+  console.log(`PLAN monitor=${monitorId} fetched=${tasks.length} unique=${uniqueTasks.length}`); // LOG
+  for (const dup of duplicates) { // FIX
+    finishTask(dup.id, { status: 'blad', blad_opis: 'DUPLICATE_URL', tresc_hash: null, snapshot_mongo_id: null }).catch(() => {}); // FIX
+  } // FIX
 
-  // 4) poczekaj na zakończenie kolejki przed wyjściem w trybie --once
-  await queue.onIdle();
+  for (const t of uniqueTasks) { // FIX
+    queue.add(() => processTask(t)).catch((e) => // FIX
+      console.error('[task] błąd krytyczny:', e) // FIX
+    ); // FIX
+  } // FIX
+
+  await queue.onIdle(); // FIX
 }
 
 // ---- RESET ----
@@ -1648,30 +1711,25 @@ async function main() {
     console.error(`[cli] invalid monitor id: ${monitorId}`);
     process.exit(1);
   }
-
-  if (once && monitorId) {
-    // Jednorazowy scan konkretnego monitora (bez globalnego planowania)
-    console.log(`[once] uruchamiam jednorazowy scan monitora ${monitorId}`);
-    // zaplanuj pojedyncze zadanie dla tego monitora
-    await scheduleDue({ onlyMonitorId: monitorId });
-    await runExecutionCycle();
-    return;
+  if (!monitorId) { // FIX
+    console.error('[cli] monitor-id is required for scanning'); // LOG
+    process.exit(1); // FIX
   }
 
   if (once) {
-    console.log('[once] pojedynczy cykl: planowanie + wykonanie');
-    await runExecutionCycle();
+    console.log(`[once] uruchamiam jednorazowy scan monitora ${monitorId}`); // LOG
+    await runExecutionCycle(monitorId); // FIX
     return;
   }
 
   console.log(`[loop] start pętli co ${LOOP_MS} ms`);
   // pierwsze odpalenie od razu
-  await runExecutionCycle();
+  await runExecutionCycle(monitorId); // FIX
 
   // cyklicznie
   setInterval(async () => {
     try {
-      await runExecutionCycle();
+      await runExecutionCycle(monitorId); // FIX
     } catch (e) {
       console.error('[loop] cykl błąd:', e?.message || e);
     }
