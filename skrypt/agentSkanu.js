@@ -124,17 +124,17 @@ async function ensureMongo() {
 }
 
 async function saveSnapshotToMongo(doc) {
-  const db = await ensureMongo();
-  const col = db.collection('snapshots');
-  const res = await col.insertOne(doc);
-  return res.insertedId?.toString();
+  const snapshotsDb = await ensureMongo();
+  const snapshotsCollection = snapshotsDb.collection('snapshots');
+  const insertResult = await snapshotsCollection.insertOne(doc);
+  return insertResult.insertedId?.toString();
 }
 
 async function clearMongoSnapshots() {
-  const db = await ensureMongo();
-  const col = db.collection('snapshots');
-  const r = await col.deleteMany({});
-  return r.deletedCount || 0;
+  const cleanupDb = await ensureMongo();
+  const cleanupCollection = cleanupDb.collection('snapshots');
+  const cleanupResult = await cleanupCollection.deleteMany({});
+  return cleanupResult.deletedCount || 0;
 }
 
 // ---- Utils ----
@@ -145,7 +145,8 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 20_000, message =
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetchFn(url, { ...options, signal: controller.signal });
+    const response = await fetchFn(url, { ...options, signal: controller.signal });
+    return response;
   } catch (e) {
     const enriched = new Error(e?.message || 'fetch failed');
     enriched.code = e?.code;
@@ -172,8 +173,8 @@ function normalizeUrl(u) { // FIX
     urlObj.hash = ''; // FIX
     const params = urlObj.searchParams; // FIX
     for (const key of Array.from(params.keys())) { // FIX
-      const lower = key.toLowerCase(); // FIX
-      if (TRACKER_PARAMS.has(lower) || TRACKER_PREFIXES.some((prefix) => lower.startsWith(prefix))) { // FIX
+      const lowerKey = key.toLowerCase(); // FIX
+      if (TRACKER_PARAMS.has(lowerKey) || TRACKER_PREFIXES.some((prefix) => lowerKey.startsWith(prefix))) { // FIX
         params.delete(key); // FIX
       }
     }
@@ -193,9 +194,9 @@ function normalizeUrl(u) { // FIX
 function appendCacheBuster(url) { // ADD
   const stamp = Date.now().toString(); // ADD
   try { // ADD
-    const parsed = new URL(url); // ADD
-    parsed.searchParams.set('_t', stamp); // ADD
-    return parsed.toString(); // ADD
+    const parsedUrl = new URL(url); // ADD
+    parsedUrl.searchParams.set('_t', stamp); // ADD
+    return parsedUrl.toString(); // ADD
   } catch (_) { // ADD
     const joiner = url.includes('?') ? '&' : '?'; // ADD
     return `${url}${joiner}_t=${stamp}`; // ADD
@@ -229,7 +230,7 @@ function createRunId(taskId, monitorId) {
 
 function createRunLogger({ taskId, monitorId }) {
   const runId = createRunId(taskId, monitorId);
-  const base = `[scan:${runId}]`;
+  const runTag = `[scan:${runId}]`;
   const timestamp = () => new Date().toISOString();
   const formatExtra = (extra) => {
     if (!extra || (typeof extra === 'object' && Object.keys(extra).length === 0)) {
@@ -244,7 +245,7 @@ function createRunLogger({ taskId, monitorId }) {
   const emit = (level, stage, message, extra, channel = 'log') => {
     const stagePart = stage ? ` | stage=${stage}` : '';
     const extraPart = formatExtra(extra);
-    const line = `${timestamp()} ${base} | level=${level}${stagePart} | ${message}${extraPart}`;
+    const line = `${timestamp()} ${runTag} | level=${level}${stagePart} | ${message}${extraPart}`;
     if (channel === 'warn') {
       console.warn(line);
     } else if (channel === 'error') {
@@ -295,150 +296,21 @@ function parseMonitorBehavior(rawSelector) {
   const trimmed = String(rawSelector).trim();
   if (trimmed.startsWith('{')) {
     try {
-      const parsed = JSON.parse(trimmed);
-      if (typeof parsed === 'string') {
-        config.selector = parsed;
+      const parsedConfig = JSON.parse(trimmed);
+      if (typeof parsedConfig === 'string') {
+        config.selector = parsedConfig;
         return config;
       }
-      const browser = ensureObject(parsed.browser || parsed.browserOptions);
-      const statik = ensureObject(parsed.static || parsed.staticOptions);
-      config.selector = parsed.selector ?? parsed.css_selector ?? null;
+      const browserConfig = ensureObject(parsedConfig.browser || parsedConfig.browserOptions);
+      const statik = ensureObject(parsedConfig.static || parsedConfig.staticOptions);
+      config.selector = parsedConfig.selector ?? parsedConfig.css_selector ?? null;
       config.staticOptions = { ...statik };
-      config.browserOptions = { ...browser };
-      if (!config.selector && typeof parsed.cssSelector === 'string') {
-        config.selector = parsed.cssSelector;
+      config.browserOptions = { ...browserConfig };
+      if (!config.selector && typeof parsedConfig.cssSelector === 'string') {
+        config.selector = parsedConfig.cssSelector;
       }
-      if (!config.selector && typeof parsed.selector === 'string') {
-        config.selector = parsed.selector;
-      }
-    } catch (_) {
-      config.selector = trimmed;
-    }
-  }
-
-  return config;
-}
-
-function appendCacheBuster(url) { // ADD
-  const stamp = Date.now().toString(); // ADD
-  try { // ADD
-    const parsed = new URL(url); // ADD
-    parsed.searchParams.set('_t', stamp); // ADD
-    return parsed.toString(); // ADD
-  } catch (_) { // ADD
-    const joiner = url.includes('?') ? '&' : '?'; // ADD
-    return `${url}${joiner}_t=${stamp}`; // ADD
-  } // ADD
-} // ADD
-
-function ensureObject(val) {
-  if (!val || typeof val !== 'object') return {};
-  return val;
-}
-
-function randomInt(min, max) {
-  return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
-function pickRandomProfile() {
-  return { ...DESKTOP_PROFILES[randomInt(0, DESKTOP_PROFILES.length - 1)] };
-}
-
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-function isUuid(value) {
-  return typeof value === 'string' && UUID_REGEX.test(value);
-}
-
-function createRunId(taskId, monitorId) {
-  const base = taskId ? taskId.slice(0, 8) : 'manual';
-  const rand = Math.random().toString(36).slice(2, 8);
-  return `${base}-${rand}-${monitorId ? monitorId.slice(0, 4) : 'ctx'}`;
-}
-
-function createRunLogger({ taskId, monitorId }) {
-  const runId = createRunId(taskId, monitorId);
-  const base = `[scan:${runId}]`;
-  const timestamp = () => new Date().toISOString();
-  const formatExtra = (extra) => {
-    if (!extra || (typeof extra === 'object' && Object.keys(extra).length === 0)) {
-      return '';
-    }
-    try {
-      return ` | data=${JSON.stringify(extra)}`;
-    } catch (_) {
-      return '';
-    }
-  };
-  const emit = (level, stage, message, extra, channel = 'log') => {
-    const stagePart = stage ? ` | stage=${stage}` : '';
-    const extraPart = formatExtra(extra);
-    const line = `${timestamp()} ${base} | level=${level}${stagePart} | ${message}${extraPart}`;
-    if (channel === 'warn') {
-      console.warn(line);
-    } else if (channel === 'error') {
-      console.error(line);
-    } else {
-      console.log(line);
-    }
-  };
-  return {
-    runId,
-    headerStart(meta) {
-      emit('HEADER', 'run', 'START', meta);
-    },
-    headerEnd(meta) {
-      emit('HEADER', 'run', 'END', meta);
-    },
-    stageStart(stage, meta) {
-      emit('STAGE', stage, 'START', meta);
-    },
-    stageEnd(stage, meta) {
-      emit('STAGE', stage, 'END', meta);
-    },
-    info(stage, message, meta) {
-      emit('INFO', stage, message, meta);
-    },
-    warn(stage, message, meta) {
-      emit('WARN', stage, message, meta, 'warn');
-    },
-    error(stage, message, meta) {
-      emit('ERROR', stage, message, meta, 'error');
-    },
-  };
-}
-
-// css_selector może być zwykłym selektorem lub JSON-em np.:
-// { "selector": "#app", "browserOptions": { "waitForSelector": "#loaded", "scrollToBottom": true } }
-function parseMonitorBehavior(rawSelector) {
-  const config = {
-    selector: rawSelector || null,
-    staticOptions: {},
-    browserOptions: {},
-  };
-
-  if (!rawSelector) {
-    return config;
-  }
-
-  const trimmed = String(rawSelector).trim();
-  if (trimmed.startsWith('{')) {
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (typeof parsed === 'string') {
-        config.selector = parsed;
-        return config;
-      }
-      const browser = ensureObject(parsed.browser || parsed.browserOptions);
-      const statik = ensureObject(parsed.static || parsed.staticOptions);
-      config.selector = parsed.selector ?? parsed.css_selector ?? null;
-      config.staticOptions = { ...statik };
-      config.browserOptions = { ...browser };
-      if (!config.selector && typeof parsed.cssSelector === 'string') {
-        config.selector = parsed.cssSelector;
-      }
-      if (!config.selector && typeof parsed.selector === 'string') {
-        config.selector = parsed.selector;
+      if (!config.selector && typeof parsedConfig.selector === 'string') {
+        config.selector = parsedConfig.selector;
       }
     } catch (_) {
       config.selector = trimmed;
@@ -482,17 +354,17 @@ function getDomainFromUrl(url) { // ADD
 } // ADD
 
 function ensureDomainState(host) { // ADD
-  let state = domainStates.get(host); // ADD
-  if (!state) { // ADD
-    state = { // ADD
+  let storedDomainState = domainStates.get(host); // ADD
+  if (!storedDomainState) { // ADD
+    storedDomainState = { // ADD
       lock: Promise.resolve(), // ADD
       nextAllowedAt: 0, // ADD
       backoffMs: DOMAIN_MIN_DELAY_MS, // ADD
       blockedUntil: 0, // ADD
     }; // ADD
-    domainStates.set(host, state); // ADD
+    domainStates.set(host, storedDomainState); // ADD
   } // ADD
-  return state; // ADD
+  return storedDomainState; // ADD
 } // ADD
 
 async function acquireDomainSlot(url, { logger, monitorId } = {}) { // ADD
@@ -503,10 +375,10 @@ async function acquireDomainSlot(url, { logger, monitorId } = {}) { // ADD
       release: () => {}, // ADD
     }; // ADD
   } // ADD
-  const state = ensureDomainState(host); // ADD
+  const domainState = ensureDomainState(host); // ADD
   const now = Date.now(); // ADD
-  if (state.blockedUntil && now < state.blockedUntil) { // ADD
-    const waitMs = state.blockedUntil - now; // ADD
+  if (domainState.blockedUntil && now < domainState.blockedUntil) { // ADD
+    const waitMs = domainState.blockedUntil - now; // ADD
     logger?.warn('throttle', 'Domain blocked window active', { domain: host, waitMs, monitorId }); // ADD
     const error = new Error('DOMAIN_BLOCKED'); // ADD
     error.code = 'DOMAIN_BLOCKED'; // ADD
@@ -515,8 +387,8 @@ async function acquireDomainSlot(url, { logger, monitorId } = {}) { // ADD
   } // ADD
 
   let releaseResolve; // ADD
-  const ticket = state.lock.then(async () => { // ADD
-    const delay = Math.max(state.nextAllowedAt - Date.now(), 0); // ADD
+  const ticket = domainState.lock.then(async () => { // ADD
+    const delay = Math.max(domainState.nextAllowedAt - Date.now(), 0); // ADD
     const jitter = randomInt(0, 3_000); // ADD
     if (delay + jitter > 0) { // ADD
       logger?.info('throttle', 'Domain delay before scan', { domain: host, waitMs: delay + jitter, monitorId }); // ADD
@@ -524,7 +396,7 @@ async function acquireDomainSlot(url, { logger, monitorId } = {}) { // ADD
     } // ADD
   }); // ADD
 
-  state.lock = ticket.then(() => new Promise((resolve) => { releaseResolve = resolve; })); // ADD
+  domainState.lock = ticket.then(() => new Promise((resolve) => { releaseResolve = resolve; })); // ADD
   await ticket; // ADD
 
   let released = false; // ADD
@@ -535,17 +407,17 @@ async function acquireDomainSlot(url, { logger, monitorId } = {}) { // ADD
       released = true; // ADD
       const finishNow = Date.now(); // ADD
       if (blocked) { // ADD
-        state.blockedUntil = finishNow + DOMAIN_BLOCK_PAUSE_MS; // ADD
-        state.backoffMs = Math.min(state.backoffMs * 2, DOMAIN_BACKOFF_MAX_MS); // ADD
-        state.nextAllowedAt = state.blockedUntil + randomInt(DOMAIN_MIN_DELAY_MS, DOMAIN_MAX_DELAY_MS); // ADD
-        logger?.warn('throttle', 'Domain blocked - pausing', { domain: host, blockedUntil: state.blockedUntil }); // ADD
+        domainState.blockedUntil = finishNow + DOMAIN_BLOCK_PAUSE_MS; // ADD
+        domainState.backoffMs = Math.min(domainState.backoffMs * 2, DOMAIN_BACKOFF_MAX_MS); // ADD
+        domainState.nextAllowedAt = domainState.blockedUntil + randomInt(DOMAIN_MIN_DELAY_MS, DOMAIN_MAX_DELAY_MS); // ADD
+        logger?.warn('throttle', 'Domain blocked - pausing', { domain: host, blockedUntil: domainState.blockedUntil }); // ADD
       } else if (error) { // ADD
-        state.backoffMs = Math.min(state.backoffMs * 2, DOMAIN_BACKOFF_MAX_MS); // ADD
-        state.nextAllowedAt = finishNow + state.backoffMs; // ADD
-        logger?.warn('throttle', 'Domain error backoff', { domain: host, backoffMs: state.backoffMs }); // ADD
+        domainState.backoffMs = Math.min(domainState.backoffMs * 2, DOMAIN_BACKOFF_MAX_MS); // ADD
+        domainState.nextAllowedAt = finishNow + domainState.backoffMs; // ADD
+        logger?.warn('throttle', 'Domain error backoff', { domain: host, backoffMs: domainState.backoffMs }); // ADD
       } else { // ADD
-        state.backoffMs = DOMAIN_MIN_DELAY_MS; // ADD
-        state.nextAllowedAt = finishNow + randomInt(DOMAIN_MIN_DELAY_MS, DOMAIN_MAX_DELAY_MS); // ADD
+        domainState.backoffMs = DOMAIN_MIN_DELAY_MS; // ADD
+        domainState.nextAllowedAt = finishNow + randomInt(DOMAIN_MIN_DELAY_MS, DOMAIN_MAX_DELAY_MS); // ADD
       } // ADD
       releaseResolve?.(); // ADD
     }, // ADD
@@ -607,11 +479,11 @@ async function restoreSessionForPage(page, monitorId, targetUrl, logger) { // AD
   try { // ADD
     if (Array.isArray(session.cookies) && session.cookies.length) { // ADD
       const cookieOrigin = session.origin || targetUrl; // ADD
-      const cookies = session.cookies.map((cookie) => ({ // ADD
+      const restoredCookies = session.cookies.map((cookie) => ({ // ADD
         ...cookie, // ADD
         url: cookie.url || cookieOrigin, // ADD
       })); // ADD
-      await page.setCookie(...cookies).catch(() => {}); // ADD
+      await page.setCookie(...restoredCookies).catch(() => {}); // ADD
     } // ADD
     if (Array.isArray(session.localStorage) && session.localStorage.length) { // ADD
       const originToVisit = session.origin || targetUrl; // ADD
@@ -650,10 +522,10 @@ async function restoreSessionForPage(page, monitorId, targetUrl, logger) { // AD
 async function persistSessionFromPage(page, monitorId, finalUrl, logger) { // ADD
   if (!monitorId) return; // ADD
   try { // ADD
-    const origin = (() => { // ADD
+    const sessionOrigin = (() => { // ADD
       try { return new URL(finalUrl).origin; } catch { return null; } // ADD
     })(); // ADD
-    const cookies = await page.cookies().catch(() => []); // ADD
+    const pageCookies = await page.cookies().catch(() => []); // ADD
     const localStorage = await page.evaluate(() => { // ADD
       const entries = []; // ADD
       try { // ADD
@@ -664,8 +536,8 @@ async function persistSessionFromPage(page, monitorId, finalUrl, logger) { // AD
       } catch (_) {} // ADD
       return entries; // ADD
     }).catch(() => []); // ADD
-    storeMonitorSession(monitorId, { origin, cookies, localStorage }); // ADD
-    logger?.info('browser:session-store', 'Session persisted', { monitorId, cookies: cookies.length, localStorage: localStorage.length }); // FIX
+    storeMonitorSession(monitorId, { origin: sessionOrigin, cookies: pageCookies, localStorage }); // ADD
+    logger?.info('browser:session-store', 'Session persisted', { monitorId, cookies: pageCookies.length, localStorage: localStorage.length }); // FIX
   } catch (err) { // ADD
     logger?.warn('browser:session-store', 'Failed to persist session', { monitorId, message: err?.message || String(err) }); // ADD
   } // ADD
@@ -683,8 +555,8 @@ async function rotatePageProfile(page) {
 }
 
 async function applyNavigationHeaders(page, extraHeaders = {}) {
-  const base = page.__profileHeaders || {};
-  const merged = { ...base, ...extraHeaders };
+  const headerBase = page.__profileHeaders || {};
+  const merged = { ...headerBase, ...extraHeaders };
   try {
     await page.setExtraHTTPHeaders(merged);
   } catch (_) {}
@@ -710,17 +582,17 @@ async function humanizePageInteractions(page, viewport = {}) {
 }
 
 async function warmUpOrigin(page, url, gotoOptions, logger, session) { // FIX
-  let origin = null; // FIX
+  let warmupOrigin = null; // FIX
   try { // FIX
-    const parsed = new URL(url); // FIX
-    origin = `${parsed.protocol}//${parsed.host}/`; // FIX
-    if (!origin || origin === url) return false; // FIX
-    logger?.stageStart('browser:warmup', { origin }); // FIX
+    const parsedWarmupUrl = new URL(url); // FIX
+    warmupOrigin = `${parsedWarmupUrl.protocol}//${parsedWarmupUrl.host}/`; // FIX
+    if (!warmupOrigin || warmupOrigin === url) return false; // FIX
+    logger?.stageStart('browser:warmup', { origin: warmupOrigin }); // FIX
     if (session?.cookies?.length) { // ADD
-      const cookies = session.cookies.map((cookie) => ({ ...cookie, url: session.origin || origin })); // ADD
-      try { await page.setCookie(...cookies); } catch (_) {} // ADD
+      const warmupCookies = session.cookies.map((cookie) => ({ ...cookie, url: session.origin || warmupOrigin })); // ADD
+      try { await page.setCookie(...warmupCookies); } catch (_) {} // ADD
     } // ADD
-    await page.goto(origin, { // FIX
+    await page.goto(warmupOrigin, { // FIX
       ...gotoOptions, // FIX
       waitUntil: 'domcontentloaded', // FIX
       timeout: Math.min(gotoOptions?.timeout ?? BROWSER_TIMEOUT_MS, 15_000), // FIX
@@ -742,10 +614,10 @@ async function warmUpOrigin(page, url, gotoOptions, logger, session) { // FIX
     await sleep(1_500); // FIX
     await humanizePageInteractions(page, page.__profile?.viewport); // FIX
     await sleep(randomInt(200, 350)); // FIX
-    logger?.stageEnd('browser:warmup', { origin, outcome: 'ok' }); // FIX
+    logger?.stageEnd('browser:warmup', { origin: warmupOrigin, outcome: 'ok' }); // FIX
     return true; // FIX
   } catch (err) { // FIX
-    logger?.stageEnd('browser:warmup', { origin, outcome: 'error', message: err?.message || String(err) }); // FIX
+    logger?.stageEnd('browser:warmup', { origin: warmupOrigin, outcome: 'error', message: err?.message || String(err) }); // FIX
     return false; // FIX
   } // FIX
 } // FIX
@@ -811,12 +683,12 @@ async function configurePage(page) {
 }
 
 async function createPage() {
-  const browser = await getBrowser();
-  const page = await browser.newPage();
-  await configurePage(page);
-  await rotatePageProfile(page);
+  const puppeteerBrowser = await getBrowser();
+  const newPage = await puppeteerBrowser.newPage();
+  await configurePage(newPage);
+  await rotatePageProfile(newPage);
   allocatedPages += 1;
-  return page;
+  return newPage;
 }
 
 async function acquirePage() {
@@ -869,9 +741,9 @@ async function releasePage(page) {
 
 async function closeBrowser() {
   if (!browserPromise) return;
-  let browser = null;
+  let browserInstance = null;
   try {
-    browser = await browserPromise;
+    browserInstance = await browserPromise;
   } catch (_) {}
 
   browserPromise = null;
@@ -879,9 +751,9 @@ async function closeBrowser() {
   await Promise.allSettled(pagePool.splice(0).map((p) => p.close().catch(() => {})));
   allocatedPages = 0;
 
-  if (browser) {
+  if (browserInstance) {
     try {
-      await browser.close();
+      await browserInstance.close();
     } catch (_) {}
   }
 }
@@ -1008,7 +880,7 @@ async function waitForPageReadiness(page, options = {}) {
 
 // ---- Tryb STATIC ----
 async function fetchStatic(url, { selector, headers = {}, fetchOptions = {}, logger } = {}) { // FIX
-  const startedAt = Date.now(); // FIX
+  const staticStartedAt = Date.now(); // FIX
   const requestUrl = appendCacheBuster(url); // FIX
   const staticHeaders = { // FIX
     'user-agent': USER_AGENT, // FIX
@@ -1023,9 +895,9 @@ async function fetchStatic(url, { selector, headers = {}, fetchOptions = {}, log
     timeoutMs: STATIC_TIMEOUT_MS, // FIX
     headers: Object.keys(staticHeaders || {}), // FIX
   }); // FIX
-  let res; // FIX
+  let staticResponse; // FIX
   try { // FIX
-    res = await fetchWithTimeout( // FIX
+    staticResponse = await fetchWithTimeout( // FIX
       requestUrl, // FIX
       { // FIX
         redirect: 'follow', // FIX
@@ -1044,29 +916,29 @@ async function fetchStatic(url, { selector, headers = {}, fetchOptions = {}, log
     throw err; // FIX
   } // FIX
 
-  const finalUrl = res.url || requestUrl; // FIX
-  const status = res.status; // FIX
+  const finalUrl = staticResponse.url || requestUrl; // FIX
+  const status = staticResponse.status; // FIX
   logger?.stageEnd('static:request', { finalUrl, status }); // FIX
 
   logger?.stageStart('static:read-body', {}); // FIX
   let buffer; // FIX
   try { // FIX
-    buffer = await res.arrayBuffer(); // FIX
+    buffer = await staticResponse.arrayBuffer(); // FIX
   } catch (err) { // FIX
     logger?.stageEnd('static:read-body', { error: err?.message || String(err) }); // FIX
     throw err; // FIX
   } // FIX
-  let html = Buffer.from(buffer).toString('utf8'); // FIX
-  if (html.length > TEXT_TRUNCATE_AT) html = html.slice(0, TEXT_TRUNCATE_AT); // FIX
-  logger?.stageEnd('static:read-body', { length: html.length }); // FIX
+  let responseHtml = Buffer.from(buffer).toString('utf8'); // FIX
+  if (responseHtml.length > TEXT_TRUNCATE_AT) responseHtml = responseHtml.slice(0, TEXT_TRUNCATE_AT); // FIX
+  logger?.stageEnd('static:read-body', { length: responseHtml.length }); // FIX
 
   logger?.stageStart('static:parse', { selector: !!selector }); // FIX
   let fragmentHtml = null; // FIX
-  let meta; // FIX
+  let metaInfo; // FIX
   let content; // FIX
   let hash; // FIX
   try { // FIX
-    const dom = new JSDOM(html); // FIX
+    const dom = new JSDOM(responseHtml); // FIX
     const { document } = dom.window; // FIX
 
     if (selector) { // FIX
@@ -1074,8 +946,8 @@ async function fetchStatic(url, { selector, headers = {}, fetchOptions = {}, log
       fragmentHtml = node ? node.outerHTML : null; // FIX
     } // FIX
 
-    meta = pickMetaFromDocument(document); // FIX
-    content = fragmentHtml || html; // FIX
+    metaInfo = pickMetaFromDocument(document); // FIX
+    content = fragmentHtml || responseHtml; // FIX
     hash = sha256(content); // FIX
   } catch (err) { // FIX
     logger?.stageEnd('static:parse', { // FIX
@@ -1086,12 +958,12 @@ async function fetchStatic(url, { selector, headers = {}, fetchOptions = {}, log
   } // FIX
   logger?.stageEnd('static:parse', { // FIX
     fragmentFound: !!fragmentHtml, // FIX
-    metaKeys: Object.keys(meta || {}), // FIX
+    metaKeys: Object.keys(metaInfo || {}), // FIX
     hash, // FIX
   }); // FIX
 
   const htmlLower = (content || '').toLowerCase(); // FIX
-  let blocked = false; // FIX
+  let isBlocked = false; // FIX
   let block_reason = null; // FIX
   const checks = [ // FIX
     { match: () => status === 403, reason: 'HTTP_403' }, // FIX
@@ -1101,23 +973,23 @@ async function fetchStatic(url, { selector, headers = {}, fetchOptions = {}, log
   ]; // FIX
   for (const check of checks) { // FIX
     if (check.match()) { // FIX
-      blocked = true; // FIX
+      isBlocked = true; // FIX
       if (!block_reason) block_reason = check.reason; // FIX
     } // FIX
   } // FIX
 
-  console.log(`FETCH static status=${status} blocked=${blocked} reason=${block_reason || 'none'} finalUrl=${finalUrl} length=${content.length}`); // LOG
+  console.log(`FETCH static status=${status} blocked=${isBlocked} reason=${block_reason || 'none'} finalUrl=${finalUrl} length=${content.length}`); // LOG
 
   return { // FIX
     mode: 'static', // FIX
-    startedAt, // FIX
+    startedAt: staticStartedAt, // FIX
     finishedAt: Date.now(), // FIX
     final_url: finalUrl, // FIX
     http_status: status, // FIX
     html: content, // FIX
-    meta, // FIX
+    meta: metaInfo, // FIX
     hash, // FIX
-    blocked, // FIX
+    blocked: isBlocked, // FIX
     block_reason, // FIX
   }; // FIX
 }
@@ -1127,7 +999,7 @@ async function detectBotWall(page) {
   try {
     return await page.evaluate(() => {
       const txt = (document.body?.innerText || '').toLowerCase();
-      const title = (document.title || '').toLowerCase();
+      const pageTitleLower = (document.title || '').toLowerCase();
       const hasCMsg = !!document.querySelector('#cmsg');
       const hasCaptchaDelivery = !!document.querySelector(
         'script[src*="captcha-delivery.com"],script[src*="ct.captcha-delivery.com"]'
@@ -1137,7 +1009,7 @@ async function detectBotWall(page) {
         hasCMsg ||
         hasCaptchaDelivery ||
         hasAllegroShield ||
-        title.includes('enable js') ||
+        pageTitleLower.includes('enable js') ||
         txt.includes('enable js') ||
         txt.includes('captcha') ||
         txt.includes('potwierdź, że jesteś człowiekiem') || // ADD
@@ -1159,60 +1031,60 @@ async function extractHtml(page, selector) {
       return fragment.length > TEXT_TRUNCATE_AT ? fragment.slice(0, TEXT_TRUNCATE_AT) : fragment;
     }
   }
-  let html = await page.content();
-  if (html.length > TEXT_TRUNCATE_AT) html = html.slice(0, TEXT_TRUNCATE_AT);
-  return html;
+  let pageHtml = await page.content();
+  if (pageHtml.length > TEXT_TRUNCATE_AT) pageHtml = pageHtml.slice(0, TEXT_TRUNCATE_AT);
+  return pageHtml;
 }
 
 async function handleCookieConsent(page, logger) {
   logger?.stageStart('browser:cookie-consent', {});
   try {
-    const result = await page.evaluate((keywords) => {
+    const consentResult = await page.evaluate((keywords) => {
       const normalize = (text) => {
         if (!text) return '';
         return text.toString().trim().toLocaleLowerCase('pl-PL');
       };
       const matches = (text) => {
-        const normalized = normalize(text);
-        if (!normalized) return false;
-        return keywords.some((keyword) => normalized.includes(keyword));
+        const normalizedLabel = normalize(text);
+        if (!normalizedLabel) return false;
+        return keywords.some((keyword) => normalizedLabel.includes(keyword));
       };
       const elements = Array.from(
         document.querySelectorAll('button, a, div, span, p, label, input')
       );
       for (const el of elements) {
-        const label = el.innerText || el.textContent || el.value || '';
-        if (!matches(label)) {
+        const elementLabel = el.innerText || el.textContent || el.value || '';
+        if (!matches(elementLabel)) {
           continue;
         }
-        const rect = el.getBoundingClientRect();
-        const style = window.getComputedStyle(el);
-        const hidden =
-          !rect ||
-          rect.width === 0 ||
-          rect.height === 0 ||
-          style.visibility === 'hidden' ||
-          style.display === 'none' ||
-          style.opacity === '0';
-        if (hidden) {
+        const elementRect = el.getBoundingClientRect();
+        const elementStyle = window.getComputedStyle(el);
+        const consentHidden =
+          !elementRect ||
+          elementRect.width === 0 ||
+          elementRect.height === 0 ||
+          elementStyle.visibility === 'hidden' ||
+          elementStyle.display === 'none' ||
+          elementStyle.opacity === '0';
+        if (consentHidden) {
           continue;
         }
         if (typeof el.click === 'function') {
           el.click();
-          return { clicked: true, label: label.trim() };
+          return { clicked: true, label: elementLabel.trim() };
         }
       }
       return { clicked: false };
     }, COOKIE_CONSENT_KEYWORDS);
 
-    if (result?.clicked) {
-      const label = result.label || 'unknown';
+    if (consentResult?.clicked) {
+      const consentLabel = consentResult.label || 'unknown';
       if (!logger) {
-        console.log(`[cookie-consent] clicked: "${label}"`);
+        console.log(`[cookie-consent] clicked: "${consentLabel}"`);
       }
-      logger?.info('browser:cookie-consent', '[cookie-consent] clicked', { label });
+      logger?.info('browser:cookie-consent', '[cookie-consent] clicked', { label: consentLabel });
       await sleep(1_500);
-      logger?.stageEnd('browser:cookie-consent', { clicked: true, label });
+      logger?.stageEnd('browser:cookie-consent', { clicked: true, label: consentLabel });
     } else {
       if (!logger) {
         console.log('[cookie-consent] no consent buttons found');
@@ -1237,7 +1109,7 @@ async function handleCookieConsent(page, logger) {
 async function handleErrorScreenConfirmation(page, logger) { // ADD
   logger?.stageStart('browser:error-screen', {}); // ADD
   try { // ADD
-    const result = await page.evaluate((keywords) => { // ADD
+    const screenResult = await page.evaluate((keywords) => { // ADD
       const bodyText = (document.body?.innerText || '').toLowerCase(); // ADD
       const urlPath = (location.pathname || '').toLowerCase(); // ADD
       const shouldCheck = bodyText.includes('potwierdź, że jesteś człowiekiem') // ADD
@@ -1249,34 +1121,34 @@ async function handleErrorScreenConfirmation(page, logger) { // ADD
       } // ADD
       const candidates = Array.from(document.querySelectorAll('button, a, div[role="button"], span[role="button"], input[type="submit"]')); // ADD
       for (const el of candidates) { // ADD
-        const label = (el.innerText || el.textContent || el.value || '').trim(); // ADD
-        if (!label) continue; // ADD
-        const lower = label.toLowerCase(); // ADD
-        if (keywords.some((keyword) => lower.includes(keyword))) { // ADD
-          const rect = el.getBoundingClientRect(); // ADD
-          const style = window.getComputedStyle(el); // ADD
-          const hidden = !rect || rect.width === 0 || rect.height === 0 // ADD
-            || style.visibility === 'hidden' // ADD
-            || style.display === 'none' // ADD
-            || style.opacity === '0'; // ADD
-          if (hidden) continue; // ADD
+        const buttonLabel = (el.innerText || el.textContent || el.value || '').trim(); // ADD
+        if (!buttonLabel) continue; // ADD
+        const lowerLabel = buttonLabel.toLowerCase(); // ADD
+        if (keywords.some((keyword) => lowerLabel.includes(keyword))) { // ADD
+          const buttonRect = el.getBoundingClientRect(); // ADD
+          const buttonStyle = window.getComputedStyle(el); // ADD
+          const isHidden = !buttonRect || buttonRect.width === 0 || buttonRect.height === 0 // ADD
+            || buttonStyle.visibility === 'hidden' // ADD
+            || buttonStyle.display === 'none' // ADD
+            || buttonStyle.opacity === '0'; // ADD
+          if (isHidden) continue; // ADD
           if (typeof el.click === 'function') { // ADD
             el.click(); // ADD
-            return { triggered: true, clicked: true, label }; // ADD
+            return { triggered: true, clicked: true, label: buttonLabel }; // ADD
           } // ADD
         } // ADD
       } // ADD
       return { triggered: true, clicked: false }; // ADD
     }, ERROR_CONFIRM_KEYWORDS); // ADD
 
-    if (!result.triggered) { // ADD
+    if (!screenResult.triggered) { // ADD
       logger?.stageEnd('browser:error-screen', { triggered: false }); // ADD
       return; // ADD
     } // ADD
-    if (result.clicked) { // ADD
-      logger?.info('browser:error-screen', 'Error screen confirmation clicked', { label: result.label }); // ADD
+    if (screenResult.clicked) { // ADD
+      logger?.info('browser:error-screen', 'Error screen confirmation clicked', { label: screenResult.label }); // ADD
       await sleep(2_000); // ADD
-      logger?.stageEnd('browser:error-screen', { triggered: true, clicked: true, label: result.label }); // ADD
+      logger?.stageEnd('browser:error-screen', { triggered: true, clicked: true, label: screenResult.label }); // ADD
     } else { // ADD
       logger?.stageEnd('browser:error-screen', { triggered: true, clicked: false }); // ADD
     } // ADD
@@ -1294,7 +1166,7 @@ async function collectBrowserSnapshot(page, {
   includeScreenshot = true,
 },
 logger) {
-  const opts = browserOptions || {};
+  const snapshotOpts = browserOptions || {};
   let navStatus = null;
   const onResponse = (resp) => {
     try {
@@ -1330,7 +1202,7 @@ logger) {
     });
     try {
       await waitForPageReadiness(page, {
-        ...opts,
+        ...snapshotOpts,
         waitAfterMs,
       });
       logger?.stageEnd('browser:wait-readiness', {});
@@ -1344,10 +1216,10 @@ logger) {
     if (selector) {
       logger?.stageStart('browser:wait-selector', {
         selector,
-        timeout: opts.fragmentTimeoutMs || 3_000,
+        timeout: snapshotOpts.fragmentTimeoutMs || 3_000,
       });
       try {
-        await page.waitForSelector(selector, { timeout: opts.fragmentTimeoutMs || 3_000 });
+        await page.waitForSelector(selector, { timeout: snapshotOpts.fragmentTimeoutMs || 3_000 });
         logger?.stageEnd('browser:wait-selector', { found: true });
       } catch (err) {
         logger?.stageEnd('browser:wait-selector', {
@@ -1358,14 +1230,14 @@ logger) {
     }
 
     logger?.stageStart('browser:detect-botwall', {});
-    const blocked = await detectBotWall(page);
-    logger?.stageEnd('browser:detect-botwall', { blocked });
-    const finalUrl = page.url();
+    const botwallDetected = await detectBotWall(page);
+    logger?.stageEnd('browser:detect-botwall', { blocked: botwallDetected });
+    const navigatedUrl = page.url();
     logger?.stageStart('browser:extract-html', { selector: !!selector });
-    let html;
+    let snapshotHtml;
     try {
-      html = await extractHtml(page, selector);
-      logger?.stageEnd('browser:extract-html', { length: html?.length || 0 });
+      snapshotHtml = await extractHtml(page, selector);
+      logger?.stageEnd('browser:extract-html', { length: snapshotHtml?.length || 0 });
     } catch (err) {
       logger?.stageEnd('browser:extract-html', {
         length: 0,
@@ -1373,16 +1245,16 @@ logger) {
       });
       throw err;
     }
-    const meta = await page.evaluate(() => { // FIX
-      const byName = (n) => document.querySelector(`meta[name="${n}"]`)?.getAttribute('content')?.trim() || null;
-      const byProp = (p) => document.querySelector(`meta[property="${p}"]`)?.getAttribute('content')?.trim() || null;
-      const title = document.querySelector('title')?.textContent?.trim() || null;
-      const desc = byName('description') || byProp('og:description') || null;
-      const canonical = document.querySelector('link[rel="canonical"]')?.getAttribute('href') || null;
-      const h1 = document.querySelector('h1')?.textContent?.trim() || null;
-      const linksCount = document.querySelectorAll('a[href]').length;
-      const textLen = document.body?.innerText?.length || 0;
-      return { title, desc, canonical, h1, linksCount, textLen };
+    const evaluatedMeta = await page.evaluate(() => { // FIX
+      const metaByName = (n) => document.querySelector(`meta[name="${n}"]`)?.getAttribute('content')?.trim() || null;
+      const metaByProp = (p) => document.querySelector(`meta[property="${p}"]`)?.getAttribute('content')?.trim() || null;
+      const metaTitle = document.querySelector('title')?.textContent?.trim() || null;
+      const metaDesc = metaByName('description') || metaByProp('og:description') || null;
+      const metaCanonical = document.querySelector('link[rel="canonical"]')?.getAttribute('href') || null;
+      const metaH1 = document.querySelector('h1')?.textContent?.trim() || null;
+      const linkCount = document.querySelectorAll('a[href]').length;
+      const textLength = document.body?.innerText?.length || 0;
+      return { title: metaTitle, desc: metaDesc, canonical: metaCanonical, h1: metaH1, linksCount: linkCount, textLen: textLength };
     });
 
     let screenshot_b64 = null;
@@ -1402,12 +1274,12 @@ logger) {
 
     return {
       navStatus,
-      finalUrl,
-      blocked,
-      html,
-      meta,
+      finalUrl: navigatedUrl,
+      blocked: botwallDetected,
+      html: snapshotHtml,
+      meta: evaluatedMeta,
       screenshot_b64,
-      hash: sha256(html || ''),
+      hash: sha256(snapshotHtml || ''),
     };
   } catch (err) {
     throw err;
@@ -1418,9 +1290,9 @@ logger) {
 
 async function prepareForBotBypass(page) {
   try {
-    const client = await page.target().createCDPSession();
-    await client.send('Network.clearBrowserCookies').catch(() => {});
-    await client.send('Network.clearBrowserCache').catch(() => {});
+    const cdpClient = await page.target().createCDPSession();
+    await cdpClient.send('Network.clearBrowserCookies').catch(() => {});
+    await cdpClient.send('Network.clearBrowserCache').catch(() => {});
   } catch (_) {}
   await rotatePageProfile(page);
   await sleep(randomInt(...BOT_BYPASS_WAIT_RANGE_MS));
@@ -1436,32 +1308,32 @@ async function attemptBotBypass(page, {
   logger,
   monitorId,
 }) {
-  const opts = browserOptions || {};
+  const bypassOpts = browserOptions || {};
   logger?.stageStart('browser:bot-bypass', { url });
   try {
     await prepareForBotBypass(page);
-    await applyNavigationHeaders(page, opts.headers || {});
-    const session = getMonitorSession(monitorId); // ADD
-    await warmUpOrigin(page, url, gotoOptions, logger, session); // FIX
+    await applyNavigationHeaders(page, bypassOpts.headers || {});
+    const bypassSession = getMonitorSession(monitorId); // ADD
+    await warmUpOrigin(page, url, gotoOptions, logger, bypassSession); // FIX
     await sleep(randomInt(...BOT_BYPASS_WAIT_RANGE_MS));
 
     const relaxedGoto = {
       ...gotoOptions,
-      waitUntil: opts.retryWaitUntil || gotoOptions.waitUntil || 'domcontentloaded',
+      waitUntil: bypassOpts.retryWaitUntil || gotoOptions.waitUntil || 'domcontentloaded',
     };
 
     await humanizePageInteractions(page, page.__profile?.viewport);
 
-    const snapshot = await collectBrowserSnapshot(page, {
+    const bypassSnapshot = await collectBrowserSnapshot(page, {
       url,
       gotoOptions: relaxedGoto,
       selector,
       waitAfterMs,
-      browserOptions: opts,
+      browserOptions: bypassOpts,
       includeScreenshot,
     }, logger);
-    logger?.stageEnd('browser:bot-bypass', { blocked: snapshot.blocked, status: snapshot.navStatus });
-    return snapshot;
+    logger?.stageEnd('browser:bot-bypass', { blocked: bypassSnapshot.blocked, status: bypassSnapshot.navStatus });
+    return bypassSnapshot;
   } catch (err) {
     logger?.stageEnd('browser:bot-bypass', {
       blocked: null,
@@ -1473,14 +1345,14 @@ async function attemptBotBypass(page, {
 }
 
 async function fetchBrowser(url, { selector, browserOptions = {}, logger, monitorId } = {}) {
-  const startedAt = Date.now();
+  const browserStartedAt = Date.now();
 
   await ensurePuppeteer();
 
   let page = null;
   const navigationTimeout = browserOptions.navigationTimeoutMs || browserOptions.timeoutMs || BROWSER_TIMEOUT_MS;
   let waitUntil = browserOptions.waitUntil || browserOptions.navigationWaitUntil || BROWSER_DEFAULT_WAIT_UNTIL;
-  const opts = browserOptions || {};
+  const navigationOpts = browserOptions || {};
 
   if (Array.isArray(waitUntil) && waitUntil.length === 0) {
     waitUntil = BROWSER_DEFAULT_WAIT_UNTIL;
@@ -1492,9 +1364,9 @@ async function fetchBrowser(url, { selector, browserOptions = {}, logger, monito
   if (Array.isArray(waitUntil)) {
     gotoOptions.waitUntil = waitUntil;
   } else if (typeof waitUntil === 'string') {
-    const trimmed = waitUntil.trim();
-    if (trimmed && trimmed !== 'manual' && trimmed !== 'none') {
-      gotoOptions.waitUntil = trimmed;
+    const waitUntilTrimmed = waitUntil.trim();
+    if (waitUntilTrimmed && waitUntilTrimmed !== 'manual' && waitUntilTrimmed !== 'none') {
+      gotoOptions.waitUntil = waitUntilTrimmed;
     }
   } else {
     gotoOptions.waitUntil = BROWSER_DEFAULT_WAIT_UNTIL;
@@ -1521,11 +1393,11 @@ async function fetchBrowser(url, { selector, browserOptions = {}, logger, monito
     }
 
     logger?.stageStart('browser:configure-page', {
-      headers: Object.keys(opts.headers || {}),
+      headers: Object.keys(navigationOpts.headers || {}),
     });
     try {
       await ensurePageProfile(page);
-      await applyNavigationHeaders(page, opts.headers || {});
+      await applyNavigationHeaders(page, navigationOpts.headers || {});
       logger?.stageEnd('browser:configure-page', {
         viewport: page.__profile?.viewport || null,
       });
@@ -1537,42 +1409,42 @@ async function fetchBrowser(url, { selector, browserOptions = {}, logger, monito
       throw err;
     }
 
-    const session = getMonitorSession(monitorId); // ADD
+    const activeSession = getMonitorSession(monitorId); // ADD
     let restoredSession = false; // ADD
-    if (session) { // ADD
+    if (activeSession) { // ADD
       restoredSession = await restoreSessionForPage(page, monitorId, url, logger); // ADD
-      await applyNavigationHeaders(page, opts.headers || {}); // ADD
+      await applyNavigationHeaders(page, navigationOpts.headers || {}); // ADD
     } else { // ADD
       await warmUpOrigin(page, url, gotoOptions, logger, null); // ADD
-      await applyNavigationHeaders(page, opts.headers || {}); // ADD
+      await applyNavigationHeaders(page, navigationOpts.headers || {}); // ADD
     } // ADD
 
-    if (session && !restoredSession) { // ADD
-      await warmUpOrigin(page, url, gotoOptions, logger, session); // ADD
-      await applyNavigationHeaders(page, opts.headers || {}); // ADD
+    if (activeSession && !restoredSession) { // ADD
+      await warmUpOrigin(page, url, gotoOptions, logger, activeSession); // ADD
+      await applyNavigationHeaders(page, navigationOpts.headers || {}); // ADD
     } // ADD
 
-    const includeScreenshot = opts.captureScreenshot !== false;
+    const includeScreenshot = navigationOpts.captureScreenshot !== false;
 
     logger?.stageStart('browser:collect', {
       includeScreenshot,
       waitAfterMs,
       waitUntil: gotoOptions.waitUntil,
     });
-    let snapshot;
+    let browserSnapshot;
     try {
-      snapshot = await collectBrowserSnapshot(page, {
+      browserSnapshot = await collectBrowserSnapshot(page, {
         url,
         gotoOptions,
         selector,
         waitAfterMs,
-        browserOptions: opts,
+        browserOptions: navigationOpts,
         includeScreenshot,
       }, logger);
       logger?.stageEnd('browser:collect', {
-        blocked: snapshot.blocked,
-        status: snapshot.navStatus,
-        finalUrl: snapshot.finalUrl,
+        blocked: browserSnapshot.blocked,
+        status: browserSnapshot.navStatus,
+        finalUrl: browserSnapshot.finalUrl,
       });
     } catch (err) {
       logger?.stageEnd('browser:collect', {
@@ -1584,22 +1456,22 @@ async function fetchBrowser(url, { selector, browserOptions = {}, logger, monito
     }
 
     const needsBypass =
-      snapshot.blocked ||
-      (snapshot.navStatus && [401, 403, 429].includes(snapshot.navStatus)) ||
-      (opts.forceBotBypass === true && snapshot.navStatus && snapshot.navStatus >= 300);
+      browserSnapshot.blocked ||
+      (browserSnapshot.navStatus && [401, 403, 429].includes(browserSnapshot.navStatus)) ||
+      (navigationOpts.forceBotBypass === true && browserSnapshot.navStatus && browserSnapshot.navStatus >= 300);
 
-    if (needsBypass && opts.disableBotBypass !== true) {
+    if (needsBypass && navigationOpts.disableBotBypass !== true) {
       logger?.info('browser:collect', 'Attempting bot bypass', {
-        blocked: snapshot.blocked,
-        status: snapshot.navStatus,
+        blocked: browserSnapshot.blocked,
+        status: browserSnapshot.navStatus,
       });
       try {
-        snapshot = await attemptBotBypass(page, {
+        browserSnapshot = await attemptBotBypass(page, {
           url,
           gotoOptions,
           selector,
           waitAfterMs,
-          browserOptions: opts,
+          browserOptions: navigationOpts,
           includeScreenshot,
           logger,
           monitorId, // ADD
@@ -1608,33 +1480,33 @@ async function fetchBrowser(url, { selector, browserOptions = {}, logger, monito
         logger?.warn('browser:bot-bypass', 'Bypass attempt failed', {
           message: err?.message || String(err),
         });
-        if (!snapshot.blocked) {
+        if (!browserSnapshot.blocked) {
           throw err;
         }
       }
     }
 
-    const http_status = snapshot.navStatus || 200; // FIX
+    const http_status = browserSnapshot.navStatus || 200; // FIX
 
-    const screenshotInfo = snapshot.screenshot_b64 ? snapshot.screenshot_b64.length : 0; // FIX
-    console.log(`BROWSER status=${http_status} blocked=${!!snapshot.blocked} finalUrl=${snapshot.finalUrl || url} screenshotLength=${screenshotInfo}`); // LOG
+    const screenshotInfo = browserSnapshot.screenshot_b64 ? browserSnapshot.screenshot_b64.length : 0; // FIX
+    console.log(`BROWSER status=${http_status} blocked=${!!browserSnapshot.blocked} finalUrl=${browserSnapshot.finalUrl || url} screenshotLength=${screenshotInfo}`); // LOG
 
     if (monitorId) { // ADD
-      await persistSessionFromPage(page, monitorId, snapshot.finalUrl || url, logger); // ADD
+      await persistSessionFromPage(page, monitorId, browserSnapshot.finalUrl || url, logger); // ADD
     } // ADD
 
     return { // FIX
       mode: 'browser',
-      startedAt,
+      startedAt: browserStartedAt,
       finishedAt: Date.now(),
-      final_url: snapshot.finalUrl || url,
+      final_url: browserSnapshot.finalUrl || url,
       http_status,
-      html: snapshot.html,
-      meta: snapshot.meta,
-      hash: snapshot.hash,
-      blocked: !!snapshot.blocked,
-      block_reason: snapshot.blocked ? 'BOT_PROTECTION' : null,
-      screenshot_b64: snapshot.screenshot_b64,
+      html: browserSnapshot.html,
+      meta: browserSnapshot.meta,
+      hash: browserSnapshot.hash,
+      blocked: !!browserSnapshot.blocked,
+      block_reason: browserSnapshot.blocked ? 'BOT_PROTECTION' : null,
+      screenshot_b64: browserSnapshot.screenshot_b64,
     };
   } catch (err) {
     throw err;
@@ -1663,24 +1535,24 @@ async function scanUrl({ url, tryb, selector, browserOptions = {}, staticOptions
     logger?.stageStart('scan-attempt', { attempt: i + 1, mode: tryb, url: normUrl });
     try {
       if (tryb === 'browser') {
-        const result = await fetchBrowser(normUrl, { selector, browserOptions, logger, monitorId }); // FIX
+        const browserResult = await fetchBrowser(normUrl, { selector, browserOptions, logger, monitorId }); // FIX
         logger?.stageEnd('scan-attempt', {
           attempt: i + 1,
           outcome: 'success',
-          mode: result.mode,
-          status: result.http_status,
-          blocked: result.blocked,
+          mode: browserResult.mode,
+          status: browserResult.http_status,
+          blocked: browserResult.blocked,
         });
-        return result;
+        return browserResult;
       }
-      let result = await fetchStatic(normUrl, { selector, ...staticOptions, logger }); // FIX
-      const htmlCheck = (result.html || '').toLowerCase(); // FIX
+      let staticResult = await fetchStatic(normUrl, { selector, ...staticOptions, logger }); // FIX
+      const htmlCheck = (staticResult.html || '').toLowerCase(); // FIX
       let fallbackTriggered = false; // FIX
       let fallbackReason = null; // FIX
-      if (result.blocked) { // FIX
+      if (staticResult.blocked) { // FIX
         fallbackTriggered = true; // FIX
-        fallbackReason = result.block_reason || 'static-blocked'; // FIX
-      } else if (result.http_status === 403) { // FIX
+        fallbackReason = staticResult.block_reason || 'static-blocked'; // FIX
+      } else if (staticResult.http_status === 403) { // FIX
         fallbackTriggered = true; // FIX
         fallbackReason = 'http-403'; // FIX
       } else if (htmlCheck.includes('captcha')) { // FIX
@@ -1692,18 +1564,18 @@ async function scanUrl({ url, tryb, selector, browserOptions = {}, staticOptions
       } // FIX
       if (fallbackTriggered) { // FIX
         console.log(`FALLBACK url=${normUrl} reason=${fallbackReason}`); // LOG
-        logger?.info('scan', 'Fallback to browser', { reason: fallbackReason, status: result.http_status }); // FIX
-        result = await fetchBrowser(normUrl, { selector, browserOptions, logger, monitorId }); // FIX
+        logger?.info('scan', 'Fallback to browser', { reason: fallbackReason, status: staticResult.http_status }); // FIX
+        staticResult = await fetchBrowser(normUrl, { selector, browserOptions, logger, monitorId }); // FIX
       } // FIX
       logger?.stageEnd('scan-attempt', { // FIX
         attempt: i + 1, // FIX
         outcome: 'success', // FIX
-        mode: result.mode, // FIX
-        status: result.http_status, // FIX
-        blocked: !!result.blocked, // FIX
+        mode: staticResult.mode, // FIX
+        status: staticResult.http_status, // FIX
+        blocked: !!staticResult.blocked, // FIX
         fallback: fallbackTriggered, // FIX
       }); // FIX
-      return result; // FIX
+      return staticResult; // FIX
     } catch (e) {
       lastErr = e;
       logger?.stageEnd('scan-attempt', {
@@ -1723,13 +1595,13 @@ async function scanUrl({ url, tryb, selector, browserOptions = {}, staticOptions
 
 // ---- PG helpers ----
 async function withPg(tx) {
-  const client = await pool.connect();
+  const pgClient = await pool.connect();
   try {
-    return await tx(client);
+    return await tx(pgClient);
   } catch (err) {
     throw err;
   } finally {
-    client.release();
+    pgClient.release();
   }
 }
 
@@ -1741,14 +1613,14 @@ async function scheduleMonitorDue(monitorId) { // FIX
   return withPg(async (pg) => { // FIX
     try { // FIX
       await pg.query('BEGIN'); // FIX
-      const res = await pg.query( // FIX
+      const scheduleResult = await pg.query( // FIX
         `INSERT INTO zadania_skanu (id, monitor_id, zaplanowano_at, status)
          VALUES (gen_random_uuid(), $1::uuid, NOW(), 'oczekuje')
          RETURNING id`, // FIX
         [monitorId] // FIX
       ); // FIX
       await pg.query('COMMIT'); // FIX
-      return res.rowCount || 0; // FIX
+      return scheduleResult.rowCount || 0; // FIX
     } catch (e) { // FIX
       try { await pg.query('ROLLBACK'); } catch {} // FIX
       throw e; // FIX
@@ -1765,7 +1637,7 @@ async function claimMonitorBatch(monitorId, limit) { // FIX
   return withPg(async (pg) => { // FIX
     try { // FIX
       await pg.query('BEGIN'); // FIX
-      const res = await pg.query( // FIX
+      const claimResult = await pg.query( // FIX
         `WITH picked AS (
            SELECT z.id, m.url
              FROM zadania_skanu z
@@ -1785,7 +1657,7 @@ async function claimMonitorBatch(monitorId, limit) { // FIX
         [monitorId, limit] // FIX
       ); // FIX
       await pg.query('COMMIT'); // FIX
-      return res.rows; // FIX
+      return claimResult.rows; // FIX
     } catch (e) { // FIX
       try { await pg.query('ROLLBACK'); } catch {} // FIX
       throw e; // FIX
@@ -1866,7 +1738,7 @@ const queue = new PQueue({ concurrency: MAX_CONCURRENCY });
 async function processTask(task) {
   const { id: taskId, monitor_id } = task;
   const logger = createRunLogger({ taskId, monitorId: monitor_id });
-  const startedAt = Date.now();
+  const taskStartedAt = Date.now();
   let finalStatus = 'unknown';
   let finalHash = null;
   let finalSnapshotId = null;
@@ -1954,45 +1826,6 @@ async function processTask(task) {
       url,
       selectorPreview: selector ? selector.slice(0, 120) : null,
     });
-
-    let domainPermit = null; // ADD
-    let domainReleaseInfo = { blocked: false, error: false }; // ADD
-    try { // ADD
-      domainPermit = await acquireDomainSlot(url, { logger, monitorId: monitor_id }); // ADD
-    } catch (acqErr) { // ADD
-      finalStatus = 'blad'; // ADD
-      finalError = acqErr?.code || acqErr?.message || String(acqErr); // ADD
-      logger.error('throttle', 'Domain throttle prevented scan', { // ADD
-        message: finalError, // ADD
-        waitMs: acqErr?.waitMs, // ADD
-      }); // ADD
-      console.error(`SCAN ABORT monitor=${monitor_id} reason=${finalError}`); // LOG
-      if (acqErr?.code === 'DOMAIN_BLOCKED') { // ADD
-        monitorsRequiringIntervention.add(monitor_id); // ADD
-        await markMonitorRequiresIntervention(monitor_id, { reason: finalError, snapshotId: null, logger }); // ADD
-      } // ADD
-      try { // ADD
-        await finishTask(taskId, { // ADD
-          status: 'blad', // ADD
-          blad_opis: finalError.slice(0, 500), // ADD
-          tresc_hash: null, // ADD
-          snapshot_mongo_id: null, // ADD
-        }); // ADD
-      } catch (finishErr) { // ADD
-        logger.error('pg:finish-task', 'Failed to update task status after throttle block', { message: finishErr?.message || String(finishErr) }); // ADD
-      } // ADD
-      return; // ADD
-    } // ADD
-
-    logger.stageStart('scan', { url, tryb });
-    const result = await scanUrl({ url, tryb, selector, browserOptions, staticOptions, logger, monitorId: monitor_id }); // FIX
-    logger.stageEnd('scan', {
-      mode: result.mode,
-      http_status: result.http_status,
-      blocked: result.blocked,
-      hash: result.hash,
-      finalUrl: result.final_url,
-    });
     domainReleaseInfo = { blocked: !!result.blocked, error: false }; // ADD
 
     logger.stageStart('mongo:save-snapshot', { mode: result.mode });
@@ -2059,19 +1892,91 @@ async function processTask(task) {
     finalSnapshotId = snapshotId;
     finalHash = result.hash;
 
-    if (result.blocked) {
+    let domainPermit = null; // ADD
+    let domainReleaseInfo = { blocked: false, error: false }; // ADD
+    try { // ADD
+      domainPermit = await acquireDomainSlot(url, { logger, monitorId: monitor_id }); // ADD
+    } catch (acqErr) { // ADD
+      finalStatus = 'blad'; // ADD
+      finalError = acqErr?.code || acqErr?.message || String(acqErr); // ADD
+      logger.error('throttle', 'Domain throttle prevented scan', { // ADD
+        message: finalError, // ADD
+        waitMs: acqErr?.waitMs, // ADD
+      }); // ADD
+      console.error(`SCAN ABORT monitor=${monitor_id} reason=${finalError}`); // LOG
+      if (acqErr?.code === 'DOMAIN_BLOCKED') { // ADD
+        monitorsRequiringIntervention.add(monitor_id); // ADD
+        await markMonitorRequiresIntervention(monitor_id, { reason: finalError, snapshotId: null, logger }); // ADD
+      } // ADD
+      try { // ADD
+        await finishTask(taskId, { // ADD
+          status: 'blad', // ADD
+          blad_opis: finalError.slice(0, 500), // ADD
+          tresc_hash: null, // ADD
+          snapshot_mongo_id: null, // ADD
+        }); // ADD
+      } catch (finishErr) { // ADD
+        logger.error('pg:finish-task', 'Failed to update task status after throttle block', { message: finishErr?.message || String(finishErr) }); // ADD
+      } // ADD
+      return; // ADD
+    } // ADD
+
+    logger.stageStart('scan', { url, tryb });
+    const scanResult = await scanUrl({ url, tryb, selector, browserOptions, staticOptions, logger, monitorId: monitor_id }); // FIX
+    logger.stageEnd('scan', {
+      mode: scanResult.mode,
+      http_status: scanResult.http_status,
+      blocked: scanResult.blocked,
+      hash: scanResult.hash,
+      finalUrl: scanResult.final_url,
+    });
+    domainReleaseInfo = { blocked: !!scanResult.blocked, error: false }; // ADD
+
+    logger.stageStart('mongo:save-snapshot', { mode: scanResult.mode });
+    let snapshotId;
+    try {
+      snapshotId = await saveSnapshotToMongo({
+        monitor_id,
+        url,
+        ts: new Date(),
+        mode: scanResult.mode,
+        final_url: scanResult.final_url,
+        html: scanResult.html,
+        meta: scanResult.meta,
+        hash: scanResult.hash,
+        blocked: !!scanResult.blocked,
+        block_reason: scanResult.block_reason || null,
+        screenshot_b64: scanResult.screenshot_b64 || null,
+      });
+      console.log(`MONGO snapshot=${snapshotId} monitor=${monitor_id} blocked=${!!scanResult.blocked}`); // LOG
+      logger.stageEnd('mongo:save-snapshot', {
+        snapshotId,
+        htmlLength: scanResult.html ? scanResult.html.length : 0,
+      });
+    } catch (err) {
+      logger.stageEnd('mongo:save-snapshot', {
+        snapshotId: null,
+        error: err?.message || String(err),
+      });
+      throw err;
+    }
+
+    finalSnapshotId = snapshotId;
+    finalHash = scanResult.hash;
+
+    if (scanResult.blocked) {
       finalStatus = 'blad'; // FIX
-      finalError = result.block_reason || 'BOT_PROTECTION';
+      finalError = scanResult.block_reason || 'BOT_PROTECTION';
       logger.warn('scan', 'Result blocked by bot protection', {
         reason: finalError,
-        status: result.http_status,
+        status: scanResult.http_status,
       });
       await markMonitorRequiresIntervention(monitor_id, { reason: finalError, snapshotId, logger }); // ADD
       logger.stageStart('pg:finish-task', { status: 'blad' });
       try {
         await finishTask(taskId, {
           status: 'blad',
-          blad_opis: result.block_reason || 'BOT_PROTECTION',
+          blad_opis: scanResult.block_reason || 'BOT_PROTECTION',
           tresc_hash: null,
           snapshot_mongo_id: snapshotId,
         });
@@ -2093,7 +1998,7 @@ async function processTask(task) {
       await finishTask(taskId, {
         status: 'ok',
         blad_opis: null,
-        tresc_hash: result.hash,
+        tresc_hash: scanResult.hash,
         snapshot_mongo_id: snapshotId,
       });
       logger.stageEnd('pg:finish-task', { status: 'ok' });
@@ -2138,7 +2043,7 @@ async function processTask(task) {
     if (domainPermit?.release) { // ADD
       domainPermit.release(domainReleaseInfo); // ADD
     } // ADD
-    const duration = Date.now() - startedAt; // FIX
+    const duration = Date.now() - taskStartedAt; // FIX
     console.log(`SCAN END monitor=${monitor_id} status=${finalStatus} durationMs=${duration} error=${finalError || 'none'}`); // LOG
     logger.headerEnd({ // FIX
       status: finalStatus,
@@ -2222,8 +2127,8 @@ async function resetData() {
 async function sanityChecks() {
   const { rows } = await pool.query('SELECT current_database() AS db, current_user AS usr');
   console.log('PG OK:', rows[0]);
-  const db = await ensureMongo();
-  await db.command({ ping: 1 });
+  const mongoDbClient = await ensureMongo();
+  await mongoDbClient.command({ ping: 1 });
   console.log('Mongo OK');
 }
 
