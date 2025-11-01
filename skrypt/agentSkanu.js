@@ -15,7 +15,8 @@
  *   node agentSkanu.js --monitor-id <UUID> --once   # pojedynczy scan konkretnego monitora (pomija planowanie)
  *   node agentSkanu.js --reset        # TRUNCATE zadania_skanu + drop snapshotów w Mongo
  */
-
+require('dns').setDefaultResultOrder('ipv4first');
+require('dns').setDefaultResultOrder('ipv4first');
 require('dotenv').config({ path: require('path').resolve(__dirname, '.env') });
 
 const path = require('path');
@@ -147,14 +148,15 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 20_000, message =
     const response = await fetchFn(url, { ...options, signal: controller.signal });
     return response;
   } catch (e) {
-    if (e && (e.name === 'AbortError' || e.code === 'ABORT_ERR')) {
-      throw new Error(message);
-    }
-    throw e;
+    const enriched = new Error(e?.message || 'fetch failed');
+    enriched.code = e?.code;
+    enriched.cause = e?.cause;
+    throw enriched.name === 'AbortError' ? new Error(message) : enriched;
   } finally {
     clearTimeout(id);
   }
 }
+
 
 
 
@@ -1824,6 +1826,71 @@ async function processTask(task) {
       url,
       selectorPreview: selector ? selector.slice(0, 120) : null,
     });
+    domainReleaseInfo = { blocked: !!result.blocked, error: false }; // ADD
+
+    logger.stageStart('mongo:save-snapshot', { mode: result.mode });
+    let snapshotId;
+    try {
+      snapshotId = await saveSnapshotToMongo({
+        monitor_id,
+        url,
+        ts: new Date(),
+        mode: result.mode,
+        final_url: result.final_url,
+        html: result.html,
+        meta: result.meta,
+        hash: result.hash,
+        blocked: !!result.blocked,
+        block_reason: result.block_reason || null,
+        screenshot_b64: result.screenshot_b64 || null,
+      });
+      console.log(`MONGO snapshot=${snapshotId} monitor=${monitor_id} blocked=${!!result.blocked}`); // LOG
+      logger.stageEnd('mongo:save-snapshot', {
+        snapshotId,
+        htmlLength: result.html ? result.html.length : 0,
+      });
+    } catch (err) {
+      logger.stageEnd('mongo:save-snapshot', {
+        snapshotId: null,
+        error: err?.message || String(err),
+      });
+      throw err;
+    }
+
+    finalSnapshotId = snapshotId;
+    finalHash = result.hash;
+
+    logger.stageStart('mongo:save-snapshot', { mode: result.mode });
+    let snapshotId;
+    try {
+      snapshotId = await saveSnapshotToMongo({
+        monitor_id,
+        url,
+        ts: new Date(),
+        mode: result.mode,
+        final_url: result.final_url,
+        html: result.html,
+        meta: result.meta,
+        hash: result.hash,
+        blocked: !!result.blocked,
+        block_reason: result.block_reason || null,
+        screenshot_b64: result.screenshot_b64 || null,
+      });
+      console.log(`MONGO snapshot=${snapshotId} monitor=${monitor_id} blocked=${!!result.blocked}`); // LOG
+      logger.stageEnd('mongo:save-snapshot', {
+        snapshotId,
+        htmlLength: result.html ? result.html.length : 0,
+      });
+    } catch (err) {
+      logger.stageEnd('mongo:save-snapshot', {
+        snapshotId: null,
+        error: err?.message || String(err),
+      });
+      throw err;
+    }
+
+    finalSnapshotId = snapshotId;
+    finalHash = result.hash;
 
     let domainPermit = null; // ADD
     let domainReleaseInfo = { blocked: false, error: false }; // ADD
