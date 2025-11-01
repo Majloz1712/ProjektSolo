@@ -327,8 +327,15 @@ async function setPageProfile(page, profile) {
       await page.setUserAgent(profile.userAgent).catch(() => {});
     }
     const headers = {
+      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
       'accept-language': profile.acceptLanguage || 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+      'cache-control': 'max-age=0',
+      'pragma': 'no-cache',
       'upgrade-insecure-requests': '1',
+      'sec-fetch-dest': 'document',
+      'sec-fetch-mode': 'navigate',
+      'sec-fetch-site': 'none',
+      'sec-fetch-user': '?1',
       'sec-ch-ua-mobile': '?0',
     };
     if (profile.secChUa) headers['sec-ch-ua'] = profile.secChUa;
@@ -379,20 +386,26 @@ async function humanizePageInteractions(page, viewport = {}) {
   await sleep(randomInt(120, 260));
 }
 
-async function warmUpOrigin(page, url, gotoOptions) {
+async function warmUpOrigin(page, url, gotoOptions, logger) {
+  let origin = null;
   try {
     const parsed = new URL(url);
-    const origin = `${parsed.protocol}//${parsed.host}/`;
+    origin = `${parsed.protocol}//${parsed.host}/`;
     if (!origin || origin === url) return false;
+    logger?.stageStart('browser:warmup', { origin });
     await page.goto(origin, {
       ...gotoOptions,
       waitUntil: 'domcontentloaded',
       timeout: Math.min(gotoOptions?.timeout ?? BROWSER_TIMEOUT_MS, 15_000),
     });
-    await sleep(randomInt(200, 350));
+    await handleCookieConsent(page, logger);
+    await sleep(1_500);
     await humanizePageInteractions(page, page.__profile?.viewport);
+    await sleep(randomInt(200, 350));
+    logger?.stageEnd('browser:warmup', { origin, outcome: 'ok' });
     return true;
   } catch (_) {
+    logger?.stageEnd('browser:warmup', { origin, outcome: 'error' });
     return false;
   }
 }
@@ -1033,7 +1046,7 @@ async function attemptBotBypass(page, {
   try {
     await prepareForBotBypass(page);
     await applyNavigationHeaders(page, opts.headers || {});
-    await warmUpOrigin(page, url, gotoOptions);
+    await warmUpOrigin(page, url, gotoOptions, logger);
     await sleep(randomInt(...BOT_BYPASS_WAIT_RANGE_MS));
 
     const relaxedGoto = {
@@ -1126,6 +1139,13 @@ async function fetchBrowser(url, { selector, browserOptions = {}, logger } = {})
         error: err?.message || String(err),
       });
       throw err;
+    }
+
+    try {
+      const warmed = await warmUpOrigin(page, url, gotoOptions, logger);
+      logger?.info('browser:warmup', 'Pre-warm completed', { warmed });
+    } catch (err) {
+      logger?.warn('browser:warmup', 'Pre-warm failed', { message: err?.message || String(err) });
     }
 
     const includeScreenshot = opts.captureScreenshot !== false;
@@ -1530,24 +1550,24 @@ async function processTask(task) {
     finalHash = result.hash;
 
     if (result.blocked) {
-      finalStatus = 'blad';
+      finalStatus = 'blocked';
       finalError = result.block_reason || 'BOT_PROTECTION';
       logger.warn('scan', 'Result blocked by bot protection', {
         reason: finalError,
         status: result.http_status,
       });
-      logger.stageStart('pg:finish-task', { status: 'blad' });
+      logger.stageStart('pg:finish-task', { status: 'blocked' });
       try {
         await finishTask(taskId, {
-          status: 'blad',
+          status: 'blocked',
           blad_opis: result.block_reason || 'BOT_PROTECTION',
           tresc_hash: null,
           snapshot_mongo_id: snapshotId,
         });
-        logger.stageEnd('pg:finish-task', { status: 'blad' });
+        logger.stageEnd('pg:finish-task', { status: 'blocked' });
       } catch (finishErr) {
         logger.stageEnd('pg:finish-task', {
-          status: 'blad',
+          status: 'blocked',
           error: finishErr?.message || String(finishErr),
         });
         logger.error('pg:finish-task', 'Failed to update task status', {
