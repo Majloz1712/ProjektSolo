@@ -15,7 +15,8 @@
  *   node agentSkanu.js --monitor-id <UUID> --once   # pojedynczy scan konkretnego monitora (pomija planowanie)
  *   node agentSkanu.js --reset        # TRUNCATE zadania_skanu + drop snapshotów w Mongo
  */
-
+require('dns').setDefaultResultOrder('ipv4first');
+require('dns').setDefaultResultOrder('ipv4first');
 require('dotenv').config({ path: require('path').resolve(__dirname, '.env') });
 
 const path = require('path');
@@ -144,17 +145,17 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 20_000, message =
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetchFn(url, { ...options, signal: controller.signal });
-    return res;
+    return await fetchFn(url, { ...options, signal: controller.signal });
   } catch (e) {
-    if (e && (e.name === 'AbortError' || e.code === 'ABORT_ERR')) {
-      throw new Error(message);
-    }
-    throw e;
+    const enriched = new Error(e?.message || 'fetch failed');
+    enriched.code = e?.code;
+    enriched.cause = e?.cause;
+    throw enriched.name === 'AbortError' ? new Error(message) : enriched;
   } finally {
     clearTimeout(id);
   }
 }
+
 
 
 
@@ -188,6 +189,135 @@ function normalizeUrl(u) { // FIX
     return u; // FIX
   }
 } // FIX
+
+function appendCacheBuster(url) { // ADD
+  const stamp = Date.now().toString(); // ADD
+  try { // ADD
+    const parsed = new URL(url); // ADD
+    parsed.searchParams.set('_t', stamp); // ADD
+    return parsed.toString(); // ADD
+  } catch (_) { // ADD
+    const joiner = url.includes('?') ? '&' : '?'; // ADD
+    return `${url}${joiner}_t=${stamp}`; // ADD
+  } // ADD
+} // ADD
+
+function ensureObject(val) {
+  if (!val || typeof val !== 'object') return {};
+  return val;
+}
+
+function randomInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function pickRandomProfile() {
+  return { ...DESKTOP_PROFILES[randomInt(0, DESKTOP_PROFILES.length - 1)] };
+}
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isUuid(value) {
+  return typeof value === 'string' && UUID_REGEX.test(value);
+}
+
+function createRunId(taskId, monitorId) {
+  const base = taskId ? taskId.slice(0, 8) : 'manual';
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `${base}-${rand}-${monitorId ? monitorId.slice(0, 4) : 'ctx'}`;
+}
+
+function createRunLogger({ taskId, monitorId }) {
+  const runId = createRunId(taskId, monitorId);
+  const base = `[scan:${runId}]`;
+  const timestamp = () => new Date().toISOString();
+  const formatExtra = (extra) => {
+    if (!extra || (typeof extra === 'object' && Object.keys(extra).length === 0)) {
+      return '';
+    }
+    try {
+      return ` | data=${JSON.stringify(extra)}`;
+    } catch (_) {
+      return '';
+    }
+  };
+  const emit = (level, stage, message, extra, channel = 'log') => {
+    const stagePart = stage ? ` | stage=${stage}` : '';
+    const extraPart = formatExtra(extra);
+    const line = `${timestamp()} ${base} | level=${level}${stagePart} | ${message}${extraPart}`;
+    if (channel === 'warn') {
+      console.warn(line);
+    } else if (channel === 'error') {
+      console.error(line);
+    } else {
+      console.log(line);
+    }
+  };
+  return {
+    runId,
+    headerStart(meta) {
+      emit('HEADER', 'run', 'START', meta);
+    },
+    headerEnd(meta) {
+      emit('HEADER', 'run', 'END', meta);
+    },
+    stageStart(stage, meta) {
+      emit('STAGE', stage, 'START', meta);
+    },
+    stageEnd(stage, meta) {
+      emit('STAGE', stage, 'END', meta);
+    },
+    info(stage, message, meta) {
+      emit('INFO', stage, message, meta);
+    },
+    warn(stage, message, meta) {
+      emit('WARN', stage, message, meta, 'warn');
+    },
+    error(stage, message, meta) {
+      emit('ERROR', stage, message, meta, 'error');
+    },
+  };
+}
+
+// css_selector może być zwykłym selektorem lub JSON-em np.:
+// { "selector": "#app", "browserOptions": { "waitForSelector": "#loaded", "scrollToBottom": true } }
+function parseMonitorBehavior(rawSelector) {
+  const config = {
+    selector: rawSelector || null,
+    staticOptions: {},
+    browserOptions: {},
+  };
+
+  if (!rawSelector) {
+    return config;
+  }
+
+  const trimmed = String(rawSelector).trim();
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (typeof parsed === 'string') {
+        config.selector = parsed;
+        return config;
+      }
+      const browser = ensureObject(parsed.browser || parsed.browserOptions);
+      const statik = ensureObject(parsed.static || parsed.staticOptions);
+      config.selector = parsed.selector ?? parsed.css_selector ?? null;
+      config.staticOptions = { ...statik };
+      config.browserOptions = { ...browser };
+      if (!config.selector && typeof parsed.cssSelector === 'string') {
+        config.selector = parsed.cssSelector;
+      }
+      if (!config.selector && typeof parsed.selector === 'string') {
+        config.selector = parsed.selector;
+      }
+    } catch (_) {
+      config.selector = trimmed;
+    }
+  }
+
+  return config;
+}
 
 function appendCacheBuster(url) { // ADD
   const stamp = Date.now().toString(); // ADD
@@ -1864,6 +1994,38 @@ async function processTask(task) {
       finalUrl: result.final_url,
     });
     domainReleaseInfo = { blocked: !!result.blocked, error: false }; // ADD
+
+    logger.stageStart('mongo:save-snapshot', { mode: result.mode });
+    let snapshotId;
+    try {
+      snapshotId = await saveSnapshotToMongo({
+        monitor_id,
+        url,
+        ts: new Date(),
+        mode: result.mode,
+        final_url: result.final_url,
+        html: result.html,
+        meta: result.meta,
+        hash: result.hash,
+        blocked: !!result.blocked,
+        block_reason: result.block_reason || null,
+        screenshot_b64: result.screenshot_b64 || null,
+      });
+      console.log(`MONGO snapshot=${snapshotId} monitor=${monitor_id} blocked=${!!result.blocked}`); // LOG
+      logger.stageEnd('mongo:save-snapshot', {
+        snapshotId,
+        htmlLength: result.html ? result.html.length : 0,
+      });
+    } catch (err) {
+      logger.stageEnd('mongo:save-snapshot', {
+        snapshotId: null,
+        error: err?.message || String(err),
+      });
+      throw err;
+    }
+
+    finalSnapshotId = snapshotId;
+    finalHash = result.hash;
 
     logger.stageStart('mongo:save-snapshot', { mode: result.mode });
     let snapshotId;
