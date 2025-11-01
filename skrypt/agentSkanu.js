@@ -15,7 +15,8 @@
  *   node agentSkanu.js --monitor-id <UUID> --once   # pojedynczy scan konkretnego monitora (pomija planowanie)
  *   node agentSkanu.js --reset        # TRUNCATE zadania_skanu + drop snapshotów w Mongo
  */
-
+require('dns').setDefaultResultOrder('ipv4first');
+require('dns').setDefaultResultOrder('ipv4first');
 require('dotenv').config({ path: require('path').resolve(__dirname, '.env') });
 
 const path = require('path');
@@ -134,17 +135,17 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 20_000, message =
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetchFn(url, { ...options, signal: controller.signal });
-    return res;
+    return await fetchFn(url, { ...options, signal: controller.signal });
   } catch (e) {
-    if (e && (e.name === 'AbortError' || e.code === 'ABORT_ERR')) {
-      throw new Error(message);
-    }
-    throw e;
+    const enriched = new Error(e?.message || 'fetch failed');
+    enriched.code = e?.code;
+    enriched.cause = e?.cause;
+    throw enriched.name === 'AbortError' ? new Error(message) : enriched;
   } finally {
     clearTimeout(id);
   }
 }
+
 
 
 
