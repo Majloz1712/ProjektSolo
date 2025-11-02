@@ -34,9 +34,11 @@ if (!fetchFn) {
 const { JSDOM } = require('jsdom'); // npm i jsdom
 
 // ---- Konfiguracja ----
-const LOOP_MS = Number(process.env.AGENT_LOOP_MS || 5_000);       // okres głównej pętli
+const LOOP_MIN_DELAY_MS = 60_000; // FIX
+const LOOP_MAX_DELAY_MS = 180_000; // ADD
+const LOOP_MS = Math.max(Number(process.env.AGENT_LOOP_MS || LOOP_MIN_DELAY_MS), LOOP_MIN_DELAY_MS);       // okres głównej pętli // FIX
 const SCHEDULE_BATCH_LIMIT = Number(process.env.SCHEDULE_BATCH_LIMIT || 200);
-const MAX_CONCURRENCY = Number(process.env.MAX_CONCURRENCY || 5);
+const MAX_CONCURRENCY = Math.max(1, Math.min(Number(process.env.MAX_CONCURRENCY || 2), 2)); // FIX
 const USER_AGENT = process.env.AGENT_UA || 'SondaMonitor/1.1 (+Inzynierka2025)';
 const STATIC_TIMEOUT_MS = Number(process.env.STATIC_TIMEOUT_MS || 20_000);
 const BROWSER_TIMEOUT_MS = Number(process.env.BROWSER_TIMEOUT_MS || 45_000);
@@ -50,16 +52,10 @@ const DEFAULT_WAIT_FOR_SELECTOR_TIMEOUT = Number(process.env.DEFAULT_WAIT_FOR_SE
 const DEFAULT_SCROLL_DELAY_MS = Number(process.env.DEFAULT_SCROLL_DELAY_MS || 250);
 const BOT_BYPASS_WAIT_RANGE_MS = [400, 900];
 
-<<<<<<< HEAD
+const TRACKER_PARAMS = new Set(['fbclid', 'gclid', 'yclid', 'mc_cid', 'mc_eid', 'igshid', 'sid', 'reco_id', 'utm_source', 'utm_medium', 'utm_campaign']); // FIX
+const TRACKER_PREFIXES = ['utm_', 'pk_', 'ga_']; // ADD
 const TRACKER_PARAMS = new Set(['fbclid', 'gclid', 'yclid', 'mc_cid', 'mc_eid', 'igshid']); // ADD
 const TRACKER_PREFIXES = ['utm_', 'pk_', 'ga_']; // ADD
-=======
-const TRACKER_PARAMS = new Set([
-  'fbclid','gclid','yclid','mc_cid','mc_eid','igshid',
-  'sid','reco_id','emission_id','device_ratio','utm_campaign','utm_source','utm_medium'
-]);
-const TRACKER_PREFIXES = ['utm_','pk_','ga_','spm_','yclid_'];
->>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
 
 const DESKTOP_PROFILES = [
   {
@@ -109,23 +105,11 @@ const COOKIE_CONSENT_KEYWORDS = [
   'consent',
 ];
 
-<<<<<<< HEAD
 const ERROR_CONFIRM_KEYWORDS = ['confirm', 'potwierdź', 'potwierdzam', 'continue']; // ADD
 
 const DOMAIN_MIN_DELAY_MS = 60_000; // ADD
 const DOMAIN_MAX_DELAY_MS = 180_000; // ADD
-=======
-const ERROR_CONFIRM_KEYWORDS = [
-  'potwierdź', 'potwierdz', 'potwierdzam',
-  'confirm', 'i confirm', 'continue', 'kontynuuj',
-  'jestem człowiekiem', 'jestem czlowiekiem', 'i am human'
-];
 
-
-
-const DOMAIN_MIN_DELAY_MS = 180_000;     // 3 min
-const DOMAIN_MAX_DELAY_MS = 420_000;     // 7 min
->>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
 const DOMAIN_BACKOFF_MAX_MS = 30 * 60_000; // ADD
 const DOMAIN_BLOCK_PAUSE_MS = 4 * 60 * 60_000; // ADD
 
@@ -232,6 +216,11 @@ function ensureObject(val) {
 function randomInt(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
+
+function computeLoopDelayMs() { // ADD
+  const maxDelay = Math.max(LOOP_MAX_DELAY_MS, LOOP_MS); // ADD
+  return randomInt(LOOP_MIN_DELAY_MS, maxDelay); // ADD
+} // ADD
 
 function pickRandomProfile() {
   return { ...DESKTOP_PROFILES[randomInt(0, DESKTOP_PROFILES.length - 1)] };
@@ -606,7 +595,11 @@ async function warmUpOrigin(page, url, gotoOptions, logger, session) { // FIX
   let warmupOrigin = null; // FIX
   try { // FIX
     const parsedWarmupUrl = new URL(url); // FIX
+    const hostName = parsedWarmupUrl.hostname || ''; // ADD
     warmupOrigin = `${parsedWarmupUrl.protocol}//${parsedWarmupUrl.host}/`; // FIX
+    if (hostName.endsWith('allegro.pl')) { // ADD
+      warmupOrigin = 'https://allegro.pl/'; // ADD
+    } // ADD
     if (!warmupOrigin || warmupOrigin === url) return false; // FIX
     logger?.stageStart('browser:warmup', { origin: warmupOrigin }); // FIX
     if (session?.cookies?.length) { // ADD
@@ -632,7 +625,8 @@ async function warmUpOrigin(page, url, gotoOptions, logger, session) { // FIX
       } catch (_) {} // ADD
     } // ADD
     await handleCookieConsent(page, logger); // FIX
-    await sleep(1_500); // FIX
+    await handleErrorScreenConfirmation(page, logger); // ADD
+    await sleep(randomInt(1_000, 1_500)); // ADD
     await humanizePageInteractions(page, page.__profile?.viewport); // FIX
     await sleep(randomInt(200, 350)); // FIX
     logger?.stageEnd('browser:warmup', { origin: warmupOrigin, outcome: 'ok' }); // FIX
@@ -698,7 +692,6 @@ async function configurePage(page) {
   try {
     await page.setBypassCSP(true);
   } catch (_) {}
-  try { await page.setCacheEnabled(false); } catch (_) {} // FIX
   page.setDefaultNavigationTimeout(BROWSER_TIMEOUT_MS);
   page.setDefaultTimeout(BROWSER_TIMEOUT_MS);
 }
@@ -991,6 +984,7 @@ async function fetchStatic(url, { selector, headers = {}, fetchOptions = {}, log
     { match: () => htmlLower.includes('captcha') || finalUrl.toLowerCase().includes('captcha'), reason: 'CAPTCHA_DETECTED' }, // FIX
     { match: () => htmlLower.includes('please enable javascript') || htmlLower.includes('please enable js'), reason: 'JS_REQUIRED' }, // FIX
     { match: () => finalUrl.toLowerCase().includes('geo.captcha-delivery.com') || htmlLower.includes('geo.captcha-delivery.com'), reason: 'GEO_CAPTCHA' }, // FIX
+    { match: () => htmlLower.includes('przesuń w prawo') || htmlLower.includes('ułóż układankę'), reason: 'CAPTCHA_SLIDER' }, // ADD
   ]; // FIX
   for (const check of checks) { // FIX
     if (check.match()) { // FIX
@@ -1026,22 +1020,30 @@ async function detectBotWall(page) {
         'script[src*="captcha-delivery.com"],script[src*="ct.captcha-delivery.com"]'
       );
       const hasAllegroShield = !!document.querySelector('div[data-box-name="allegro.guard"]');
-      return (
+      const sliderPhrases = ['przesuń w prawo', 'ułóż układankę', 'potwierdź, że jesteś człowiekiem', 'confirm you are human'];
+      const hasSliderText = sliderPhrases.some((phrase) => txt.includes(phrase));
+      const hasCaptchaCanvas = !!document.querySelector('canvas[data-testid*="captcha"], canvas[aria-label*="captcha"], canvas[id*="captcha"], canvas[class*="captcha"]');
+      const genericBlocked =
         hasCMsg ||
         hasCaptchaDelivery ||
         hasAllegroShield ||
         pageTitleLower.includes('enable js') ||
         txt.includes('enable js') ||
         txt.includes('captcha') ||
-        txt.includes('potwierdź, że jesteś człowiekiem') || // ADD
-        txt.includes('confirm you are human') || // ADD
         txt.includes('bot protection') ||
         txt.includes('access denied') ||
-        txt.includes('protect our site')
-      );
+        txt.includes('protect our site');
+      let reason = null;
+      if (hasSliderText || hasCaptchaCanvas) {
+        reason = 'CAPTCHA_SLIDER';
+      } else if (genericBlocked) {
+        reason = 'BOT_PROTECTION';
+      }
+      const blocked = Boolean(reason || genericBlocked);
+      return { blocked, reason: reason || (blocked ? 'BOT_PROTECTION' : null) };
     });
   } catch (_) {
-    return false;
+    return { blocked: false, reason: null };
   }
 }
 
@@ -1127,7 +1129,6 @@ async function handleCookieConsent(page, logger) {
   }
 }
 
-<<<<<<< HEAD
 async function handleErrorScreenConfirmation(page, logger) { // ADD
   logger?.stageStart('browser:error-screen', {}); // ADD
   try { // ADD
@@ -1169,7 +1170,7 @@ async function handleErrorScreenConfirmation(page, logger) { // ADD
     } // ADD
     if (screenResult.clicked) { // ADD
       logger?.info('browser:error-screen', 'Error screen confirmation clicked', { label: screenResult.label }); // ADD
-      await sleep(2_000); // ADD
+      await sleep(randomInt(1_000, 1_500)); // ADD
       logger?.stageEnd('browser:error-screen', { triggered: true, clicked: true, label: screenResult.label }); // ADD
     } else { // ADD
       logger?.stageEnd('browser:error-screen', { triggered: true, clicked: false }); // ADD
@@ -1178,116 +1179,6 @@ async function handleErrorScreenConfirmation(page, logger) { // ADD
     logger?.stageEnd('browser:error-screen', { triggered: true, clicked: false, error: err?.message || String(err) }); // ADD
   } // ADD
 } // ADD
-=======
-async function handleErrorScreenConfirmation(page, logger) {
-  logger?.stageStart('browser:error-screen', {});
-  const norm = (s) => (s || '').toString().trim().toLowerCase();
-
-  // klikamy w ramce używając samego DOM (żadnego $x na Frame)
-  async function tryClickInFrame(frame, words) {
-    try {
-      const result = await frame.evaluate((words2) => {
-        const norm = (s) => (s || '').toString().trim().toLowerCase();
-        const visible = (el) => {
-          try {
-            const r = el.getBoundingClientRect();
-            const cs = window.getComputedStyle(el);
-            return !!r && r.width > 0 && r.height > 0 &&
-              cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0';
-          } catch (_) { return false; }
-        };
-        const matches = (el) => {
-          const txt = norm(el.innerText || el.textContent || el.value || '');
-          if (!txt) return false;
-          return words2.some((w) => txt.includes(norm(w)));
-        };
-
-        // typowe klikane elementy
-        const SEL = [
-          'button',
-          'a',
-          'div[role="button"]',
-          'span[role="button"]',
-          'input[type="submit"]',
-          'input[type="button"]'
-        ].join(',');
-
-        // 1) przegląd wszystkich kandydatów
-        const nodes = Array.from(document.querySelectorAll(SEL));
-        for (const el of nodes) {
-          if (!visible(el)) continue;
-          if (!matches(el)) continue;
-          el.scrollIntoView({ block: 'center', inline: 'center' });
-          if (typeof el.click === 'function') el.click();
-          return { clicked: true, label: (el.innerText || el.value || '').trim() };
-        }
-
-        // 2) heurystyka Allegro — przycisk "CONFIRM"
-        const hard = Array.from(document.querySelectorAll('button, a')).find((el) => {
-          const t = norm(el.innerText || el.textContent || '');
-          return visible(el) && (t === 'confirm' || t.includes('confirm'));
-        });
-        if (hard) {
-          hard.scrollIntoView({ block: 'center', inline: 'center' });
-          if (typeof hard.click === 'function') hard.click();
-          return { clicked: true, label: (hard.innerText || '').trim() };
-        }
-
-        return { clicked: false };
-      }, words);
-
-      return result || { clicked: false };
-    } catch {
-      return { clicked: false };
-    }
-  }
-
-  try {
-    // czy w ogóle jesteśmy na ekranie ochronnym?
-    const bodyText = norm(await page.evaluate(() => document.body?.innerText || ''));
-    const path = norm(await page.evaluate(() => location.pathname || ''));
-    const probable =
-      bodyText.includes('potwierdź, że jesteś człowiekiem') ||
-      bodyText.includes('confirm you are human') ||
-      bodyText.includes('unusual activity') ||
-      path.includes('error') || path.includes('bledy');
-
-    const words = ERROR_CONFIRM_KEYWORDS.slice();
-
-    // 1) spróbuj w głównej ramce
-    let result = await tryClickInFrame(page.mainFrame(), words);
-
-    // 2) i we wszystkich iframach
-    if (!result.clicked) {
-      for (const fr of page.frames()) {
-        if (fr === page.mainFrame()) continue;
-        const r = await tryClickInFrame(fr, words);
-        if (r.clicked) { result = r; break; }
-      }
-    }
-
-    if (result.clicked) {
-      logger?.info('browser:error-screen', 'Confirmation clicked', { label: result.label });
-      // czekamy na przeładowanie lub „zejście” overlaya
-      try {
-        await Promise.race([
-          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 8000 }),
-          page.waitForResponse((resp) => {
-            try { return resp.status() < 400; } catch { return false; }
-          }, { timeout: 8000 })
-        ]);
-      } catch (_) {}
-      await sleep(800);
-      logger?.stageEnd('browser:error-screen', { triggered: true, clicked: true, label: result.label });
-    } else {
-      logger?.stageEnd('browser:error-screen', { triggered: probable, clicked: false });
-    }
-  } catch (err) {
-    logger?.stageEnd('browser:error-screen', { triggered: true, clicked: false, error: err?.message || String(err) });
-  }
-}
-
->>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
 
 async function collectBrowserSnapshot(page, {
   url,
@@ -1362,8 +1253,8 @@ logger) {
     }
 
     logger?.stageStart('browser:detect-botwall', {});
-    const botwallDetected = await detectBotWall(page);
-    logger?.stageEnd('browser:detect-botwall', { blocked: botwallDetected });
+    const botwallInfo = await detectBotWall(page);
+    logger?.stageEnd('browser:detect-botwall', { blocked: botwallInfo?.blocked || false, reason: botwallInfo?.reason || null });
     const navigatedUrl = page.url();
     logger?.stageStart('browser:extract-html', { selector: !!selector });
     let snapshotHtml;
@@ -1388,6 +1279,8 @@ logger) {
       const textLength = document.body?.innerText?.length || 0;
       return { title: metaTitle, desc: metaDesc, canonical: metaCanonical, h1: metaH1, linksCount: linkCount, textLen: textLength };
     });
+  }
+}
 
     let screenshot_b64 = null;
     if (includeScreenshot) {
@@ -1407,7 +1300,8 @@ logger) {
     return {
       navStatus,
       finalUrl: navigatedUrl,
-      blocked: botwallDetected,
+      blocked: !!(botwallInfo && botwallInfo.blocked),
+      blockReason: botwallInfo?.reason || (botwallInfo?.blocked ? 'BOT_PROTECTION' : null),
       html: snapshotHtml,
       meta: evaluatedMeta,
       screenshot_b64,
@@ -1519,6 +1413,108 @@ async function fetchBrowser(url, { selector, browserOptions = {}, logger, monito
     } catch (err) {
       logger?.stageEnd('browser:acquire-page', {
         acquired: false,
+async function handleErrorScreenConfirmation(page, logger) { // ADD
+  logger?.stageStart('browser:error-screen', {}); // ADD
+  try { // ADD
+    const screenResult = await page.evaluate((keywords) => { // ADD
+      const bodyText = (document.body?.innerText || '').toLowerCase(); // ADD
+      const urlPath = (location.pathname || '').toLowerCase(); // ADD
+      const shouldCheck = bodyText.includes('potwierdź, że jesteś człowiekiem') // ADD
+        || bodyText.includes('confirm you are human') // ADD
+        || urlPath.includes('bledy') // ADD
+        || urlPath.includes('error'); // ADD
+      if (!shouldCheck) { // ADD
+        return { triggered: false }; // ADD
+      } // ADD
+      const candidates = Array.from(document.querySelectorAll('button, a, div[role="button"], span[role="button"], input[type="submit"]')); // ADD
+      for (const el of candidates) { // ADD
+        const buttonLabel = (el.innerText || el.textContent || el.value || '').trim(); // ADD
+        if (!buttonLabel) continue; // ADD
+        const lowerLabel = buttonLabel.toLowerCase(); // ADD
+        if (keywords.some((keyword) => lowerLabel.includes(keyword))) { // ADD
+          const buttonRect = el.getBoundingClientRect(); // ADD
+          const buttonStyle = window.getComputedStyle(el); // ADD
+          const isHidden = !buttonRect || buttonRect.width === 0 || buttonRect.height === 0 // ADD
+            || buttonStyle.visibility === 'hidden' // ADD
+            || buttonStyle.display === 'none' // ADD
+            || buttonStyle.opacity === '0'; // ADD
+          if (isHidden) continue; // ADD
+          if (typeof el.click === 'function') { // ADD
+            el.click(); // ADD
+            return { triggered: true, clicked: true, label: buttonLabel }; // ADD
+          } // ADD
+        } // ADD
+      } // ADD
+      return { triggered: true, clicked: false }; // ADD
+    }, ERROR_CONFIRM_KEYWORDS); // ADD
+
+    if (!screenResult.triggered) { // ADD
+      logger?.stageEnd('browser:error-screen', { triggered: false }); // ADD
+      return; // ADD
+    } // ADD
+    if (screenResult.clicked) { // ADD
+      logger?.info('browser:error-screen', 'Error screen confirmation clicked', { label: screenResult.label }); // ADD
+      await sleep(2_000); // ADD
+      logger?.stageEnd('browser:error-screen', { triggered: true, clicked: true, label: screenResult.label }); // ADD
+    } else { // ADD
+      logger?.stageEnd('browser:error-screen', { triggered: true, clicked: false }); // ADD
+    } // ADD
+  } catch (err) { // ADD
+    logger?.stageEnd('browser:error-screen', { triggered: true, clicked: false, error: err?.message || String(err) }); // ADD
+  } // ADD
+} // ADD
+
+async function collectBrowserSnapshot(page, {
+  url,
+  gotoOptions,
+  selector,
+  waitAfterMs,
+  browserOptions,
+  includeScreenshot = true,
+},
+logger) {
+  const snapshotOpts = browserOptions || {};
+  let navStatus = null;
+  const onResponse = (resp) => {
+    try {
+      if (resp.request().resourceType() === 'document' && navStatus === null) {
+        navStatus = resp.status();
+      }
+    } catch (_) {}
+  };
+  page.on('response', onResponse);
+  try {
+    logger?.stageStart('browser:navigate', {
+      url,
+      waitUntil: gotoOptions.waitUntil,
+      timeout: gotoOptions.timeout,
+    });
+    try {
+      await page.goto(url, gotoOptions);
+      logger?.stageEnd('browser:navigate', { status: navStatus });
+    } catch (err) {
+      logger?.stageEnd('browser:navigate', {
+        status: navStatus,
+        error: err?.message || String(err),
+      });
+      throw err;
+    }
+
+    await handleCookieConsent(page, logger); // FIX
+    await handleErrorScreenConfirmation(page, logger); // ADD
+
+    logger?.stageStart('browser:wait-readiness', {
+      waitAfterMs,
+      waitUntil: gotoOptions.waitUntil,
+    });
+    try {
+      await waitForPageReadiness(page, {
+        ...snapshotOpts,
+        waitAfterMs,
+      });
+      logger?.stageEnd('browser:wait-readiness', {});
+    } catch (err) {
+      logger?.stageEnd('browser:wait-readiness', {
         error: err?.message || String(err),
       });
       throw err;
@@ -1542,17 +1538,12 @@ async function fetchBrowser(url, { selector, browserOptions = {}, logger, monito
     }
 
     const activeSession = getMonitorSession(monitorId); // ADD
-    let restoredSession = false; // ADD
-    if (activeSession) { // ADD
-      restoredSession = await restoreSessionForPage(page, monitorId, url, logger); // ADD
-      await applyNavigationHeaders(page, navigationOpts.headers || {}); // ADD
-    } else { // ADD
-      await warmUpOrigin(page, url, gotoOptions, logger, null); // ADD
-      await applyNavigationHeaders(page, navigationOpts.headers || {}); // ADD
-    } // ADD
-
-    if (activeSession && !restoredSession) { // ADD
-      await warmUpOrigin(page, url, gotoOptions, logger, activeSession); // ADD
+    const restoredSession = await restoreSessionForPage(page, monitorId, url, logger); // FIX
+    await applyNavigationHeaders(page, navigationOpts.headers || {}); // ADD
+    const hostForScan = getDomainFromUrl(url); // ADD
+    const requiresWarmup = !restoredSession || (hostForScan && hostForScan.endsWith('allegro.pl')); // ADD
+    if (requiresWarmup) { // ADD
+      await warmUpOrigin(page, url, gotoOptions, logger, activeSession || null); // ADD
       await applyNavigationHeaders(page, navigationOpts.headers || {}); // ADD
     } // ADD
 
@@ -1621,7 +1612,7 @@ async function fetchBrowser(url, { selector, browserOptions = {}, logger, monito
     const http_status = browserSnapshot.navStatus || 200; // FIX
 
     const screenshotInfo = browserSnapshot.screenshot_b64 ? browserSnapshot.screenshot_b64.length : 0; // FIX
-    console.log(`BROWSER status=${http_status} blocked=${!!browserSnapshot.blocked} finalUrl=${browserSnapshot.finalUrl || url} screenshotLength=${screenshotInfo}`); // LOG
+    console.log(`BROWSER status=${http_status} blocked=${!!browserSnapshot.blocked} reason=${browserSnapshot.blockReason || 'none'} finalUrl=${browserSnapshot.finalUrl || url} screenshotLength=${screenshotInfo}`); // LOG
 
     if (monitorId) { // ADD
       await persistSessionFromPage(page, monitorId, browserSnapshot.finalUrl || url, logger); // ADD
@@ -1637,7 +1628,7 @@ async function fetchBrowser(url, { selector, browserOptions = {}, logger, monito
       meta: browserSnapshot.meta,
       hash: browserSnapshot.hash,
       blocked: !!browserSnapshot.blocked,
-      block_reason: browserSnapshot.blocked ? 'BOT_PROTECTION' : null,
+      block_reason: browserSnapshot.blockReason || (browserSnapshot.blocked ? 'BOT_PROTECTION' : null),
       screenshot_b64: browserSnapshot.screenshot_b64,
     };
   } catch (err) {
@@ -1871,7 +1862,6 @@ async function processTask(task) {
   const { id: taskId, monitor_id } = task;
   const logger = createRunLogger({ taskId, monitorId: monitor_id });
   const taskStartedAt = Date.now();
-<<<<<<< HEAD
   let finalStatus = 'unknown';
   let finalHash = null;
   let finalSnapshotId = null;
@@ -1880,21 +1870,7 @@ async function processTask(task) {
   logger.headerStart({ taskId, monitorId: monitor_id });
 
   try {
-=======
 
-  let finalStatus = 'unknown';
-  let finalHash = null;
-  let finalSnapshotId = null;
-  let finalError = null;
-
-  let domainPermit = null;                 // <— trzymamy uchwyt do throttlingu domeny
-  let domainReleaseInfo = { blocked: false, error: false };
-
-  logger.headerStart({ taskId, monitorId: monitor_id });
-
-  try {
-    // --- Walidacja identyfikatorów
->>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
     logger.stageStart('validate-identifiers', { taskId, monitorId: monitor_id });
     const validTaskId = isUuid(taskId);
     const validMonitorId = isUuid(monitor_id);
@@ -1903,7 +1879,6 @@ async function processTask(task) {
       finalStatus = 'blad';
       finalError = 'INVALID_UUID';
       logger.error('validate-identifiers', 'Invalid UUID detected', { validTaskId, validMonitorId });
-<<<<<<< HEAD
       logger.stageStart('pg:finish-task', { status: 'blad' });
       try {
         await finishTask(taskId, {
@@ -1922,22 +1897,10 @@ async function processTask(task) {
           message: finishErr?.message || String(finishErr),
         });
       }
-=======
-      await finishTask(taskId, {
-        status: 'blad',
-        blad_opis: 'INVALID_UUID',
-        tresc_hash: null,
-        snapshot_mongo_id: null,
-      }).catch((e) => logger.error('pg:finish-task', 'Failed to update task status', { message: e?.message || String(e) }));
->>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
       return;
     }
     logger.stageEnd('validate-identifiers', { validTaskId, validMonitorId, outcome: 'ok' });
 
-<<<<<<< HEAD
-=======
-    // --- Pobranie monitora
->>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
     logger.stageStart('load-monitor', { monitorId: monitor_id });
     const monitor = await withPg((pg) => loadMonitor(pg, monitor_id));
     if (!monitor) {
@@ -1945,7 +1908,6 @@ async function processTask(task) {
       finalStatus = 'blad';
       finalError = 'MONITOR_NOT_FOUND';
       logger.error('load-monitor', 'Monitor not found', {});
-<<<<<<< HEAD
       logger.stageStart('pg:finish-task', { status: 'blad' });
       try {
         await finishTask(taskId, {
@@ -1964,14 +1926,6 @@ async function processTask(task) {
           message: finishErr?.message || String(finishErr),
         });
       }
-=======
-      await finishTask(taskId, {
-        status: 'blad',
-        blad_opis: 'MONITOR_NOT_FOUND',
-        tresc_hash: null,
-        snapshot_mongo_id: null,
-      }).catch((e) => logger.error('pg:finish-task', 'Failed to update task status', { message: e?.message || String(e) }));
->>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
       return;
     }
     logger.stageEnd('load-monitor', {
@@ -1980,10 +1934,6 @@ async function processTask(task) {
       url: monitor.url,
     });
 
-<<<<<<< HEAD
-=======
-    // --- Parsowanie zachowania (selector + opcje)
->>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
     logger.stageStart('parse-behavior', { hasSelector: !!monitor.css_selector });
     const { selector, staticOptions, browserOptions } = parseMonitorBehavior(monitor.css_selector || null);
     logger.stageEnd('parse-behavior', {
@@ -1993,60 +1943,48 @@ async function processTask(task) {
     });
 
     const tryb = (monitor.tryb_skanu || 'static').toLowerCase() === 'browser' ? 'browser' : 'static';
-<<<<<<< HEAD
     const url = normalizeUrl(monitor.url); // FIX
     console.log(`SCAN START monitor=${monitor_id} url=${url}`); // LOG
-=======
-    const url = normalizeUrl(monitor.url);
-    console.log(`SCAN START monitor=${monitor_id} url=${url}`);
->>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
+    const url = normalizeUrl(monitor.url); // FIX
+    console.log(`SCAN START monitor=${monitor_id} url=${url}`); // LOG
     logger.info('determine-mode', 'Resolved scan mode', {
       tryb,
       url,
       selectorPreview: selector ? selector.slice(0, 120) : null,
     });
-<<<<<<< HEAD
     domainReleaseInfo = { blocked: !!result.blocked, error: false }; // ADD
 
-    logger.stageStart('mongo:save-snapshot', { mode: result.mode });
-    let snapshotId;
-=======
+    let domainPermit = null; // ADD
+    let domainReleaseInfo = { blocked: false, error: false }; // ADD
+    try { // ADD
+      domainPermit = await acquireDomainSlot(url, { logger, monitorId: monitor_id }); // ADD
+    } catch (acqErr) { // ADD
+      finalStatus = 'blad'; // ADD
+      finalError = acqErr?.code || acqErr?.message || String(acqErr); // ADD
+      logger.error('throttle', 'Domain throttle prevented scan', { // ADD
+        message: finalError, // ADD
+        waitMs: acqErr?.waitMs, // ADD
+      }); // ADD
+      console.error(`SCAN ABORT monitor=${monitor_id} reason=${finalError}`); // LOG
+      if (acqErr?.code === 'DOMAIN_BLOCKED') { // ADD
+        monitorsRequiringIntervention.add(monitor_id); // ADD
+        await markMonitorRequiresIntervention(monitor_id, { reason: finalError, snapshotId: null, logger }); // ADD
+      } // ADD
+      try { // ADD
+        await finishTask(taskId, { // ADD
+          status: 'blad', // ADD
+          blad_opis: finalError.slice(0, 500), // ADD
+          tresc_hash: null, // ADD
+          snapshot_mongo_id: null, // ADD
+        }); // ADD
+      } catch (finishErr) { // ADD
+        logger.error('pg:finish-task', 'Failed to update task status after throttle block', { message: finishErr?.message || String(finishErr) }); // ADD
+      } // ADD
+      return; // ADD
+    } // ADD
 
-    // --- Throttling na poziomie domeny (przed właściwym skanem)
-    try {
-      domainPermit = await acquireDomainSlot(url, { logger, monitorId: monitor_id });
-    } catch (acqErr) {
-      finalStatus = 'blad';
-      finalError = acqErr?.code || acqErr?.message || String(acqErr);
-      logger.error('throttle', 'Domain throttle prevented scan', {
-        message: finalError,
-        waitMs: acqErr?.waitMs,
-      });
-      console.error(`SCAN ABORT monitor=${monitor_id} reason=${finalError}`);
-      if (acqErr?.code === 'DOMAIN_BLOCKED') {
-        monitorsRequiringIntervention.add(monitor_id);
-        await markMonitorRequiresIntervention(monitor_id, { reason: finalError, snapshotId: null, logger });
-      }
-      await finishTask(taskId, {
-        status: 'blad',
-        blad_opis: (finalError || '').slice(0, 500),
-        tresc_hash: null,
-        snapshot_mongo_id: null,
-      }).catch((e) => logger.error('pg:finish-task', 'Failed to update task status after throttle block', { message: e?.message || String(e) }));
-      return;
-    }
-
-    // --- Właściwy skan
     logger.stageStart('scan', { url, tryb });
-    const scanResult = await scanUrl({
-      url,
-      tryb,
-      selector,
-      browserOptions,
-      staticOptions,
-      logger,
-      monitorId: monitor_id,
-    });
+    const scanResult = await scanUrl({ url, tryb, selector, browserOptions, staticOptions, logger, monitorId: monitor_id }); // FIX
     logger.stageEnd('scan', {
       mode: scanResult.mode,
       http_status: scanResult.http_status,
@@ -2054,20 +1992,15 @@ async function processTask(task) {
       hash: scanResult.hash,
       finalUrl: scanResult.final_url,
     });
+    domainReleaseInfo = { blocked: !!scanResult.blocked, error: false }; // ADD
 
-    // info dla throttlingu
-    domainReleaseInfo = { blocked: !!scanResult.blocked, error: false };
-
-    // --- Zapis snapshotu do Mongo (PO skanie, TYLKO raz)
     logger.stageStart('mongo:save-snapshot', { mode: scanResult.mode });
-    let snapshotId = null;
->>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
+    let snapshotId;
     try {
       snapshotId = await saveSnapshotToMongo({
         monitor_id,
         url,
         ts: new Date(),
-<<<<<<< HEAD
         mode: result.mode,
         final_url: result.final_url,
         html: result.html,
@@ -2076,7 +2009,6 @@ async function processTask(task) {
         blocked: !!result.blocked,
         block_reason: result.block_reason || null,
         screenshot_b64: result.screenshot_b64 || null,
-=======
         mode: scanResult.mode,
         final_url: scanResult.final_url,
         html: scanResult.html,
@@ -2086,39 +2018,6 @@ async function processTask(task) {
         block_reason: scanResult.block_reason || null,
         screenshot_b64: scanResult.screenshot_b64 || null,
       });
-      console.log(`MONGO snapshot=${snapshotId} monitor=${monitor_id} blocked=${!!scanResult.blocked}`);
-      logger.stageEnd('mongo:save-snapshot', {
-        snapshotId,
-        htmlLength: scanResult.html ? scanResult.html.length : 0,
-      });
-    } catch (err) {
-      logger.stageEnd('mongo:save-snapshot', {
-        snapshotId: null,
-        error: err?.message || String(err),
-      });
-      throw err;
-    }
-
-    finalSnapshotId = snapshotId;
-    finalHash = scanResult.hash;
-
-    // --- Obsługa blokady BOT / finish status
-    if (scanResult.blocked) {
-      finalStatus = 'blad';
-      finalError = scanResult.block_reason || 'BOT_PROTECTION';
-      logger.warn('scan', 'Result blocked by bot protection', {
-        reason: finalError,
-        status: scanResult.http_status,
-      });
-
-      await markMonitorRequiresIntervention(monitor_id, { reason: finalError, snapshotId, logger });
-
-      await finishTask(taskId, {
-        status: 'blad',
-        blad_opis: finalError,
-        tresc_hash: null,
-        snapshot_mongo_id: snapshotId,
->>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
       });
       console.log(`MONGO snapshot=${snapshotId} monitor=${monitor_id} blocked=${!!result.blocked}`); // LOG
       logger.stageEnd('mongo:save-snapshot', {
@@ -2269,7 +2168,6 @@ async function processTask(task) {
       return;
     }
 
-<<<<<<< HEAD
     logger.stageStart('pg:finish-task', { status: 'ok' });
     try {
       await finishTask(taskId, {
@@ -2289,46 +2187,26 @@ async function processTask(task) {
       });
       throw finishErr;
     }
-=======
-    // --- Sukces
-    logger.stageStart('pg:finish-task', { status: 'ok' });
-    await finishTask(taskId, {
-      status: 'ok',
-      blad_opis: null,
-      tresc_hash: scanResult.hash,
-      snapshot_mongo_id: snapshotId,
-    });
-    logger.stageEnd('pg:finish-task', { status: 'ok' });
->>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
     finalStatus = 'ok';
   } catch (e) {
     finalStatus = 'blad';
     finalError = e?.message || String(e);
-<<<<<<< HEAD
     logger.error('run', 'Unhandled error during task', {
       message: finalError,
       stack: e?.stack,
     });
     domainReleaseInfo.error = true; // ADD
-=======
-    logger.error('run', 'Unhandled error during task', { message: finalError, stack: e?.stack });
-    domainReleaseInfo.error = true;
->>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
     try {
       logger.stageStart('pg:finish-task', { status: 'blad' });
       await finishTask(taskId, {
         status: 'blad',
-<<<<<<< HEAD
         blad_opis: finalError.slice(0, 500),
-=======
-        blad_opis: (finalError || '').slice(0, 500),
->>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
+        blad_opis: finalError.slice(0, 500),
         tresc_hash: null,
         snapshot_mongo_id: null,
       });
       logger.stageEnd('pg:finish-task', { status: 'blad' });
     } catch (finishErr) {
-<<<<<<< HEAD
       logger.stageEnd('pg:finish-task', {
         status: 'blad',
         error: finishErr?.message || String(finishErr),
@@ -2346,21 +2224,6 @@ async function processTask(task) {
     logger.headerEnd({ // FIX
       status: finalStatus,
       durationMs: duration, // FIX
-=======
-      logger.stageEnd('pg:finish-task', { status: 'blad', error: finishErr?.message || String(finishErr) });
-      logger.error('pg:finish-task', 'Failed to update task status', { message: finishErr?.message || String(finishErr) });
-    }
-  } finally {
-    // zawsze zwalniamy slot domeny
-    try {
-      if (domainPermit?.release) domainPermit.release(domainReleaseInfo);
-    } catch (_) {}
-    const duration = Date.now() - taskStartedAt;
-    console.log(`SCAN END monitor=${monitor_id} status=${finalStatus} durationMs=${duration} error=${finalError || 'none'}`);
-    logger.headerEnd({
-      status: finalStatus,
-      durationMs: duration,
->>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
       snapshotId: finalSnapshotId,
       hash: finalHash,
       error: finalError,
@@ -2370,7 +2233,6 @@ async function processTask(task) {
 
 
 
-<<<<<<< HEAD
 async function runExecutionCycle(monitorId) { // FIX
   if (!isUuid(monitorId)) { // FIX
     throw new Error('INVALID_MONITOR_ID'); // FIX
@@ -2415,53 +2277,6 @@ async function runExecutionCycle(monitorId) { // FIX
     finishTask(dup.id, { status: 'blad', blad_opis: 'DUPLICATE_URL', tresc_hash: null, snapshot_mongo_id: null }).catch(() => {}); // FIX
   } // FIX
 
-=======
-
-async function runExecutionCycle(monitorId) { // FIX
-  if (!isUuid(monitorId)) { // FIX
-    throw new Error('INVALID_MONITOR_ID'); // FIX
-  } // FIX
-  if (monitorsRequiringIntervention.has(monitorId)) { // ADD
-    console.log(`[intervention] monitor=${monitorId} paused`); // LOG
-    return; // ADD
-  } // ADD
-  try { // FIX
-    const planned = await scheduleMonitorDue(monitorId); // FIX
-    if (planned) { // FIX
-      console.log(`PLAN scheduled=${planned} monitor=${monitorId}`); // LOG
-    } // FIX
-  } catch (e) { // FIX
-    console.error(`[PLAN] error=${e?.message || e}`); // LOG
-  } // FIX
-
-  let tasks = []; // FIX
-  try { // FIX
-    tasks = await claimMonitorBatch(monitorId, MAX_CONCURRENCY); // FIX
-  } catch (e) { // FIX
-    console.error(`[PLAN] claim-error=${e?.message || e}`); // LOG
-  } // FIX
-
-  const uniqueByUrl = new Map(); // FIX
-  const duplicates = []; // FIX
-  for (const task of tasks) { // FIX
-    const normalizedTaskUrl = task?.url ? normalizeUrl(task.url) : null; // ADD
-    if (!normalizedTaskUrl) { // ADD
-      uniqueByUrl.set(`${task.id}`, task); // FIX
-      continue; // FIX
-    } // FIX
-    if (uniqueByUrl.has(normalizedTaskUrl)) { // FIX
-      duplicates.push(task); // FIX
-    } else { // FIX
-      uniqueByUrl.set(normalizedTaskUrl, { ...task, url: normalizedTaskUrl }); // FIX
-    } // FIX
-  } // FIX
-  const uniqueTasks = Array.from(uniqueByUrl.values()); // FIX
-  console.log(`PLAN monitor=${monitorId} fetched=${tasks.length} unique=${uniqueTasks.length}`); // LOG
-  for (const dup of duplicates) { // FIX
-    finishTask(dup.id, { status: 'blad', blad_opis: 'DUPLICATE_URL', tresc_hash: null, snapshot_mongo_id: null }).catch(() => {}); // FIX
-  } // FIX
-
->>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
   for (const t of uniqueTasks) { // FIX
     queue.add(() => processTask(t)).catch((e) => // FIX
       console.error('[task] błąd krytyczny:', e) // FIX
@@ -2528,18 +2343,24 @@ async function main() {
     return;
   }
 
-  console.log(`[loop] start pętli co ${LOOP_MS} ms`);
-  // pierwsze odpalenie od razu
+  console.log(`[loop] start pętli z losowym odstępem (>=${LOOP_MIN_DELAY_MS} ms)`); // LOG
   await runExecutionCycle(monitorId); // FIX
 
-  // cyklicznie
-  setInterval(async () => {
-    try {
-      await runExecutionCycle(monitorId); // FIX
-    } catch (e) {
-      console.error('[loop] cykl błąd:', e?.message || e);
-    }
-  }, LOOP_MS);
+  const scheduleNextCycle = () => { // ADD
+    const delay = computeLoopDelayMs(); // ADD
+    console.log(`[loop] kolejny cykl za ${delay} ms`); // LOG
+    setTimeout(async () => { // ADD
+      try { // ADD
+        await runExecutionCycle(monitorId); // FIX
+      } catch (e) { // ADD
+        console.error('[loop] cykl błąd:', e?.message || e); // LOG
+      } finally { // ADD
+        scheduleNextCycle(); // ADD
+      } // ADD
+    }, delay); // ADD
+  }; // ADD
+
+  scheduleNextCycle(); // ADD
 }
 
 // Start
