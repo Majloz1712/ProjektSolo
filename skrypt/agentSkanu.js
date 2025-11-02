@@ -1204,6 +1204,7 @@ logger) {
   };
   page.on('response', onResponse);
   let snapshotResult = null; // FIX
+  let snapshotError = null; // ADD
   try {
     logger?.stageStart('browser:navigate', {
       url,
@@ -1313,13 +1314,15 @@ logger) {
       hash: sha256(snapshotHtml || ''),
     }; // FIX
   } catch (err) {
+    snapshotError = err; // ADD
     logger?.error('browser:collect', 'collectBrowserSnapshot failed', {
       message: err?.message || String(err),
     });
-    throw err;
-  } finally {
-    page.off('response', onResponse);
   }
+  page.off('response', onResponse); // FIX
+  if (snapshotError) { // ADD
+    throw snapshotError; // ADD
+  } // ADD
   return snapshotResult; // FIX
 }
 
@@ -1957,6 +1960,40 @@ async function processTask(task) {
       }
       return;
     }
+    logger.stageEnd('validate-identifiers', { validTaskId, validMonitorId, outcome: 'ok' });
+
+    logger.stageStart('load-monitor', { monitorId: monitor_id });
+    const monitor = await withPg((pg) => loadMonitor(pg, monitor_id));
+    if (!monitor) {
+      logger.stageEnd('load-monitor', { outcome: 'not-found' });
+      finalStatus = 'blad';
+      finalError = 'MONITOR_NOT_FOUND';
+      logger.error('load-monitor', 'Monitor not found', {});
+      logger.stageStart('pg:finish-task', { status: 'blad' });
+      try {
+        await finishTask(taskId, {
+          status: 'blad',
+          blad_opis: 'MONITOR_NOT_FOUND',
+          tresc_hash: null,
+          snapshot_mongo_id: null,
+        });
+        logger.stageEnd('pg:finish-task', { status: 'blad' });
+      } catch (finishErr) {
+        logger.stageEnd('pg:finish-task', {
+          status: 'blad',
+          error: finishErr?.message || String(finishErr),
+        });
+        logger.error('pg:finish-task', 'Failed to update task status', {
+          message: finishErr?.message || String(finishErr),
+        });
+      }
+      return;
+    }
+    logger.stageEnd('load-monitor', {
+      outcome: 'found',
+      tryb_skanu: monitor.tryb_skanu,
+      url: monitor.url,
+    });
 
     logger.stageStart('pg:finish-task', { status: 'ok' });
     try {
@@ -2016,6 +2053,45 @@ async function processTask(task) {
       snapshotId: finalSnapshotId,
       hash: finalHash,
       error: finalError,
+    });
+
+    let domainPermit = null; // ADD
+    let domainReleaseInfo = { blocked: false, error: false }; // ADD
+    try { // ADD
+      domainPermit = await acquireDomainSlot(url, { logger, monitorId: monitor_id }); // ADD
+    } catch (acqErr) { // ADD
+      finalStatus = 'blad'; // ADD
+      finalError = acqErr?.code || acqErr?.message || String(acqErr); // ADD
+      logger.error('throttle', 'Domain throttle prevented scan', { // ADD
+        message: finalError, // ADD
+        waitMs: acqErr?.waitMs, // ADD
+      }); // ADD
+      console.error(`SCAN ABORT monitor=${monitor_id} reason=${finalError}`); // LOG
+      if (acqErr?.code === 'DOMAIN_BLOCKED') { // ADD
+        monitorsRequiringIntervention.add(monitor_id); // ADD
+        await markMonitorRequiresIntervention(monitor_id, { reason: finalError, snapshotId: null, logger }); // ADD
+      } // ADD
+      try { // ADD
+        await finishTask(taskId, { // ADD
+          status: 'blad', // ADD
+          blad_opis: finalError.slice(0, 500), // ADD
+          tresc_hash: null, // ADD
+          snapshot_mongo_id: null, // ADD
+        }); // ADD
+      } catch (finishErr) { // ADD
+        logger.error('pg:finish-task', 'Failed to update task status after throttle block', { message: finishErr?.message || String(finishErr) }); // ADD
+      } // ADD
+      return; // ADD
+    } // ADD
+
+    logger.stageStart('scan', { url, tryb });
+    const scanResult = await scanUrl({ url, tryb, selector, browserOptions, staticOptions, logger, monitorId: monitor_id }); // FIX
+    logger.stageEnd('scan', {
+      mode: scanResult.mode,
+      http_status: scanResult.http_status,
+      blocked: scanResult.blocked,
+      hash: scanResult.hash,
+      finalUrl: scanResult.final_url,
     });
     domainReleaseInfo = { blocked: !!scanResult.blocked, error: false }; // ADD
 
