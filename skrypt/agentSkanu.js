@@ -15,7 +15,7 @@
  *   node agentSkanu.js --monitor-id <UUID> --once   # pojedynczy scan konkretnego monitora (pomija planowanie)
  *   node agentSkanu.js --reset        # TRUNCATE zadania_skanu + drop snapshotów w Mongo
  */
-require('dns').setDefaultResultOrder('ipv4first');
+
 require('dns').setDefaultResultOrder('ipv4first');
 require('dotenv').config({ path: require('path').resolve(__dirname, '.env') });
 
@@ -50,8 +50,16 @@ const DEFAULT_WAIT_FOR_SELECTOR_TIMEOUT = Number(process.env.DEFAULT_WAIT_FOR_SE
 const DEFAULT_SCROLL_DELAY_MS = Number(process.env.DEFAULT_SCROLL_DELAY_MS || 250);
 const BOT_BYPASS_WAIT_RANGE_MS = [400, 900];
 
+<<<<<<< HEAD
 const TRACKER_PARAMS = new Set(['fbclid', 'gclid', 'yclid', 'mc_cid', 'mc_eid', 'igshid']); // ADD
 const TRACKER_PREFIXES = ['utm_', 'pk_', 'ga_']; // ADD
+=======
+const TRACKER_PARAMS = new Set([
+  'fbclid','gclid','yclid','mc_cid','mc_eid','igshid',
+  'sid','reco_id','emission_id','device_ratio','utm_campaign','utm_source','utm_medium'
+]);
+const TRACKER_PREFIXES = ['utm_','pk_','ga_','spm_','yclid_'];
+>>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
 
 const DESKTOP_PROFILES = [
   {
@@ -101,10 +109,23 @@ const COOKIE_CONSENT_KEYWORDS = [
   'consent',
 ];
 
+<<<<<<< HEAD
 const ERROR_CONFIRM_KEYWORDS = ['confirm', 'potwierdź', 'potwierdzam', 'continue']; // ADD
 
 const DOMAIN_MIN_DELAY_MS = 60_000; // ADD
 const DOMAIN_MAX_DELAY_MS = 180_000; // ADD
+=======
+const ERROR_CONFIRM_KEYWORDS = [
+  'potwierdź', 'potwierdz', 'potwierdzam',
+  'confirm', 'i confirm', 'continue', 'kontynuuj',
+  'jestem człowiekiem', 'jestem czlowiekiem', 'i am human'
+];
+
+
+
+const DOMAIN_MIN_DELAY_MS = 180_000;     // 3 min
+const DOMAIN_MAX_DELAY_MS = 420_000;     // 7 min
+>>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
 const DOMAIN_BACKOFF_MAX_MS = 30 * 60_000; // ADD
 const DOMAIN_BLOCK_PAUSE_MS = 4 * 60 * 60_000; // ADD
 
@@ -1106,6 +1127,7 @@ async function handleCookieConsent(page, logger) {
   }
 }
 
+<<<<<<< HEAD
 async function handleErrorScreenConfirmation(page, logger) { // ADD
   logger?.stageStart('browser:error-screen', {}); // ADD
   try { // ADD
@@ -1156,6 +1178,116 @@ async function handleErrorScreenConfirmation(page, logger) { // ADD
     logger?.stageEnd('browser:error-screen', { triggered: true, clicked: false, error: err?.message || String(err) }); // ADD
   } // ADD
 } // ADD
+=======
+async function handleErrorScreenConfirmation(page, logger) {
+  logger?.stageStart('browser:error-screen', {});
+  const norm = (s) => (s || '').toString().trim().toLowerCase();
+
+  // klikamy w ramce używając samego DOM (żadnego $x na Frame)
+  async function tryClickInFrame(frame, words) {
+    try {
+      const result = await frame.evaluate((words2) => {
+        const norm = (s) => (s || '').toString().trim().toLowerCase();
+        const visible = (el) => {
+          try {
+            const r = el.getBoundingClientRect();
+            const cs = window.getComputedStyle(el);
+            return !!r && r.width > 0 && r.height > 0 &&
+              cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0';
+          } catch (_) { return false; }
+        };
+        const matches = (el) => {
+          const txt = norm(el.innerText || el.textContent || el.value || '');
+          if (!txt) return false;
+          return words2.some((w) => txt.includes(norm(w)));
+        };
+
+        // typowe klikane elementy
+        const SEL = [
+          'button',
+          'a',
+          'div[role="button"]',
+          'span[role="button"]',
+          'input[type="submit"]',
+          'input[type="button"]'
+        ].join(',');
+
+        // 1) przegląd wszystkich kandydatów
+        const nodes = Array.from(document.querySelectorAll(SEL));
+        for (const el of nodes) {
+          if (!visible(el)) continue;
+          if (!matches(el)) continue;
+          el.scrollIntoView({ block: 'center', inline: 'center' });
+          if (typeof el.click === 'function') el.click();
+          return { clicked: true, label: (el.innerText || el.value || '').trim() };
+        }
+
+        // 2) heurystyka Allegro — przycisk "CONFIRM"
+        const hard = Array.from(document.querySelectorAll('button, a')).find((el) => {
+          const t = norm(el.innerText || el.textContent || '');
+          return visible(el) && (t === 'confirm' || t.includes('confirm'));
+        });
+        if (hard) {
+          hard.scrollIntoView({ block: 'center', inline: 'center' });
+          if (typeof hard.click === 'function') hard.click();
+          return { clicked: true, label: (hard.innerText || '').trim() };
+        }
+
+        return { clicked: false };
+      }, words);
+
+      return result || { clicked: false };
+    } catch {
+      return { clicked: false };
+    }
+  }
+
+  try {
+    // czy w ogóle jesteśmy na ekranie ochronnym?
+    const bodyText = norm(await page.evaluate(() => document.body?.innerText || ''));
+    const path = norm(await page.evaluate(() => location.pathname || ''));
+    const probable =
+      bodyText.includes('potwierdź, że jesteś człowiekiem') ||
+      bodyText.includes('confirm you are human') ||
+      bodyText.includes('unusual activity') ||
+      path.includes('error') || path.includes('bledy');
+
+    const words = ERROR_CONFIRM_KEYWORDS.slice();
+
+    // 1) spróbuj w głównej ramce
+    let result = await tryClickInFrame(page.mainFrame(), words);
+
+    // 2) i we wszystkich iframach
+    if (!result.clicked) {
+      for (const fr of page.frames()) {
+        if (fr === page.mainFrame()) continue;
+        const r = await tryClickInFrame(fr, words);
+        if (r.clicked) { result = r; break; }
+      }
+    }
+
+    if (result.clicked) {
+      logger?.info('browser:error-screen', 'Confirmation clicked', { label: result.label });
+      // czekamy na przeładowanie lub „zejście” overlaya
+      try {
+        await Promise.race([
+          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 8000 }),
+          page.waitForResponse((resp) => {
+            try { return resp.status() < 400; } catch { return false; }
+          }, { timeout: 8000 })
+        ]);
+      } catch (_) {}
+      await sleep(800);
+      logger?.stageEnd('browser:error-screen', { triggered: true, clicked: true, label: result.label });
+    } else {
+      logger?.stageEnd('browser:error-screen', { triggered: probable, clicked: false });
+    }
+  } catch (err) {
+    logger?.stageEnd('browser:error-screen', { triggered: true, clicked: false, error: err?.message || String(err) });
+  }
+}
+
+>>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
 
 async function collectBrowserSnapshot(page, {
   url,
@@ -1739,6 +1871,7 @@ async function processTask(task) {
   const { id: taskId, monitor_id } = task;
   const logger = createRunLogger({ taskId, monitorId: monitor_id });
   const taskStartedAt = Date.now();
+<<<<<<< HEAD
   let finalStatus = 'unknown';
   let finalHash = null;
   let finalSnapshotId = null;
@@ -1747,6 +1880,21 @@ async function processTask(task) {
   logger.headerStart({ taskId, monitorId: monitor_id });
 
   try {
+=======
+
+  let finalStatus = 'unknown';
+  let finalHash = null;
+  let finalSnapshotId = null;
+  let finalError = null;
+
+  let domainPermit = null;                 // <— trzymamy uchwyt do throttlingu domeny
+  let domainReleaseInfo = { blocked: false, error: false };
+
+  logger.headerStart({ taskId, monitorId: monitor_id });
+
+  try {
+    // --- Walidacja identyfikatorów
+>>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
     logger.stageStart('validate-identifiers', { taskId, monitorId: monitor_id });
     const validTaskId = isUuid(taskId);
     const validMonitorId = isUuid(monitor_id);
@@ -1755,6 +1903,7 @@ async function processTask(task) {
       finalStatus = 'blad';
       finalError = 'INVALID_UUID';
       logger.error('validate-identifiers', 'Invalid UUID detected', { validTaskId, validMonitorId });
+<<<<<<< HEAD
       logger.stageStart('pg:finish-task', { status: 'blad' });
       try {
         await finishTask(taskId, {
@@ -1773,10 +1922,22 @@ async function processTask(task) {
           message: finishErr?.message || String(finishErr),
         });
       }
+=======
+      await finishTask(taskId, {
+        status: 'blad',
+        blad_opis: 'INVALID_UUID',
+        tresc_hash: null,
+        snapshot_mongo_id: null,
+      }).catch((e) => logger.error('pg:finish-task', 'Failed to update task status', { message: e?.message || String(e) }));
+>>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
       return;
     }
     logger.stageEnd('validate-identifiers', { validTaskId, validMonitorId, outcome: 'ok' });
 
+<<<<<<< HEAD
+=======
+    // --- Pobranie monitora
+>>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
     logger.stageStart('load-monitor', { monitorId: monitor_id });
     const monitor = await withPg((pg) => loadMonitor(pg, monitor_id));
     if (!monitor) {
@@ -1784,6 +1945,7 @@ async function processTask(task) {
       finalStatus = 'blad';
       finalError = 'MONITOR_NOT_FOUND';
       logger.error('load-monitor', 'Monitor not found', {});
+<<<<<<< HEAD
       logger.stageStart('pg:finish-task', { status: 'blad' });
       try {
         await finishTask(taskId, {
@@ -1802,6 +1964,14 @@ async function processTask(task) {
           message: finishErr?.message || String(finishErr),
         });
       }
+=======
+      await finishTask(taskId, {
+        status: 'blad',
+        blad_opis: 'MONITOR_NOT_FOUND',
+        tresc_hash: null,
+        snapshot_mongo_id: null,
+      }).catch((e) => logger.error('pg:finish-task', 'Failed to update task status', { message: e?.message || String(e) }));
+>>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
       return;
     }
     logger.stageEnd('load-monitor', {
@@ -1810,6 +1980,10 @@ async function processTask(task) {
       url: monitor.url,
     });
 
+<<<<<<< HEAD
+=======
+    // --- Parsowanie zachowania (selector + opcje)
+>>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
     logger.stageStart('parse-behavior', { hasSelector: !!monitor.css_selector });
     const { selector, staticOptions, browserOptions } = parseMonitorBehavior(monitor.css_selector || null);
     logger.stageEnd('parse-behavior', {
@@ -1819,22 +1993,81 @@ async function processTask(task) {
     });
 
     const tryb = (monitor.tryb_skanu || 'static').toLowerCase() === 'browser' ? 'browser' : 'static';
+<<<<<<< HEAD
     const url = normalizeUrl(monitor.url); // FIX
     console.log(`SCAN START monitor=${monitor_id} url=${url}`); // LOG
+=======
+    const url = normalizeUrl(monitor.url);
+    console.log(`SCAN START monitor=${monitor_id} url=${url}`);
+>>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
     logger.info('determine-mode', 'Resolved scan mode', {
       tryb,
       url,
       selectorPreview: selector ? selector.slice(0, 120) : null,
     });
+<<<<<<< HEAD
     domainReleaseInfo = { blocked: !!result.blocked, error: false }; // ADD
 
     logger.stageStart('mongo:save-snapshot', { mode: result.mode });
     let snapshotId;
+=======
+
+    // --- Throttling na poziomie domeny (przed właściwym skanem)
+    try {
+      domainPermit = await acquireDomainSlot(url, { logger, monitorId: monitor_id });
+    } catch (acqErr) {
+      finalStatus = 'blad';
+      finalError = acqErr?.code || acqErr?.message || String(acqErr);
+      logger.error('throttle', 'Domain throttle prevented scan', {
+        message: finalError,
+        waitMs: acqErr?.waitMs,
+      });
+      console.error(`SCAN ABORT monitor=${monitor_id} reason=${finalError}`);
+      if (acqErr?.code === 'DOMAIN_BLOCKED') {
+        monitorsRequiringIntervention.add(monitor_id);
+        await markMonitorRequiresIntervention(monitor_id, { reason: finalError, snapshotId: null, logger });
+      }
+      await finishTask(taskId, {
+        status: 'blad',
+        blad_opis: (finalError || '').slice(0, 500),
+        tresc_hash: null,
+        snapshot_mongo_id: null,
+      }).catch((e) => logger.error('pg:finish-task', 'Failed to update task status after throttle block', { message: e?.message || String(e) }));
+      return;
+    }
+
+    // --- Właściwy skan
+    logger.stageStart('scan', { url, tryb });
+    const scanResult = await scanUrl({
+      url,
+      tryb,
+      selector,
+      browserOptions,
+      staticOptions,
+      logger,
+      monitorId: monitor_id,
+    });
+    logger.stageEnd('scan', {
+      mode: scanResult.mode,
+      http_status: scanResult.http_status,
+      blocked: scanResult.blocked,
+      hash: scanResult.hash,
+      finalUrl: scanResult.final_url,
+    });
+
+    // info dla throttlingu
+    domainReleaseInfo = { blocked: !!scanResult.blocked, error: false };
+
+    // --- Zapis snapshotu do Mongo (PO skanie, TYLKO raz)
+    logger.stageStart('mongo:save-snapshot', { mode: scanResult.mode });
+    let snapshotId = null;
+>>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
     try {
       snapshotId = await saveSnapshotToMongo({
         monitor_id,
         url,
         ts: new Date(),
+<<<<<<< HEAD
         mode: result.mode,
         final_url: result.final_url,
         html: result.html,
@@ -1843,6 +2076,49 @@ async function processTask(task) {
         blocked: !!result.blocked,
         block_reason: result.block_reason || null,
         screenshot_b64: result.screenshot_b64 || null,
+=======
+        mode: scanResult.mode,
+        final_url: scanResult.final_url,
+        html: scanResult.html,
+        meta: scanResult.meta,
+        hash: scanResult.hash,
+        blocked: !!scanResult.blocked,
+        block_reason: scanResult.block_reason || null,
+        screenshot_b64: scanResult.screenshot_b64 || null,
+      });
+      console.log(`MONGO snapshot=${snapshotId} monitor=${monitor_id} blocked=${!!scanResult.blocked}`);
+      logger.stageEnd('mongo:save-snapshot', {
+        snapshotId,
+        htmlLength: scanResult.html ? scanResult.html.length : 0,
+      });
+    } catch (err) {
+      logger.stageEnd('mongo:save-snapshot', {
+        snapshotId: null,
+        error: err?.message || String(err),
+      });
+      throw err;
+    }
+
+    finalSnapshotId = snapshotId;
+    finalHash = scanResult.hash;
+
+    // --- Obsługa blokady BOT / finish status
+    if (scanResult.blocked) {
+      finalStatus = 'blad';
+      finalError = scanResult.block_reason || 'BOT_PROTECTION';
+      logger.warn('scan', 'Result blocked by bot protection', {
+        reason: finalError,
+        status: scanResult.http_status,
+      });
+
+      await markMonitorRequiresIntervention(monitor_id, { reason: finalError, snapshotId, logger });
+
+      await finishTask(taskId, {
+        status: 'blad',
+        blad_opis: finalError,
+        tresc_hash: null,
+        snapshot_mongo_id: snapshotId,
+>>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
       });
       console.log(`MONGO snapshot=${snapshotId} monitor=${monitor_id} blocked=${!!result.blocked}`); // LOG
       logger.stageEnd('mongo:save-snapshot', {
@@ -1993,6 +2269,7 @@ async function processTask(task) {
       return;
     }
 
+<<<<<<< HEAD
     logger.stageStart('pg:finish-task', { status: 'ok' });
     try {
       await finishTask(taskId, {
@@ -2012,25 +2289,46 @@ async function processTask(task) {
       });
       throw finishErr;
     }
+=======
+    // --- Sukces
+    logger.stageStart('pg:finish-task', { status: 'ok' });
+    await finishTask(taskId, {
+      status: 'ok',
+      blad_opis: null,
+      tresc_hash: scanResult.hash,
+      snapshot_mongo_id: snapshotId,
+    });
+    logger.stageEnd('pg:finish-task', { status: 'ok' });
+>>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
     finalStatus = 'ok';
   } catch (e) {
     finalStatus = 'blad';
     finalError = e?.message || String(e);
+<<<<<<< HEAD
     logger.error('run', 'Unhandled error during task', {
       message: finalError,
       stack: e?.stack,
     });
     domainReleaseInfo.error = true; // ADD
+=======
+    logger.error('run', 'Unhandled error during task', { message: finalError, stack: e?.stack });
+    domainReleaseInfo.error = true;
+>>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
     try {
       logger.stageStart('pg:finish-task', { status: 'blad' });
       await finishTask(taskId, {
         status: 'blad',
+<<<<<<< HEAD
         blad_opis: finalError.slice(0, 500),
+=======
+        blad_opis: (finalError || '').slice(0, 500),
+>>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
         tresc_hash: null,
         snapshot_mongo_id: null,
       });
       logger.stageEnd('pg:finish-task', { status: 'blad' });
     } catch (finishErr) {
+<<<<<<< HEAD
       logger.stageEnd('pg:finish-task', {
         status: 'blad',
         error: finishErr?.message || String(finishErr),
@@ -2048,6 +2346,21 @@ async function processTask(task) {
     logger.headerEnd({ // FIX
       status: finalStatus,
       durationMs: duration, // FIX
+=======
+      logger.stageEnd('pg:finish-task', { status: 'blad', error: finishErr?.message || String(finishErr) });
+      logger.error('pg:finish-task', 'Failed to update task status', { message: finishErr?.message || String(finishErr) });
+    }
+  } finally {
+    // zawsze zwalniamy slot domeny
+    try {
+      if (domainPermit?.release) domainPermit.release(domainReleaseInfo);
+    } catch (_) {}
+    const duration = Date.now() - taskStartedAt;
+    console.log(`SCAN END monitor=${monitor_id} status=${finalStatus} durationMs=${duration} error=${finalError || 'none'}`);
+    logger.headerEnd({
+      status: finalStatus,
+      durationMs: duration,
+>>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
       snapshotId: finalSnapshotId,
       hash: finalHash,
       error: finalError,
@@ -2056,6 +2369,53 @@ async function processTask(task) {
 }
 
 
+
+<<<<<<< HEAD
+async function runExecutionCycle(monitorId) { // FIX
+  if (!isUuid(monitorId)) { // FIX
+    throw new Error('INVALID_MONITOR_ID'); // FIX
+  } // FIX
+  if (monitorsRequiringIntervention.has(monitorId)) { // ADD
+    console.log(`[intervention] monitor=${monitorId} paused`); // LOG
+    return; // ADD
+  } // ADD
+  try { // FIX
+    const planned = await scheduleMonitorDue(monitorId); // FIX
+    if (planned) { // FIX
+      console.log(`PLAN scheduled=${planned} monitor=${monitorId}`); // LOG
+    } // FIX
+  } catch (e) { // FIX
+    console.error(`[PLAN] error=${e?.message || e}`); // LOG
+  } // FIX
+
+  let tasks = []; // FIX
+  try { // FIX
+    tasks = await claimMonitorBatch(monitorId, MAX_CONCURRENCY); // FIX
+  } catch (e) { // FIX
+    console.error(`[PLAN] claim-error=${e?.message || e}`); // LOG
+  } // FIX
+
+  const uniqueByUrl = new Map(); // FIX
+  const duplicates = []; // FIX
+  for (const task of tasks) { // FIX
+    const normalizedTaskUrl = task?.url ? normalizeUrl(task.url) : null; // ADD
+    if (!normalizedTaskUrl) { // ADD
+      uniqueByUrl.set(`${task.id}`, task); // FIX
+      continue; // FIX
+    } // FIX
+    if (uniqueByUrl.has(normalizedTaskUrl)) { // FIX
+      duplicates.push(task); // FIX
+    } else { // FIX
+      uniqueByUrl.set(normalizedTaskUrl, { ...task, url: normalizedTaskUrl }); // FIX
+    } // FIX
+  } // FIX
+  const uniqueTasks = Array.from(uniqueByUrl.values()); // FIX
+  console.log(`PLAN monitor=${monitorId} fetched=${tasks.length} unique=${uniqueTasks.length}`); // LOG
+  for (const dup of duplicates) { // FIX
+    finishTask(dup.id, { status: 'blad', blad_opis: 'DUPLICATE_URL', tresc_hash: null, snapshot_mongo_id: null }).catch(() => {}); // FIX
+  } // FIX
+
+=======
 
 async function runExecutionCycle(monitorId) { // FIX
   if (!isUuid(monitorId)) { // FIX
@@ -2101,6 +2461,7 @@ async function runExecutionCycle(monitorId) { // FIX
     finishTask(dup.id, { status: 'blad', blad_opis: 'DUPLICATE_URL', tresc_hash: null, snapshot_mongo_id: null }).catch(() => {}); // FIX
   } // FIX
 
+>>>>>>> 58b53ce (Dziala OLX/Vinted/Amazon)
   for (const t of uniqueTasks) { // FIX
     queue.add(() => processTask(t)).catch((e) => // FIX
       console.error('[task] błąd krytyczny:', e) // FIX
