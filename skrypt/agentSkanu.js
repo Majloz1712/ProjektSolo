@@ -54,8 +54,6 @@ const BOT_BYPASS_WAIT_RANGE_MS = [400, 900];
 
 const TRACKER_PARAMS = new Set(['fbclid', 'gclid', 'yclid', 'mc_cid', 'mc_eid', 'igshid', 'sid', 'reco_id', 'utm_source', 'utm_medium', 'utm_campaign']); // FIX
 const TRACKER_PREFIXES = ['utm_', 'pk_', 'ga_']; // ADD
-const TRACKER_PARAMS = new Set(['fbclid', 'gclid', 'yclid', 'mc_cid', 'mc_eid', 'igshid']); // ADD
-const TRACKER_PREFIXES = ['utm_', 'pk_', 'ga_']; // ADD
 
 const DESKTOP_PROFILES = [
   {
@@ -109,7 +107,6 @@ const ERROR_CONFIRM_KEYWORDS = ['confirm', 'potwierdź', 'potwierdzam', 'continu
 
 const DOMAIN_MIN_DELAY_MS = 60_000; // ADD
 const DOMAIN_MAX_DELAY_MS = 180_000; // ADD
-
 const DOMAIN_BACKOFF_MAX_MS = 30 * 60_000; // ADD
 const DOMAIN_BLOCK_PAUSE_MS = 4 * 60 * 60_000; // ADD
 
@@ -408,6 +405,7 @@ async function acquireDomainSlot(url, { logger, monitorId } = {}) { // ADD
 
   domainState.lock = ticket.then(() => new Promise((resolve) => { releaseResolve = resolve; })); // ADD
   await ticket; // ADD
+  logger?.info('throttle', 'Domain slot acquired', { domain: host, monitorId }); // ADD
 
   let released = false; // ADD
   return { // ADD
@@ -429,6 +427,12 @@ async function acquireDomainSlot(url, { logger, monitorId } = {}) { // ADD
         domainState.backoffMs = DOMAIN_MIN_DELAY_MS; // ADD
         domainState.nextAllowedAt = finishNow + randomInt(DOMAIN_MIN_DELAY_MS, DOMAIN_MAX_DELAY_MS); // ADD
       } // ADD
+      logger?.info('throttle', 'Domain slot released', { // ADD
+        domain: host, // ADD
+        blocked, // ADD
+        error, // ADD
+        nextAllowedAt: domainState.nextAllowedAt, // ADD
+      }); // ADD
       releaseResolve?.(); // ADD
     }, // ADD
   }; // ADD
@@ -1413,108 +1417,6 @@ async function fetchBrowser(url, { selector, browserOptions = {}, logger, monito
     } catch (err) {
       logger?.stageEnd('browser:acquire-page', {
         acquired: false,
-async function handleErrorScreenConfirmation(page, logger) { // ADD
-  logger?.stageStart('browser:error-screen', {}); // ADD
-  try { // ADD
-    const screenResult = await page.evaluate((keywords) => { // ADD
-      const bodyText = (document.body?.innerText || '').toLowerCase(); // ADD
-      const urlPath = (location.pathname || '').toLowerCase(); // ADD
-      const shouldCheck = bodyText.includes('potwierdź, że jesteś człowiekiem') // ADD
-        || bodyText.includes('confirm you are human') // ADD
-        || urlPath.includes('bledy') // ADD
-        || urlPath.includes('error'); // ADD
-      if (!shouldCheck) { // ADD
-        return { triggered: false }; // ADD
-      } // ADD
-      const candidates = Array.from(document.querySelectorAll('button, a, div[role="button"], span[role="button"], input[type="submit"]')); // ADD
-      for (const el of candidates) { // ADD
-        const buttonLabel = (el.innerText || el.textContent || el.value || '').trim(); // ADD
-        if (!buttonLabel) continue; // ADD
-        const lowerLabel = buttonLabel.toLowerCase(); // ADD
-        if (keywords.some((keyword) => lowerLabel.includes(keyword))) { // ADD
-          const buttonRect = el.getBoundingClientRect(); // ADD
-          const buttonStyle = window.getComputedStyle(el); // ADD
-          const isHidden = !buttonRect || buttonRect.width === 0 || buttonRect.height === 0 // ADD
-            || buttonStyle.visibility === 'hidden' // ADD
-            || buttonStyle.display === 'none' // ADD
-            || buttonStyle.opacity === '0'; // ADD
-          if (isHidden) continue; // ADD
-          if (typeof el.click === 'function') { // ADD
-            el.click(); // ADD
-            return { triggered: true, clicked: true, label: buttonLabel }; // ADD
-          } // ADD
-        } // ADD
-      } // ADD
-      return { triggered: true, clicked: false }; // ADD
-    }, ERROR_CONFIRM_KEYWORDS); // ADD
-
-    if (!screenResult.triggered) { // ADD
-      logger?.stageEnd('browser:error-screen', { triggered: false }); // ADD
-      return; // ADD
-    } // ADD
-    if (screenResult.clicked) { // ADD
-      logger?.info('browser:error-screen', 'Error screen confirmation clicked', { label: screenResult.label }); // ADD
-      await sleep(2_000); // ADD
-      logger?.stageEnd('browser:error-screen', { triggered: true, clicked: true, label: screenResult.label }); // ADD
-    } else { // ADD
-      logger?.stageEnd('browser:error-screen', { triggered: true, clicked: false }); // ADD
-    } // ADD
-  } catch (err) { // ADD
-    logger?.stageEnd('browser:error-screen', { triggered: true, clicked: false, error: err?.message || String(err) }); // ADD
-  } // ADD
-} // ADD
-
-async function collectBrowserSnapshot(page, {
-  url,
-  gotoOptions,
-  selector,
-  waitAfterMs,
-  browserOptions,
-  includeScreenshot = true,
-},
-logger) {
-  const snapshotOpts = browserOptions || {};
-  let navStatus = null;
-  const onResponse = (resp) => {
-    try {
-      if (resp.request().resourceType() === 'document' && navStatus === null) {
-        navStatus = resp.status();
-      }
-    } catch (_) {}
-  };
-  page.on('response', onResponse);
-  try {
-    logger?.stageStart('browser:navigate', {
-      url,
-      waitUntil: gotoOptions.waitUntil,
-      timeout: gotoOptions.timeout,
-    });
-    try {
-      await page.goto(url, gotoOptions);
-      logger?.stageEnd('browser:navigate', { status: navStatus });
-    } catch (err) {
-      logger?.stageEnd('browser:navigate', {
-        status: navStatus,
-        error: err?.message || String(err),
-      });
-      throw err;
-    }
-
-    await handleCookieConsent(page, logger); // FIX
-    await handleErrorScreenConfirmation(page, logger); // ADD
-
-    logger?.stageStart('browser:wait-readiness', {
-      waitAfterMs,
-      waitUntil: gotoOptions.waitUntil,
-    });
-    try {
-      await waitForPageReadiness(page, {
-        ...snapshotOpts,
-        waitAfterMs,
-      });
-      logger?.stageEnd('browser:wait-readiness', {});
-    } catch (err) {
-      logger?.stageEnd('browser:wait-readiness', {
         error: err?.message || String(err),
       });
       throw err;
@@ -1870,7 +1772,6 @@ async function processTask(task) {
   logger.headerStart({ taskId, monitorId: monitor_id });
 
   try {
-
     logger.stageStart('validate-identifiers', { taskId, monitorId: monitor_id });
     const validTaskId = isUuid(taskId);
     const validMonitorId = isUuid(monitor_id);
@@ -1945,127 +1846,12 @@ async function processTask(task) {
     const tryb = (monitor.tryb_skanu || 'static').toLowerCase() === 'browser' ? 'browser' : 'static';
     const url = normalizeUrl(monitor.url); // FIX
     console.log(`SCAN START monitor=${monitor_id} url=${url}`); // LOG
-    const url = normalizeUrl(monitor.url); // FIX
-    console.log(`SCAN START monitor=${monitor_id} url=${url}`); // LOG
     logger.info('determine-mode', 'Resolved scan mode', {
       tryb,
       url,
       selectorPreview: selector ? selector.slice(0, 120) : null,
     });
-    domainReleaseInfo = { blocked: !!result.blocked, error: false }; // ADD
-
-    let domainPermit = null; // ADD
-    let domainReleaseInfo = { blocked: false, error: false }; // ADD
-    try { // ADD
-      domainPermit = await acquireDomainSlot(url, { logger, monitorId: monitor_id }); // ADD
-    } catch (acqErr) { // ADD
-      finalStatus = 'blad'; // ADD
-      finalError = acqErr?.code || acqErr?.message || String(acqErr); // ADD
-      logger.error('throttle', 'Domain throttle prevented scan', { // ADD
-        message: finalError, // ADD
-        waitMs: acqErr?.waitMs, // ADD
-      }); // ADD
-      console.error(`SCAN ABORT monitor=${monitor_id} reason=${finalError}`); // LOG
-      if (acqErr?.code === 'DOMAIN_BLOCKED') { // ADD
-        monitorsRequiringIntervention.add(monitor_id); // ADD
-        await markMonitorRequiresIntervention(monitor_id, { reason: finalError, snapshotId: null, logger }); // ADD
-      } // ADD
-      try { // ADD
-        await finishTask(taskId, { // ADD
-          status: 'blad', // ADD
-          blad_opis: finalError.slice(0, 500), // ADD
-          tresc_hash: null, // ADD
-          snapshot_mongo_id: null, // ADD
-        }); // ADD
-      } catch (finishErr) { // ADD
-        logger.error('pg:finish-task', 'Failed to update task status after throttle block', { message: finishErr?.message || String(finishErr) }); // ADD
-      } // ADD
-      return; // ADD
-    } // ADD
-
-    logger.stageStart('scan', { url, tryb });
-    const scanResult = await scanUrl({ url, tryb, selector, browserOptions, staticOptions, logger, monitorId: monitor_id }); // FIX
-    logger.stageEnd('scan', {
-      mode: scanResult.mode,
-      http_status: scanResult.http_status,
-      blocked: scanResult.blocked,
-      hash: scanResult.hash,
-      finalUrl: scanResult.final_url,
-    });
     domainReleaseInfo = { blocked: !!scanResult.blocked, error: false }; // ADD
-
-    logger.stageStart('mongo:save-snapshot', { mode: scanResult.mode });
-    let snapshotId;
-    try {
-      snapshotId = await saveSnapshotToMongo({
-        monitor_id,
-        url,
-        ts: new Date(),
-        mode: result.mode,
-        final_url: result.final_url,
-        html: result.html,
-        meta: result.meta,
-        hash: result.hash,
-        blocked: !!result.blocked,
-        block_reason: result.block_reason || null,
-        screenshot_b64: result.screenshot_b64 || null,
-        mode: scanResult.mode,
-        final_url: scanResult.final_url,
-        html: scanResult.html,
-        meta: scanResult.meta,
-        hash: scanResult.hash,
-        blocked: !!scanResult.blocked,
-        block_reason: scanResult.block_reason || null,
-        screenshot_b64: scanResult.screenshot_b64 || null,
-      });
-      });
-      console.log(`MONGO snapshot=${snapshotId} monitor=${monitor_id} blocked=${!!result.blocked}`); // LOG
-      logger.stageEnd('mongo:save-snapshot', {
-        snapshotId,
-        htmlLength: result.html ? result.html.length : 0,
-      });
-    } catch (err) {
-      logger.stageEnd('mongo:save-snapshot', {
-        snapshotId: null,
-        error: err?.message || String(err),
-      });
-      throw err;
-    }
-
-    finalSnapshotId = snapshotId;
-    finalHash = result.hash;
-
-    logger.stageStart('mongo:save-snapshot', { mode: result.mode });
-    let snapshotId;
-    try {
-      snapshotId = await saveSnapshotToMongo({
-        monitor_id,
-        url,
-        ts: new Date(),
-        mode: result.mode,
-        final_url: result.final_url,
-        html: result.html,
-        meta: result.meta,
-        hash: result.hash,
-        blocked: !!result.blocked,
-        block_reason: result.block_reason || null,
-        screenshot_b64: result.screenshot_b64 || null,
-      });
-      console.log(`MONGO snapshot=${snapshotId} monitor=${monitor_id} blocked=${!!result.blocked}`); // LOG
-      logger.stageEnd('mongo:save-snapshot', {
-        snapshotId,
-        htmlLength: result.html ? result.html.length : 0,
-      });
-    } catch (err) {
-      logger.stageEnd('mongo:save-snapshot', {
-        snapshotId: null,
-        error: err?.message || String(err),
-      });
-      throw err;
-    }
-
-    finalSnapshotId = snapshotId;
-    finalHash = result.hash;
 
     let domainPermit = null; // ADD
     let domainReleaseInfo = { blocked: false, error: false }; // ADD
@@ -2201,7 +1987,6 @@ async function processTask(task) {
       await finishTask(taskId, {
         status: 'blad',
         blad_opis: finalError.slice(0, 500),
-        blad_opis: finalError.slice(0, 500),
         tresc_hash: null,
         snapshot_mongo_id: null,
       });
@@ -2228,10 +2013,39 @@ async function processTask(task) {
       hash: finalHash,
       error: finalError,
     });
-  }
-}
+    domainReleaseInfo = { blocked: !!scanResult.blocked, error: false }; // ADD
 
+    logger.stageStart('mongo:save-snapshot', { mode: scanResult.mode });
+    let snapshotId;
+    try {
+      snapshotId = await saveSnapshotToMongo({
+        monitor_id,
+        url,
+        ts: new Date(),
+        mode: scanResult.mode,
+        final_url: scanResult.final_url,
+        html: scanResult.html,
+        meta: scanResult.meta,
+        hash: scanResult.hash,
+        blocked: !!scanResult.blocked,
+        block_reason: scanResult.block_reason || null,
+        screenshot_b64: scanResult.screenshot_b64 || null,
+      });
+      console.log(`MONGO snapshot=${snapshotId} monitor=${monitor_id} blocked=${!!scanResult.blocked}`); // LOG
+      logger.stageEnd('mongo:save-snapshot', {
+        snapshotId,
+        htmlLength: scanResult.html ? scanResult.html.length : 0,
+      });
+    } catch (err) {
+      logger.stageEnd('mongo:save-snapshot', {
+        snapshotId: null,
+        error: err?.message || String(err),
+      });
+      throw err;
+    }
 
+    finalSnapshotId = snapshotId;
+    finalHash = scanResult.hash;
 
 async function runExecutionCycle(monitorId) { // FIX
   if (!isUuid(monitorId)) { // FIX
