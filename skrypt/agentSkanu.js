@@ -2054,75 +2054,8 @@ async function processTask(task) {
       hash: finalHash,
       error: finalError,
     });
-
-    let domainPermit = null; // ADD
-    let domainReleaseInfo = { blocked: false, error: false }; // ADD
-    try { // ADD
-      domainPermit = await acquireDomainSlot(url, { logger, monitorId: monitor_id }); // ADD
-    } catch (acqErr) { // ADD
-      finalStatus = 'blad'; // ADD
-      finalError = acqErr?.code || acqErr?.message || String(acqErr); // ADD
-      logger.error('throttle', 'Domain throttle prevented scan', { // ADD
-        message: finalError, // ADD
-        waitMs: acqErr?.waitMs, // ADD
-      }); // ADD
-      console.error(`SCAN ABORT monitor=${monitor_id} reason=${finalError}`); // LOG
-      if (acqErr?.code === 'DOMAIN_BLOCKED') { // ADD
-        monitorsRequiringIntervention.add(monitor_id); // ADD
-        await markMonitorRequiresIntervention(monitor_id, { reason: finalError, snapshotId: null, logger }); // ADD
-      } // ADD
-      try { // ADD
-        await finishTask(taskId, { // ADD
-          status: 'blad', // ADD
-          blad_opis: finalError.slice(0, 500), // ADD
-          tresc_hash: null, // ADD
-          snapshot_mongo_id: null, // ADD
-        }); // ADD
-      } catch (finishErr) { // ADD
-        logger.error('pg:finish-task', 'Failed to update task status after throttle block', { message: finishErr?.message || String(finishErr) }); // ADD
-      } // ADD
-      return; // ADD
-    } // ADD
-
-    logger.stageStart('scan', { url, tryb });
-    const scanResult = await scanUrl({ url, tryb, selector, browserOptions, staticOptions, logger, monitorId: monitor_id }); // FIX
-    logger.stageEnd('scan', {
-      mode: scanResult.mode,
-      http_status: scanResult.http_status,
-      blocked: scanResult.blocked,
-      hash: scanResult.hash,
-      finalUrl: scanResult.final_url,
-    });
-    domainReleaseInfo = { blocked: !!scanResult.blocked, error: false }; // ADD
-
-    logger.stageStart('mongo:save-snapshot', { mode: scanResult.mode });
-    let snapshotId;
-    try {
-      snapshotId = await saveSnapshotToMongo({
-        monitor_id,
-        url,
-        ts: new Date(),
-        mode: scanResult.mode,
-        final_url: scanResult.final_url,
-        html: scanResult.html,
-        meta: scanResult.meta,
-        hash: scanResult.hash,
-        blocked: !!scanResult.blocked,
-        block_reason: scanResult.block_reason || null,
-        screenshot_b64: scanResult.screenshot_b64 || null,
-      });
-      console.log(`MONGO snapshot=${snapshotId} monitor=${monitor_id} blocked=${!!scanResult.blocked}`); // LOG
-      logger.stageEnd('mongo:save-snapshot', {
-        snapshotId,
-        htmlLength: scanResult.html ? scanResult.html.length : 0,
-      });
-    } catch (err) {
-      logger.stageEnd('mongo:save-snapshot', {
-        snapshotId: null,
-        error: err?.message || String(err),
-      });
-      throw err;
-    }
+  }
+}
 
 async function runExecutionCycle(monitorId) { // FIX
   if (!isUuid(monitorId)) { // FIX
