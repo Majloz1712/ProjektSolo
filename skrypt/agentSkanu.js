@@ -190,13 +190,14 @@ export async function handleCookieConsent(page) {
   return false;
 }
 
-async function humanize(page) {
-  const steps = 2 + Math.floor(Math.random() * 2);
-  for (let i = 0; i < steps; i += 1) {
-    await page.waitForTimeout(300 + Math.random() * 400);
-    await page.mouse.wheel({ deltaY: 250 + Math.random() * 300 });
+async function humanize(page){
+  const steps = 2 + Math.floor(Math.random()*2);
+  for (let i = 0; i < steps; i++) {
+    await page.waitForTimeout(300 + Math.random()*400);
+    await page.safeScroll(250 + Math.random()*300);
   }
 }
+
 
 async function waitForAny(page, selectors, timeoutMs = 8_000) {
   const start = Date.now();
@@ -211,6 +212,25 @@ async function waitForAny(page, selectors, timeoutMs = 8_000) {
 
 export async function runBrowserFlow({ browser, url, mongoDb, monitorId }) {
   const page = await browser.newPage();
+  
+  // Polyfill dla starszych wersji Puppeteera
+if (typeof page.waitForTimeout !== 'function') {
+  page.waitForTimeout = (ms) => new Promise(res => setTimeout(res, ms));
+}
+// (opcjonalnie) fallback scrolla, gdyby .mouse.wheel nie istniało
+if (!page.mouse || typeof page.mouse.wheel !== 'function') {
+  page.safeScroll = async (deltaY) => page.evaluate(dy => window.scrollBy(0, dy), deltaY);
+} else {
+  page.safeScroll = async (deltaY) => page.mouse.wheel({ deltaY });
+}
+
+  
+  
+  
+  
+  
+  
+  
   await hardenPage(page);
 
   const origin = new URL(url).origin;
