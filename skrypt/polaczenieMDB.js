@@ -1,21 +1,21 @@
-// skrypt/polaczenieMDB.js
-require('dotenv').config({ path: require('path').resolve(__dirname, '..', '.env') });
-const { MongoClient } = require('mongodb');
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import dotenv from 'dotenv';
+import { MongoClient } from 'mongodb';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+dotenv.config({ path: path.resolve(__dirname, '..', '.env') });
 
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017';
-const DB_NAME   = process.env.MONGO_DB || 'inzynierka';
+const DB_NAME = process.env.MONGO_DB || 'inzynierka';
 
-// Wspólny klient dla całej aplikacji (serwer + agent)
-const mongoClient = new MongoClient(MONGO_URI);
+export const mongoClient = new MongoClient(MONGO_URI);
 
-// Cache db po pierwszym połączeniu
 let dbCache = null;
 
-/**
- * Używane przez serwerStart.js
- * Łączy (jeśli potrzeba) i zwraca instancję DB.
- */
-async function connectMongo() {
+export async function connectMongo() {
   if (!dbCache) {
     await mongoClient.connect();
     dbCache = mongoClient.db(DB_NAME);
@@ -23,12 +23,8 @@ async function connectMongo() {
   return dbCache;
 }
 
-/**
- * Opcjonalny helper – jeśli już połączeni, zwróci db.
- */
-function getDb() {
+export function getDb() {
   return dbCache || mongoClient.db(DB_NAME);
 }
 
-module.exports = { mongoClient, connectMongo, getDb };
-
+export default mongoClient;
