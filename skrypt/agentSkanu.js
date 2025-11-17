@@ -26,6 +26,8 @@ puppeteer.use(StealthPlugin());
 
 const fetchFn = globalThis.fetch ?? (await import('node-fetch')).default;
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // ===== POLICY (global config) =====
 export const POLICY = {
   defaultMode: 'browser',
@@ -33,6 +35,7 @@ export const POLICY = {
     /(^|\.)amazon\.pl$/i,
     /(^|\.)wikipedia\.org$/i,
   ],
+  cookieScreenshotOnBlock: true,
   locale: {
     timezone: 'Europe/Warsaw',
     locale: 'pl-PL',
@@ -191,6 +194,42 @@ export async function handleCookieConsent(page) {
   return false;
 }
 
+async function clickCookieBannerIfPresent(page, logger) {
+  const selectors = ['button', 'div[role="button"]', 'button[aria-label]'];
+  const keywords = [
+    'zgadzam się',
+    'zgadzam',
+    'akceptuję',
+    'akceptuj',
+    'akceptacja',
+    'accept',
+    'i agree',
+    'agree',
+  ];
+  try {
+    await sleep(1_000 + Math.random() * 1_000);
+    const elements = await page.$$(selectors.join(','));
+    for (const element of elements) {
+      const label = await element.evaluate((el) => {
+        const text = (el.innerText || el.textContent || '').trim();
+        const aria = (el.getAttribute('aria-label') || '').trim();
+        return text || aria;
+      });
+      if (!label) continue;
+      const normalized = label.toLowerCase();
+      if (!keywords.some((kw) => normalized.includes(kw))) continue;
+      await element.click({ delay: 120 + Math.floor(Math.random() * 120) }).catch(() => {});
+      await sleep(1_000 + Math.random() * 1_000);
+      logger?.info?.('cookie_click', { clicked: true, label });
+      console.log('[cookie] clicked consent button');
+      return true;
+    }
+  } catch (err) {
+    logger?.warn?.('cookie_click_failed', { error: err?.message || String(err) });
+  }
+  return false;
+}
+
 async function humanize(page) {
   const steps = 2 + Math.floor(Math.random() * 2);
   for (let i = 0; i < steps; i += 1) {
@@ -244,6 +283,37 @@ export async function runBrowserFlow({ browser, url, mongoDb, monitorId }) {
   await page.close();
 
   return { ok, html, screenshot, finalUrl };
+}
+
+async function runCookieScreenshotFlow({ monitorId, targetUrl, logger, proxyUrl }) {
+  let browser;
+  try {
+    const userDataDir = profilePath({ monitorId: monitorId || 'unknown', url: targetUrl });
+    browser = await launchWithPolicy({ userDataDir, proxyUrl });
+    const page = await browser.newPage();
+    await hardenPage(page);
+    await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 45_000 });
+    await clickCookieBannerIfPresent(page, logger);
+    await sleep(1_500);
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const safeMonitorId = monitorId || 'unknown';
+    const screenshotPath = path.join('logs', 'screenshots', `${safeMonitorId}-${ts}.png`);
+    await fs.promises.mkdir(path.dirname(screenshotPath), { recursive: true });
+    await page.screenshot({ path: screenshotPath, fullPage: true });
+    logger?.info?.('cookie_screenshot_done', { screenshotPath, url: targetUrl });
+    console.log(`[cookie] screenshot saved ${screenshotPath}`);
+    return screenshotPath;
+  } catch (err) {
+    logger?.warn?.('cookie_screenshot_failed', { error: err?.message || String(err) });
+    console.warn('[cookie] screenshot flow failed', err?.message || err);
+    return null;
+  } finally {
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (_) {}
+    }
+  }
 }
 
 // ===== proxy picker (sticky by monitor) =====
@@ -531,6 +601,7 @@ async function processTask(task) {
   let meta = null;
   let status = null;
   let screenshotB64 = null;
+  let staticBlockReason = null;
 
   try {
     if (mode === 'static') {
@@ -540,6 +611,17 @@ async function processTask(task) {
       html = staticResult.html;
       meta = staticResult.meta;
       blocked = !staticResult.ok;
+      const htmlLower = (staticResult.html || '').toLowerCase();
+      if (status === 403) {
+        staticBlockReason = 'HTTP_403';
+      } else if (status === 429) {
+        staticBlockReason = 'HTTP_429';
+      } else if (/captcha|verify|robot|enable javascript|access denied/.test(htmlLower)) {
+        staticBlockReason = 'HTML_BLOCK_DETECTED';
+      }
+      if (staticBlockReason) {
+        blocked = true;
+      }
     } else {
       const userDataDir = profilePath({ monitorId, url: targetUrl });
       const proxyUrl = pickProxy(monitorId);
@@ -608,6 +690,18 @@ async function processTask(task) {
     console.log(`[task] snapshot stored id=${snapshot}`);
   } catch (err) {
     console.error('[task] snapshot save failed', err);
+  }
+
+  const shouldRunCookieScreenshot =
+    POLICY.cookieScreenshotOnBlock && mode === 'static' && Boolean(staticBlockReason);
+
+  if (shouldRunCookieScreenshot) {
+    await runCookieScreenshotFlow({
+      monitorId,
+      targetUrl: finalUrl || targetUrl,
+      logger: null,
+      proxyUrl: pickProxy(monitorId),
+    });
   }
 
   if (blocked) {
