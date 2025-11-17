@@ -11,3 +11,5 @@ Thumbs.db
 .vscode/
 .idea/
 node_modules/
+log*.txt
+*.log
