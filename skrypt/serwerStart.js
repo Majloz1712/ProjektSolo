@@ -8,6 +8,7 @@ import { pool } from './polaczeniePG.js';
 import { connectMongo } from './polaczenieMDB.js';
 import authRoutes from './routes/auth.js';
 import monitoryRoutes from './routes/monitory.js';
+import pluginTasksRouter from './routes/pluginTasks.js';
 
 dotenv.config();
 
@@ -49,9 +50,10 @@ console.log('ℹ️ polaczeniePG path:', import.meta.url.replace(/serwerStart\.j
   console.log('📋 Widoczne tabele:', t.map((r) => `${r.table_schema}.${r.table_name}`));
 })();
 
-app.use(express.json());
-
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use((req, _res, next) => { req.pg = pool; next(); });
+
 
 pool.on('connect', (client) => {
   client.query('SET search_path TO public');
@@ -63,7 +65,7 @@ connectMongo()
 
     app.use('/auth', authRoutes);
     app.use('/api/monitory', monitoryRoutes);
-
+    app.use('/api/plugin-tasks', pluginTasksRouter);
     app.use(express.static(path.join(__dirname, '..', 'strona')));
     app.use('/styl', express.static(path.join(__dirname, '..', 'styl')));
     app.use('/skrypt', express.static(path.join(__dirname, '..', 'skrypt')));

@@ -1,4 +1,14 @@
-import { clampTextLength, normalizeWhitespace, inferContentType } from '../utils/normalize.js';
+import { clampTextLength, normalizeWhitespace, normalizePriceCandidate, inferContentType } from '../utils/normalize.js';
+
+
+function detectPrice(text) {
+  if (!text) return null;
+  const match = text.match(/([\d][\d\s.,]+)\s*(zł|pln|eur|€|usd|\$|£)/i);
+  if (!match) return null;
+  return normalizePriceCandidate(match[0]);
+}
+
+
 
 function scoreElement(element) {
   if (!element) return 0;
@@ -42,21 +52,29 @@ export const readabilityExtractor = {
     const { score } = findBestContainer(doc);
     return Math.min(1, score);
   },
-  extract(doc, { url }) {
+    extract(doc, { url }) {
     const { element, score } = findBestContainer(doc);
     if (!element) return null;
-    const text = normalizeWhitespace(element.textContent || '');
+
+    // NOWE: klon + wycięcie script/style/noscript
+    const clone = element.cloneNode(true);
+    clone.querySelectorAll('script, style, noscript').forEach(el => el.remove());
+
+    const text = normalizeWhitespace(clone.textContent || '');
     if (!text) return null;
-    const htmlMain = clampTextLength(element.innerHTML || '');
+
+    const htmlMain = clampTextLength(clone.innerHTML || '');
     const title = normalizeWhitespace(doc.querySelector('h1')?.textContent || doc.querySelector('title')?.textContent || '');
     const description = normalizeWhitespace(doc.querySelector('meta[name="description"]')?.getAttribute('content') || '');
+    const price = detectPrice(text);
+
     return {
       url,
       title: title || null,
       description: description || null,
       text,
-      htmlMain,
-      price: null,
+      //htmlMain,
+      price: price || null,
       images: Array.from(element.querySelectorAll('img'))
         .map((img) => img.getAttribute('src'))
         .filter(Boolean),
@@ -65,5 +83,7 @@ export const readabilityExtractor = {
       extractor: 'readability',
       contentType: inferContentType({ text }),
     };
+
   },
+
 };
