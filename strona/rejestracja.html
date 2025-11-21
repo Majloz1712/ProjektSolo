@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rejestracja – Dark UI</title>
+  <link rel="stylesheet" href="/styl/styles.css" />
+</head>
+<body>
+  <main class="card">
+    <header>
+      <div class="logo">PI</div>
+      <div>
+        <h1 class="title">Utwórz konto</h1>
+        <p class="subtitle">Rejestracja nowego użytkownika</p>
+      </div>
+    </header>
+
+    <form id="registerForm" novalidate>
+      <div class="field">
+        <label for="fullname">Imię i nazwisko</label>
+        <input id="fullname" class="input" type="text" required placeholder="Jan Kowalski" />
+      </div>
+
+      <div class="field">
+        <label for="email">Email</label>
+        <input id="email" class="input" type="email" required placeholder="twoj@email.com" />
+      </div>
+
+      <div class="field">
+        <label for="password">Hasło</label>
+        <div class="rel">
+          <input id="password" class="input" type="password" required minlength="8" />
+          <button type="button" class="toggle-pass" onclick="togglePassword('password', this)">Pokaż</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="password2">Powtórz hasło</label>
+        <div class="rel">
+          <input id="password2" class="input" type="password" required minlength="8" />
+          <button type="button" class="toggle-pass" onclick="togglePassword('password2', this)">Pokaż</button>
+        </div>
+      </div>
+
+      <div class="row">
+        <label class="checkbox">
+          <input type="checkbox" id="terms" required />
+          <span>Akceptuję regulamin</span>
+        </label>
+        <a class="link" href="logowanie.html">Masz konto? Zaloguj się</a>
+      </div>
+
+      <button class="btn" type="submit">Zarejestruj</button>
+      <div class="messages" id="messages"></div>
+    </form>
+
+    <div class="footer">
+      <a class="link" href="resetHasla.html">Nie pamiętasz hasła?</a>
+    </div>
+  </main>
+
+  <script src="/skrypt/app.js"></script>
+</body>
+</html>
+

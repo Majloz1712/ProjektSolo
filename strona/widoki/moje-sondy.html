@@ -1,0 +1,39 @@
+<!-- /widoki/moje-sondy.html -->
+<div class="card card--full">
+  <div class="card-body">
+    <h2 style="margin:0 0 12px 0;">Moje sondy</h2>
+
+<div class="row" style="margin: 12px 0 6px 0; align-items: center;">
+  <input id="msSearch" class="input" placeholder="Szukaj po nazwie lub URL…" />
+  <select id="msStatus" class="input" style="max-width:180px">
+    <option value="">Wszystkie</option>
+    <option value="active">Aktywne</option>
+    <option value="paused">Wstrzymane</option>
+    <option value="error">Z błędem</option>
+  </select>
+</div>
+
+<!-- WYRÓWNANIE DO PRAWEJ: select + przycisk w jednym wierszu -->
+<div class="row" style="margin: 6px 0 16px 0; justify-content: flex-end; gap: 12px;">
+  <select id="msLimit" class="input" style="max-width:180px">
+    <option value="10">10 / stronę</option>
+    <option value="20" selected>20 / stronę</option>
+    <option value="50">50 / stronę</option>
+  </select>
+  <button id="msRefresh" class="btn" style="max-width:220px">Odśwież</button>
+</div>
+    <div id="msInfo" class="hint"></div>
+
+    <div id="msList" style="display:grid; gap:12px;"></div>
+
+    <div id="msEmpty" class="hint" style="display:none; text-align:center; margin-top:16px">
+      Brak sond. Dodaj pierwszą w zakładce „Dodaj sondę”.
+    </div>
+
+    <div id="msPager" class="row" style="margin-top:16px; grid-template-columns: 1fr 1fr;">
+      <button id="msPrev" class="btn" style="max-width:200px">◀ Poprzednia</button>
+      <button id="msNext" class="btn" style="max-width:200px">Następna ▶</button>
+    </div>
+  </div>
+</div>
+
