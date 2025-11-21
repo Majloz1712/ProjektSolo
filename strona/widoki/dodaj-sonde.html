@@ -1,0 +1,227 @@
+<section class="card card--full" aria-labelledby="add-probe-title">
+  <div class="card-body">
+<section class="card" aria-labelledby="add-probe-title">
+  <header>
+    <div class="logo">AS</div>
+    <div>
+      <h1 id="add-probe-title" class="title">Dodaj sondę</h1>
+      <p class="subtitle">Podaj adres strony, częstotliwość sprawdzania i opcjonalny prompt wspierający model.</p>
+    </div>
+  </header>
+  
+  <form id="formAddProbe" novalidate>
+      <!-- Nazwa sondy -->
+    <div class="field">
+      <label for="probeName">Nazwa sondy</label>
+      <input
+        type="text"
+        id="probeName"
+        name="name"
+        class="input"
+        placeholder="Np. Promocje – Sklep X"
+        maxlength="150"
+        required
+      />
+      <div class="hint">Dowolna nazwa, która pomoże Ci rozpoznać sondę.</div>
+    </div>
+
+    <!-- URL strony -->
+    <div class="field">
+      <label for="probeUrl">Link do strony (URL)</label>
+      <input
+        type="url"
+        id="probeUrl"
+        name="url"
+        class="input"
+        placeholder="https://twojadomena.pl/artykul"
+        inputmode="url"
+        autocomplete="off"
+        required
+      />
+      <div class="hint">Wklej pełny adres zaczynający się od <code>http://</code> lub <code>https://</code>.</div>
+    </div>
+
+    <!-- Częstotliwość -->
+    <div class="field">
+      <label for="intervalValue">Co ile wykonywać sondę</label>
+      <div class="row">
+        <input
+          type="number"
+          id="intervalValue"
+          name="interval_value"
+          class="input"
+          placeholder="5"
+          min="1"
+          step="1"
+          required
+          aria-describedby="intervalHelp"
+        />
+        <select id="intervalUnit" name="interval_unit" class="input" required>
+          <option value="minute">minut(y)</option>
+          <option value="hour">godzin(y)</option>
+          <option value="second">sekund(y)</option>
+        </select>
+      </div>
+      <div id="intervalHelp" class="hint">Minimalna wartość: 1. Wybierz jednostkę czasu.</div>
+    </div>
+
+    <!-- Dodatkowy prompt -->
+    <div class="field">
+      <label for="llmPrompt">Dodatkowy prompt (opcjonalnie)</label>
+      <textarea
+        id="llmPrompt"
+        name="prompt"
+        class="input"
+        rows="6"
+        placeholder="Np. 'Wyszukaj w treści zmiany cen, dostępności lub słów: wyprzedaż, promocja.'"
+        maxlength="1200"
+      ></textarea>
+      <div class="row" style="justify-content: flex-end;">
+        <div class="hint" id="promptCounter">0 / 1200</div>
+      </div>
+    </div>
+
+    <!-- Komunikaty -->
+    <div class="messages" id="formMessages" aria-live="polite"></div>
+
+    <!-- Przyciski -->
+    <div class="row">
+      <button type="reset" class="btn" id="btnClear" style="background: #181818; color: var(--text); border: 1px solid var(--muted-2);">
+        Wyczyść
+      </button>
+      <button type="submit" class="btn" id="btnAdd">
+        Dodaj
+      </button>
+    </div>
+  </form>
+</section>
+  </div>
+</section>
+<script>
+  (function () {
+    const form = document.getElementById('formAddProbe');
+    const urlEl = document.getElementById('probeUrl');
+    const intValEl = document.getElementById('intervalValue');
+    const intUnitEl = document.getElementById('intervalUnit');
+    const promptEl = document.getElementById('llmPrompt');
+    const msgEl = document.getElementById('formMessages');
+    const counterEl = document.getElementById('promptCounter');
+    const btnAdd = document.getElementById('btnAdd');
+
+    // Licznik znaków dla promptu
+    function updateCounter() {
+      counterEl.textContent = (promptEl.value?.length || 0) + ' / ' + promptEl.maxLength;
+    }
+    promptEl.addEventListener('input', updateCounter);
+    updateCounter();
+
+    // Prosta walidacja URL
+    function isValidUrl(value) {
+      try {
+        const u = new URL(value);
+        return u.protocol === 'http:' || u.protocol === 'https:';
+      } catch {
+        return false;
+      }
+    }
+
+    function showMessage(text, ok = false) {
+      msgEl.textContent = text;
+      msgEl.className = 'messages ' + (ok ? 'msg-ok' : 'msg-error');
+    }
+
+    function clearErrors() {
+      urlEl.classList.remove('error');
+      intValEl.classList.remove('error');
+      intUnitEl.classList.remove('error');
+      showMessage('');
+    }
+
+    form.addEventListener('reset', () => {
+      setTimeout(() => { // odśwież licznik po reset
+        updateCounter();
+        clearErrors();
+      }, 0);
+    });
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      clearErrors();
+      
+      
+      
+      
+      const nameEl = document.getElementById('probeName');
+      const name = nameEl.value.trim();
+      const url = urlEl.value.trim();
+      const intervalValue = Number(intValEl.value);
+      const intervalUnit = intUnitEl.value; // 'second' | 'minute' | 'hour'
+      const prompt = promptEl.value.trim();
+
+      // Walidacja
+      
+      if (!name) {
+        nameEl.classList.add('error');
+        showMessage('Podaj nazwę sondy.');
+        return;
+      }
+      
+      if (!isValidUrl(url)) {
+        urlEl.classList.add('error');
+        showMessage('Podaj poprawny adres URL (http/https).');
+        return;
+      }
+      
+      
+      
+      if (!intervalValue || intervalValue < 1) {
+        intValEl.classList.add('error');
+        showMessage('Częstotliwość musi być liczbą dodatnią (co najmniej 1).');
+        return;
+      }
+      if (!intervalUnit) {
+        intUnitEl.classList.add('error');
+        showMessage('Wybierz jednostkę czasu dla częstotliwości.');
+        return;
+      }
+
+      // Przeliczenie na sekundy (przykład – dopasuj do backendu)
+      const multiplier = intervalUnit === 'hour' ? 3600 : (intervalUnit === 'minute' ? 60 : 1);
+      const intervalSeconds = intervalValue * multiplier;
+
+      // Payload do API – DOPASUJ ENDPOINT DO SWOJEGO BACKENDU
+        const payload = {
+          name,
+          url,
+          interval_seconds: intervalSeconds,
+          prompt: prompt || null
+        };
+
+      try {
+        btnAdd.disabled = true;
+
+        // Przykładowe wywołanie – zmień na właściwy adres (np. /api/probes)
+ 
+        const res = await fetch("/api/monitory", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err?.message || 'Nie udało się dodać sondy.');
+        }
+
+        showMessage('Sonda została dodana.', true);
+        form.reset();
+        updateCounter();
+      } catch (err) {
+        showMessage(err.message || 'Wystąpił błąd. Spróbuj ponownie.');
+      } finally {
+        btnAdd.disabled = false;
+      }
+    });
+  })();
+</script>
+
