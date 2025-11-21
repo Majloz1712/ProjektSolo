@@ -9,7 +9,7 @@ import dotenv from 'dotenv';
 import PQueue from 'p-queue';
 import { JSDOM } from 'jsdom';
 import puppeteer from 'puppeteer-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+// import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 
 import { pool } from './polaczeniePG.js';
 import { mongoClient } from './polaczenieMDB.js';
@@ -21,8 +21,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 dotenv.config({ path: path.resolve(__dirname, '.env') });
-
-puppeteer.use(StealthPlugin());
+console.log('AGENT VERSION: 2.1 clean snapshot');
+// puppeteer.use(StealthPlugin());
 
 const fetchFn = globalThis.fetch ?? (await import('node-fetch')).default;
 
@@ -35,15 +35,14 @@ export const POLICY = {
     /(^|\.)amazon\.pl$/i,
     /(^|\.)wikipedia\.org$/i,
   ],
-  cookieScreenshotOnBlock: true,
   locale: {
     timezone: 'Europe/Warsaw',
     locale: 'pl-PL',
     geolocation: { lat: 52.2297, lon: 21.0122, accuracy: 50 },
   },
   chrome: {
-    executablePath: '/usr/bin/google-chrome',
-    headless: false,
+    // executablePath: '/usr/bin/google-chrome',
+    headless: true,
     viewport: { width: 1366, height: 768 },
   },
   session: {
@@ -53,8 +52,15 @@ export const POLICY = {
   proxy: {
     use: false,
     stickyByMonitor: true,
-    pool: [],
+    pool: [
+      '79.110.198.37:8080',
+      '45.14.224.247:80',
+      '133.232.93.66:80',
+      '185.84.162.116:3128',
+    ],
   },
+
+  cookieScreenshotOnBlock: true,
 };
 
 // ===== determine-mode (policy-driven) =====
@@ -81,30 +87,24 @@ export async function launchWithPolicy({ userDataDir, proxyUrl } = {}) {
     '--window-size=1366,768',
     '--disable-blink-features=AutomationControlled',
   ];
-  if (proxyUrl) args.push(`--proxy-server=${proxyUrl}`);
+
+  if (proxyUrl) {
+    args.push(`--proxy-server=${proxyUrl}`);
+  }
 
   return puppeteer.launch({
     headless: POLICY.chrome.headless,
-    executablePath: POLICY.chrome.executablePath,
     userDataDir,
     args,
     defaultViewport: POLICY.chrome.viewport,
+    protocolTimeout: 120_000,
   });
 }
 
-// ===== harden page =====
+// ===== page hardening (stealth tweaks) =====
 export async function hardenPage(page) {
-  await page.setUserAgent(
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
-  );
-  await page.setExtraHTTPHeaders({
-    'accept-language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
-    'sec-ch-ua': '"Chromium";v="127", "Google Chrome";v="127", "Not:A-Brand";v="99"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-  });
-
   const client = await page.target().createCDPSession();
+
   await client.send('Emulation.setTimezoneOverride', { timezoneId: POLICY.locale.timezone });
   await client.send('Emulation.setLocaleOverride', { locale: POLICY.locale.locale });
   await client.send('Emulation.setGeolocationOverride', {
@@ -123,15 +123,18 @@ export async function hardenPage(page) {
 // ===== session persistence (Mongo) =====
 export async function restoreSession(page, mongoDb, { monitorId, origin }) {
   if (!mongoDb || POLICY.session.persistToMongo === false) return;
+
   const session = await mongoDb.collection('sessions').findOne({ monitorId, origin });
   if (!session) return;
 
-  const cdp = await page.target().createCDPSession();
-  for (const cookie of session.cookies || []) {
+  const client = await page.target().createCDPSession();
+  await client.send('Network.enable');
+  session.cookies.forEach(async (cookie) => {
     try {
-      await cdp.send('Network.setCookie', { ...cookie, path: cookie.path || '/' });
+      await client.send('Network.setCookie', { ...cookie, path: cookie.path || '/' });
     } catch (_) {}
-  }
+  });
+
   await page.goto(origin, { waitUntil: 'domcontentloaded', timeout: 20_000 });
   if (session.localStorage && Object.keys(session.localStorage).length) {
     await page.evaluate((ls) => {
@@ -167,6 +170,7 @@ export async function handleCookieConsent(page) {
   const clickAny = async (ctx) => ctx.evaluate((texts) => {
     const lower = (s) => (s || '').toLowerCase();
     const elements = Array.from(document.querySelectorAll('button,[role="button"],a'));
+    // eslint-disable-next-line no-restricted-syntax
     for (const el of elements) {
       const text = lower(el.innerText || el.textContent || '');
       if (texts.some((needle) => text.includes(needle))) {
@@ -178,15 +182,17 @@ export async function handleCookieConsent(page) {
   }, labels);
 
   if (await clickAny(page)) {
-    await page.waitForTimeout(400);
+    await sleep(400);
     return true;
   }
 
+  // eslint-disable-next-line no-restricted-syntax
   for (const frame of page.frames()) {
     try {
       if (frame === page.mainFrame()) continue;
+      // eslint-disable-next-line no-await-in-loop
       if (await clickAny(frame)) {
-        await page.waitForTimeout(400);
+        await sleep(400);
         return true;
       }
     } catch (_) {}
@@ -194,46 +200,12 @@ export async function handleCookieConsent(page) {
   return false;
 }
 
-async function clickCookieBannerIfPresent(page, logger) {
-  const selectors = ['button', 'div[role="button"]', 'button[aria-label]'];
-  const keywords = [
-    'zgadzam się',
-    'zgadzam',
-    'akceptuję',
-    'akceptuj',
-    'akceptacja',
-    'accept',
-    'i agree',
-    'agree',
-  ];
-  try {
-    await sleep(1_000 + Math.random() * 1_000);
-    const elements = await page.$$(selectors.join(','));
-    for (const element of elements) {
-      const label = await element.evaluate((el) => {
-        const text = (el.innerText || el.textContent || '').trim();
-        const aria = (el.getAttribute('aria-label') || '').trim();
-        return text || aria;
-      });
-      if (!label) continue;
-      const normalized = label.toLowerCase();
-      if (!keywords.some((kw) => normalized.includes(kw))) continue;
-      await element.click({ delay: 120 + Math.floor(Math.random() * 120) }).catch(() => {});
-      await sleep(1_000 + Math.random() * 1_000);
-      logger?.info?.('cookie_click', { clicked: true, label });
-      console.log('[cookie] clicked consent button');
-      return true;
-    }
-  } catch (err) {
-    logger?.warn?.('cookie_click_failed', { error: err?.message || String(err) });
-  }
-  return false;
-}
-
 async function humanize(page) {
   const steps = 2 + Math.floor(Math.random() * 2);
   for (let i = 0; i < steps; i += 1) {
-    await page.waitForTimeout(300 + Math.random() * 400);
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(300 + Math.random() * 400);
+    // eslint-disable-next-line no-await-in-loop
     await page.mouse.wheel({ deltaY: 250 + Math.random() * 300 });
   }
 }
@@ -241,15 +213,33 @@ async function humanize(page) {
 async function waitForAny(page, selectors, timeoutMs = 8_000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
+    // eslint-disable-next-line no-restricted-syntax
     for (const selector of selectors) {
+      // eslint-disable-next-line no-await-in-loop
       if (await page.$(selector)) return true;
     }
-    await page.waitForTimeout(250);
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(250);
   }
   return false;
 }
 
-export async function runBrowserFlow({ browser, url, mongoDb, monitorId }) {
+function detectBotProtection(html) {
+  if (!html) return false;
+
+  const patterns = [
+    /JavaScript is disabled/i,
+    /verify that you'?re not a robot/i,
+    /AwsWafIntegration/i,
+    /__challenge_/i,
+    /window\.awsWafCookieDomainList/i,
+  ];
+
+  return patterns.some((re) => re.test(html));
+}
+
+
+export async function runBrowserFlow({ browser, url, mongoDb, monitorId, takeScreenshot = false }) {
   const page = await browser.newPage();
   await hardenPage(page);
 
@@ -257,11 +247,11 @@ export async function runBrowserFlow({ browser, url, mongoDb, monitorId }) {
 
   await restoreSession(page, mongoDb, { monitorId, origin });
 
-  await page.goto(origin, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  await page.goto(origin, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await handleCookieConsent(page);
   await humanize(page);
 
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
   await handleCookieConsent(page);
 
   const ok = await waitForAny(
@@ -272,46 +262,146 @@ export async function runBrowserFlow({ browser, url, mongoDb, monitorId }) {
       '[data-testid*="price"], [data-role*="price"]',
       'h1',
     ],
-    9_000,
+    9000,
   );
 
   const html = await page.content();
-  const screenshot = await page.screenshot({ type: 'jpeg', quality: 60, fullPage: false });
+  const screenshot = takeScreenshot
+    ? await page.screenshot({ type: 'jpeg', quality: 60, fullPage: false })
+    : null;
+
+  // 🔎 HEURYSTYKA CENY Z DOM (POPRAWIONA)
+  const domPriceText = await page.evaluate(() => {
+    const currencyRe = /(zł|pln|eur|€|usd|\$|£)/i;
+    const priceWithCurrRe = /(\d[\d\s.,]*\d?)\s*(zł|pln|eur|€|usd|\$|£)/i;
+    const numberRe = /(\d[\d\s.,]*\d?)/;
+
+    // 0) NAJPIERW: szukamy "1234 zł" w CAŁYM tekście strony
+    const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+    const globalMatch = bodyText.match(priceWithCurrRe);
+    if (globalMatch) {
+      // np. "968 zł"
+      return globalMatch[0];
+    }
+
+    const candidates = [];
+
+    const addCandidate = (el, reason, opts = {}) => {
+      const { requireCurrency = true } = opts;
+      if (!el) return;
+      const raw = el.textContent || '';
+      const text = raw.replace(/\s+/g, ' ').trim();
+      if (!text) return;
+
+      if (requireCurrency && !currencyRe.test(text)) return;
+      if (!priceWithCurrRe.test(text) && !numberRe.test(text)) return;
+
+      let score = 0;
+      const t = text.toLowerCase();
+      const cls = (el.className || '').toLowerCase();
+      const id = (el.id || '').toLowerCase();
+
+      if (cls.includes('price') || id.includes('price')) score += 3;
+      if (cls.includes('amount') || cls.includes('total')) score += 1;
+      if (t.includes('noc') || t.includes('night') || t.includes('pobyt')) score += 1;
+
+      const len = text.length;
+      if (len < 8) score += 1;
+      if (len > 120) score -= 1;
+
+      // Jeżeli nie ma waluty, ale wygląda jak "cena" – trochę podbijamy
+      if (!currencyRe.test(text) && (cls.includes('price') || id.includes('price'))) {
+        score += 1;
+      }
+
+      // ⚠️ Karzemy rzeczy typu "Personel 9,0", "Czystość 9,0" (to nie ceny)
+      if (/personel|czystość|komfort|lokalizacja|wifi|udogodnienia/i.test(t)) {
+        score -= 3;
+      }
+
+      candidates.push({ text, score, reason });
+    };
+
+    // 1) „mocne” selektory – waluta NIE jest wymagana
+    const strongSelectors = [
+      '[itemprop="price"]',
+      '[data-testid*="price"]',
+      '[class*="price"]',
+      '[id*="price"]',
+      '[aria-label*="price"]',
+      '[aria-label*="cena"]',
+      '[class*="prco-"]',               // Booking
+      '[class*="bui-price-display"]',   // Booking – box z ceną
+      '[class*="hprt-price"]',          // Booking – tabela pokoi
+    ];
+    strongSelectors.forEach((sel) => {
+      document.querySelectorAll(sel).forEach((el) => addCandidate(el, `selector:${sel}`, { requireCurrency: false }));
+    });
+
+    // 2) fallback po elementach – wymagamy waluty
+    if (!candidates.length) {
+      const all = Array.from(document.querySelectorAll('span,div,strong,b,p'));
+      for (const el of all) {
+        const raw = el.textContent || '';
+        const text = raw.replace(/\s+/g, ' ').trim();
+        if (!text) continue;
+        if (text.length < 4 || text.length > 120) continue;
+        if (!currencyRe.test(text)) continue;
+        addCandidate(el, 'fallback_generic', { requireCurrency: true });
+      }
+    }
+
+    if (candidates.length) {
+      candidates.sort((a, b) => b.score - a.score);
+      return candidates[0].text;
+    }
+
+    // nic nie znaleziono
+    return null;
+  });
+
   const finalUrl = page.url();
 
   await persistSession(page, mongoDb, { monitorId, origin });
   await page.close();
 
-  return { ok, html, screenshot, finalUrl };
+  return { ok, html, screenshot, finalUrl, domPriceText };
 }
 
-async function runCookieScreenshotFlow({ monitorId, targetUrl, logger, proxyUrl }) {
+
+
+
+async function runCookieScreenshotFlow({ monitorId, url, mongoDb }) {
+  let db = mongoDb;
+  if (!db) {
+    db = await ensureMongo();
+  }
+  const userDataDir = profilePath({ monitorId, url });
+  const proxyUrl = pickProxy(monitorId);
   let browser;
   try {
-    const userDataDir = profilePath({ monitorId: monitorId || 'unknown', url: targetUrl });
     browser = await launchWithPolicy({ userDataDir, proxyUrl });
-    const page = await browser.newPage();
-    await hardenPage(page);
-    await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 45_000 });
-    await clickCookieBannerIfPresent(page, logger);
-    await sleep(1_500);
-    const ts = new Date().toISOString().replace(/[:.]/g, '-');
-    const safeMonitorId = monitorId || 'unknown';
-    const screenshotPath = path.join('logs', 'screenshots', `${safeMonitorId}-${ts}.png`);
-    await fs.promises.mkdir(path.dirname(screenshotPath), { recursive: true });
-    await page.screenshot({ path: screenshotPath, fullPage: true });
-    logger?.info?.('cookie_screenshot_done', { screenshotPath, url: targetUrl });
-    console.log(`[cookie] screenshot saved ${screenshotPath}`);
-    return screenshotPath;
+const { screenshot } = await runBrowserFlow({
+  browser,
+  url,
+  mongoDb: db,
+  monitorId,
+  takeScreenshot: true,
+});
+    if (screenshot) {
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      const safeMonitorId = monitorId || 'unknown';
+      const screenshotsDir = path.join(__dirname, 'logs', 'screenshots');
+      await fs.promises.mkdir(screenshotsDir, { recursive: true });
+      const filePath = path.join(screenshotsDir, `${safeMonitorId}-${ts}.jpeg`);
+      await fs.promises.writeFile(filePath, screenshot);
+      console.log('[cookie-shot] screenshot saved', filePath);
+    }
   } catch (err) {
-    logger?.warn?.('cookie_screenshot_failed', { error: err?.message || String(err) });
-    console.warn('[cookie] screenshot flow failed', err?.message || err);
-    return null;
+    console.warn('[cookie-shot] failed', err?.message || err);
   } finally {
     if (browser) {
-      try {
-        await browser.close();
-      } catch (_) {}
+      await browser.close().catch(() => {});
     }
   }
 }
@@ -346,21 +436,6 @@ function isUuid(value) {
   return typeof value === 'string' && UUID_REGEX.test(value);
 }
 
-function sha256(input) {
-  return crypto.createHash('sha256').update(input).digest('hex');
-}
-
-function normalizeUrl(raw) {
-  try {
-    const url = new URL(raw);
-    url.hash = '';
-    if (!url.pathname) url.pathname = '/';
-    return url.toString();
-  } catch {
-    return raw;
-  }
-}
-
 async function ensureMongo() {
   if (mongoClient.topology?.isConnected?.()) {
     return mongoClient.db(process.env.MONGO_DB || 'monitor');
@@ -378,9 +453,8 @@ async function saveSnapshotToMongo(doc) {
 
 async function clearMongoSnapshots() {
   const db = await ensureMongo();
-  const collection = db.collection('snapshots');
-  const { deletedCount } = await collection.deleteMany({});
-  return deletedCount || 0;
+  await db.collection('snapshots').deleteMany({});
+  console.log('[mongo] snapshots cleared');
 }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = STATIC_TIMEOUT_MS) {
@@ -395,43 +469,76 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = STATIC_TIMEOUT_MS
 }
 
 async function scanStatic({ url, selector }) {
-  const response = await fetchWithTimeout(url, {
-    redirect: 'follow',
-    headers: {
-      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
-      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'accept-language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
-      'cache-control': 'no-cache',
-      'pragma': 'no-cache',
-    },
-  });
+  // prosty timeout na wypadek wiszącego requestu
+  const controller = new AbortController();
+  const timeoutMs = 15000;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let response;
+  try {
+    response = await fetchFn(url, {
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: {
+        'user-agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+          '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'accept-language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+      },
+    });
+  } finally {
+    clearTimeout(timer);
+  }
 
   const status = response.status;
   const finalUrl = response.url || url;
-  const buffer = await response.arrayBuffer();
-  let html = Buffer.from(buffer).toString('utf8');
-  if (html.length > TEXT_TRUNCATE_AT) html = html.slice(0, TEXT_TRUNCATE_AT);
 
-  const dom = new JSDOM(html);
-  const document = dom.window.document;
-  let content = html;
-  if (selector) {
-    const node = document.querySelector(selector);
-    if (node) {
-      content = node.outerHTML;
-    }
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.toLowerCase().includes('text/html')) {
+    return {
+      ok: false,
+      status,
+      html: null,
+      finalUrl,
+      meta: null,
+    };
   }
 
-  const meta = pickMetaFromDocument(document);
+  const buffer = await response.arrayBuffer();
+  const content = Buffer.from(buffer).toString('utf8');
+
+  const lower = content.toLowerCase();
+  const isChallenge =
+    lower.includes('javascript is disabled') ||
+    lower.includes('awswafintegration') ||
+    lower.includes('__challenge_') ||
+    lower.includes("verify that you're not a robot");
+
+  const ok = status >= 200 && status < 400 && !isChallenge;
+
+  if (isChallenge) {
+    console.log('[static] detected WAF/challenge page, static ok=false');
+  }
+
+  let meta = null;
+  try {
+    const dom = new JSDOM(content, { url: finalUrl });
+    meta = pickMetaFromDocument(dom.window.document);
+  } catch {
+    meta = null;
+  }
 
   return {
-    ok: status >= 200 && status < 400,
+    ok,
     status,
     html: content,
     finalUrl,
     meta,
   };
 }
+
+
+
 
 function pickMetaFromDocument(document) {
   const byName = (n) => document.querySelector(`meta[name="${n}"]`)?.getAttribute('content')?.trim() || null;
@@ -442,7 +549,9 @@ function pickMetaFromDocument(document) {
   const h1 = document.querySelector('h1')?.textContent?.trim() || null;
   const linksCount = document.querySelectorAll('a[href]').length;
   const textLen = document.body?.innerText?.length || 0;
-  return { title, desc, canonical, h1, linksCount, textLen };
+  return {
+    title, desc, canonical, h1, linksCount, textLen,
+  };
 }
 
 async function withPg(fn) {
@@ -453,6 +562,49 @@ async function withPg(fn) {
     client.release();
   }
 }
+
+// ===== plugin tasks helper (3-ci tryb) =====
+
+// Dodawanie zadania dla pluginu (fallback / price_only)
+async function createPluginTask({
+  monitorId,
+  taskId,
+  url,
+  mode = 'fallback', // 'fallback' | 'price_only'
+}) {
+  if (!monitorId || !taskId || !url) return;
+
+  await withPg(async (pg) => {
+    await pg.query(
+      `INSERT INTO plugin_tasks (monitor_id, zadanie_id, url, status, mode)
+       VALUES ($1, $2, $3, 'pending', $4)`,
+      [monitorId, taskId, url, mode],
+    );
+  });
+
+  console.log(
+    `[plugin-task] created mode=${mode} monitor=${monitorId} zadanie=${taskId} url=${url}`,
+  );
+}
+
+
+
+async function updateMonitorScanMode(monitorId, mode) {
+  if (!monitorId) return;
+  if (!['static', 'browser', 'plugin'].includes(mode)) return;
+
+  try {
+    await withPg(async (pg) => {
+      await pg.query(
+        'UPDATE monitory SET tryb_skanu = $2 WHERE id = $1',
+        [monitorId, mode],
+      );
+    });
+  } catch (err) {
+    console.warn('[monitor] update tryb_skanu failed', err?.message || err);
+  }
+}
+
 
 async function scheduleMonitorDue(monitorId) {
   if (!isUuid(monitorId)) throw new Error('INVALID_MONITOR_ID');
@@ -473,50 +625,110 @@ async function scheduleMonitorDue(monitorId) {
   });
 }
 
-async function claimMonitorBatch(monitorId, limit) {
-  if (!isUuid(monitorId)) throw new Error('INVALID_MONITOR_ID');
+async function scheduleBatch() {
   return withPg(async (pg) => {
-    await pg.query('BEGIN');
-    try {
-      const { rows } = await pg.query(
-        `WITH picked AS (
-           SELECT z.id, m.url
+    const { rows } = await pg.query(
+      `INSERT INTO zadania_skanu (id, monitor_id, zaplanowano_at, status)
+         SELECT gen_random_uuid(), m.id, NOW(), 'oczekuje'
+         FROM monitory m
+         WHERE m.aktywny = true
+           AND NOT EXISTS (
+             SELECT 1
              FROM zadania_skanu z
-             JOIN monitory m ON m.id = z.monitor_id
-            WHERE z.status = 'oczekuje'
-              AND z.monitor_id = $1::uuid
-            ORDER BY z.zaplanowano_at ASC
-            LIMIT $2
-            FOR UPDATE SKIP LOCKED
-         )
-         UPDATE zadania_skanu z
-            SET status = 'przetwarzanie',
-                rozpoczecie_at = NOW()
-           FROM picked p
-          WHERE z.id = p.id
-          RETURNING z.id, z.monitor_id, p.url AS url`,
-        [monitorId, limit],
-      );
-      await pg.query('COMMIT');
-      return rows;
-    } catch (err) {
-      await pg.query('ROLLBACK');
-      throw err;
-    }
+             WHERE z.monitor_id = m.id
+               AND z.status IN ('oczekuje', 'w_trakcie')
+           )
+           AND (
+             SELECT COALESCE(MAX(z.zaplanowano_at), m.utworzono_at)
+             FROM zadania_skanu z
+             WHERE z.monitor_id = m.id
+           ) + make_interval(secs => m.interwal_sec) <= NOW()
+         ORDER BY m.utworzono_at ASC
+         LIMIT $1
+         RETURNING id`,
+      [SCHEDULE_BATCH_LIMIT],
+    );
+    return rows.length;
+  });
+}
+
+async function loadPendingTasks(limit = MAX_CONCURRENCY) {
+  return withPg(async (pg) => {
+    const { rows } = await pg.query(
+      `UPDATE zadania_skanu
+          SET status = 'w_trakcie',
+              rozpoczecie_at = NOW()
+        WHERE id IN (
+          SELECT id
+          FROM zadania_skanu
+          WHERE status = 'oczekuje'
+          ORDER BY zaplanowano_at ASC
+          LIMIT $1
+        )
+        RETURNING *`,
+      [limit],
+    );
+    return rows;
+  });
+}
+
+async function loadPendingTasksForMonitor(monitorId, limit = MAX_CONCURRENCY) {
+  return withPg(async (pg) => {
+    const { rows } = await pg.query(
+      `UPDATE zadania_skanu
+          SET status = 'w_trakcie',
+              rozpoczecie_at = NOW()
+        WHERE id IN (
+          SELECT id
+          FROM zadania_skanu
+          WHERE status = 'oczekuje'
+            AND monitor_id = $1
+          ORDER BY zaplanowano_at ASC
+          LIMIT $2
+        )
+        RETURNING *`,
+      [monitorId, limit],
+    );
+    return rows;
   });
 }
 
 async function loadMonitor(pg, monitorId) {
   const { rows } = await pg.query(
-    `SELECT id, url, tryb_skanu, css_selector
+    `SELECT id, uzytkownik_id, nazwa, url, llm_prompt, interwal_sec, aktywny, utworzono_at, tryb_skanu, css_selector
        FROM monitory
-      WHERE id = $1`,
+       WHERE id = $1`,
     [monitorId],
   );
+  if (!rows.length) return null;
   return rows[0];
 }
 
-async function finishTask(taskId, { status, blad_opis, tresc_hash, snapshot_mongo_id }) {
+function isPriceMissing(extracted) {
+  if (!extracted) return true;
+  if (extracted.price === undefined || extracted.price === null || extracted.price === '') {
+    return true;
+  }
+  // w przyszłości możesz tu dodać np. extracted.attributes.price itp.
+  return false;
+}
+
+// Na podstawie llm_prompt monitora sprawdzamy,
+// czy użytkownik oczekuje monitorowania CENY.
+function wantsPricePlugin(monitor) {
+  const prompt = (monitor.llm_prompt || '').toString();
+
+  // szukamy słowa "cena" lub "price" jako osobnego słowa (case-insensitive)
+  if (/\bcena\b/i.test(prompt)) return true;
+  if (/\bprice\b/i.test(prompt)) return true;
+
+  return false;
+}
+
+
+async function finishTask(taskId, {
+  status, blad_opis, tresc_hash, snapshot_mongo_id,
+}) {
   await withPg(async (pg) => {
     await pg.query(
       `UPDATE zadania_skanu
@@ -531,23 +743,30 @@ async function finishTask(taskId, { status, blad_opis, tresc_hash, snapshot_mong
   });
 }
 
+
 async function markMonitorRequiresIntervention(monitorId, { reason, snapshotId } = {}) {
   if (!monitorId) return;
+
   try {
     await withPg(async (pg) => {
+      // ustaw status monitora
       await pg.query(
         `UPDATE monitory
-            SET status = 'wymaga_interwencji',
-                aktywny = false
-          WHERE id = $1`,
+           SET status = 'wymaga_interwencji',
+               aktywny = false
+         WHERE id = $1`,
         [monitorId],
       );
+
+      // treść powiadomienia
       const message = snapshotId
         ? `Monitor wymaga interwencji: ${reason || 'BOT_PROTECTION'} (snapshot: ${snapshotId})`
         : `Monitor wymaga interwencji: ${reason || 'BOT_PROTECTION'}`;
+
+      // zapis powiadomienia
       await pg.query(
-        `INSERT INTO powiadomienia (monitor_id, typ, tresc, utworzono_at)
-         VALUES ($1, 'monitor_blocked', $2, NOW())`,
+        `INSERT INTO powiadomienia (id, monitor_id, tresc, utworzone_at)
+           VALUES (gen_random_uuid(), $1, $2, NOW())`,
         [monitorId, message],
       );
     });
@@ -565,7 +784,7 @@ async function processTask(task) {
   if (!isUuid(taskId) || !isUuid(monitorId)) {
     await finishTask(taskId, {
       status: 'blad',
-      blad_opis: 'INVALID_UUID',
+      blad_opis: 'INVALID_IDS',
       tresc_hash: null,
       snapshot_mongo_id: null,
     });
@@ -591,8 +810,10 @@ async function processTask(task) {
 
   const targetUrl = normalizeUrl(monitor.url);
   const selector = parseSelector(monitor.css_selector);
-  const mode = determineModeByPolicy(targetUrl);
   const mongoDb = await ensureMongo();
+
+  // Czy użytkownik ewidentnie oczekuje ceny? (llm_prompt zawiera "cena"/"price")
+  const monitorWantsPrice = wantsPricePlugin(monitor);
 
   let snapshot = null;
   let blocked = false;
@@ -601,46 +822,70 @@ async function processTask(task) {
   let meta = null;
   let status = null;
   let screenshotB64 = null;
-  let staticBlockReason = null;
+
+  // tryb, który faktycznie użyliśmy
+  let mode = 'static';
 
   try {
-    if (mode === 'static') {
-      const staticResult = await scanStatic({ url: targetUrl, selector });
-      status = staticResult.status;
-      finalUrl = staticResult.finalUrl;
-      html = staticResult.html;
-      meta = staticResult.meta;
-      blocked = !staticResult.ok;
-      const htmlLower = (staticResult.html || '').toLowerCase();
-      if (status === 403) {
-        staticBlockReason = 'HTTP_403';
-      } else if (status === 429) {
-        staticBlockReason = 'HTTP_429';
-      } else if (/captcha|verify|robot|enable javascript|access denied/.test(htmlLower)) {
-        staticBlockReason = 'HTML_BLOCK_DETECTED';
-      }
-      if (staticBlockReason) {
-        blocked = true;
-      }
-    } else {
+    // ===== 1) PROBA STATYCZNA =====
+    let staticResult = null;
+
+    try {
+  staticResult = await scanStatic({ url: targetUrl, selector });
+  status = staticResult.status;
+  finalUrl = staticResult.finalUrl;
+  html = staticResult.html;
+  meta = staticResult.meta;
+
+      // ⛔ NIE ustawiamy blocked na podstawie staticResult.ok
+      // staticResult.ok == false oznacza tylko: "static się nie udał"
+      // blocked === true oznacza: "browser też nie dał rady"
+      // blocked ustawiamy dopiero PO browserze
+    } catch (err) {
+      console.warn('[task] static scan failed (exception)', err?.message || err);
+      // Static całkowicie padł → nie ma co przedłużać, browser i tak będzie konieczny
+    }
+
+
+    const needBrowserFallback =
+      !staticResult
+      || !staticResult.ok
+      || !html
+      || (typeof status === 'number' && status >= 400);
+
+    // ===== 2) FALLBACK DO BROWSER (PUPPETEER) =====
+    if (needBrowserFallback) {
+      blocked = false; // reset – dajemy szansę trybowi browser
+      mode = 'browser';
+
       const userDataDir = profilePath({ monitorId, url: targetUrl });
       const proxyUrl = pickProxy(monitorId);
       const browser = await launchWithPolicy({ userDataDir, proxyUrl });
+
       try {
-        const { ok, html: browserHtml, screenshot, finalUrl: browserFinalUrl } = await runBrowserFlow({
+        const {
+          ok,
+          html: browserHtml,
+          screenshot,
+          finalUrl: browserFinalUrl,
+        } = await runBrowserFlow({
           browser,
           url: targetUrl,
           mongoDb,
           monitorId,
         });
+
         blocked = !ok;
         html = browserHtml;
         finalUrl = browserFinalUrl;
-        status = ok ? 200 : 403;
+        status = ok ? (status || 200) : (status || 403);
         screenshotB64 = screenshot ? Buffer.from(screenshot).toString('base64') : null;
       } finally {
         await browser.close();
       }
+    } else {
+      // statyczny scan był OK
+      mode = 'static';
     }
   } catch (err) {
     console.error('[task] scan failed', err);
@@ -653,17 +898,41 @@ async function processTask(task) {
     return;
   }
 
-  if (!html) {
-    blocked = true;
+  // ===== 2.5) TOTALNA PORAŻKA HTML/BLOKADA → tryb plugin Fallback =====
+  if (!html || blocked) {
+    // utwórz zadanie dla pluginu w trybie "fallback" (screenshot, pełna strona)
+    await createPluginTask({
+      monitorId,
+      taskId,
+      url: finalUrl || targetUrl,
+      mode: 'fallback',
+    });
+
+    await markMonitorRequiresIntervention(monitorId, {
+      reason: 'PLUGIN_SCREENSHOT_REQUIRED',
+      snapshotId: snapshot || null,
+    });
+
+    await finishTask(taskId, {
+      status: 'blad',
+      blad_opis: 'WAITING_FOR_PLUGIN_SCREENSHOT',
+      tresc_hash: null,
+      snapshot_mongo_id: snapshot || null,
+    });
+
+    console.log(`[task] monitor=${monitorId} -> przekazany do pluginu (fallback)`);
+    return;
   }
 
+  // ===== 3) EKSTRAKCJA LLM =====
   let extracted = null;
   try {
-    // CHANGED: integrated extractOrchestrator — non breaking change
-    extracted = await fetchAndExtract(finalUrl, {
-      render: false,
-      correlationId: `task-${taskId}`,
-    });
+ extracted = await fetchAndExtract(finalUrl, {
+  render: false,
+  correlationId: `task-${taskId}`,
+  html, // <--- KLUCZOWE: dajemy mu HTML z browsera
+});
+
   } catch (err) {
     console.warn('[task] extract orchestrator failed', err);
   }
@@ -671,19 +940,16 @@ async function processTask(task) {
   const hash = html ? sha256(html) : null;
 
   const snapshotDoc = {
-    monitor_id: monitorId,
-    url: targetUrl,
-    ts: new Date(),
-    mode,
-    final_url: finalUrl,
-    html,
-    meta,
-    hash,
-    blocked,
-    block_reason: blocked ? 'BOT_PROTECTION' : null,
-    screenshot_b64: screenshotB64,
-    extracted_v2: extracted || null,
-  };
+  monitor_id: monitorId,
+  url: targetUrl,
+  ts: new Date(),
+  mode,
+  final_url: finalUrl,
+  blocked,
+  block_reason: blocked ? 'BOT_PROTECTION' : null,
+  screenshot_b64: screenshotB64,
+  extracted_v2: extracted || null,
+};
 
   try {
     snapshot = await saveSnapshotToMongo(snapshotDoc);
@@ -692,19 +958,25 @@ async function processTask(task) {
     console.error('[task] snapshot save failed', err);
   }
 
-  const shouldRunCookieScreenshot =
-    POLICY.cookieScreenshotOnBlock && mode === 'static' && Boolean(staticBlockReason);
-
-  if (shouldRunCookieScreenshot) {
-    await runCookieScreenshotFlow({
-      monitorId,
-      targetUrl: finalUrl || targetUrl,
-      logger: null,
-      proxyUrl: pickProxy(monitorId),
-    });
-  }
-
+  // ===== 3.5) BOT PROTECTION mimo wszystko (np. challenge HTML) =====
   if (blocked) {
+    if (
+      POLICY.cookieScreenshotOnBlock
+      && mode === 'static'
+      && typeof status === 'number'
+      && (status === 403 || status === 429)
+    ) {
+      try {
+        await runCookieScreenshotFlow({
+          monitorId,
+          url: finalUrl || targetUrl,
+          mongoDb,
+        });
+      } catch (err) {
+        console.warn('[task] cookie screenshot flow failed', err?.message || err);
+      }
+    }
+
     await markMonitorRequiresIntervention(monitorId, { reason: 'BOT_PROTECTION', snapshotId: snapshot });
     await finishTask(taskId, {
       status: 'blad',
@@ -715,6 +987,31 @@ async function processTask(task) {
     return;
   }
 
+  // ===== 4) PRICE-ONLY: brak ceny, ale user w promptcie zaznaczył "CENA" =====
+  const shouldCreatePriceOnlyTask =
+    !blocked
+    && monitorWantsPrice
+    && isPriceMissing(extracted);
+
+  if (shouldCreatePriceOnlyTask) {
+    try {
+      await createPluginTask({
+        monitorId,
+        taskId,
+        url: finalUrl || targetUrl,
+        mode: 'price_only',
+      });
+      console.log(
+        `[task] monitor=${monitorId} task=${taskId} -> plugin_task(mode=price_only) created (missing price, llm_prompt wants price)`,
+      );
+    } catch (err) {
+      console.warn('[task] failed to create price_only plugin task', err?.message || err);
+    }
+  }
+
+  // ===== 5) SKAN UDANY – ZAPISZ UŻYTY TRYB W "monitory.tryb_skanu" =====
+  await updateMonitorScanMode(monitorId, mode);
+
   await finishTask(taskId, {
     status: 'ok',
     blad_opis: null,
@@ -722,88 +1019,180 @@ async function processTask(task) {
     snapshot_mongo_id: snapshot,
   });
 
-  console.log(`[task] done monitor=${monitorId} status=${status}`);
+  console.log(`[task] done monitor=${monitorId} status=${status} mode=${mode}`);
 }
+
+
+function buildCleanSnapshot({
+  extracted,
+  monitorId,
+  targetUrl,
+  finalUrl,
+  mode,
+  blocked,
+  screenshotB64,
+  hash,
+  domPriceText,
+}) {
+  // 1) baza z extractora
+  let price = extracted?.price || null;
+  let currency = extracted?.currency || null;
+
+  // 2) fallback: jeśli extractor nie znalazł ceny, spróbujmy z domPriceText
+  if (!price && domPriceText) {
+    const text = domPriceText.trim();
+
+    const currencyRe = /(zł|pln|eur|€|usd|\$|£)/i;
+    const priceWithCurrRe = /(\d[\d\s.,]*\d?)\s*(zł|pln|eur|€|usd|\$|£)/i;
+    const numberRe = /(\d[\d\s.,]*\d?)/;
+
+    const withCurr = text.match(priceWithCurrRe);
+    if (withCurr) {
+      const valuePart = withCurr[1].trim();
+      const currPart = withCurr[2].trim().toLowerCase();
+
+      price = `${valuePart} ${withCurr[2].trim()}`;
+
+      if (currPart.includes('zł') || currPart === 'pln') currency = 'PLN';
+      else if (currPart.includes('eur') || currPart === '€') currency = 'EUR';
+      else if (currPart.includes('usd') || currPart === '$') currency = 'USD';
+      else if (currPart.includes('£')) currency = 'GBP';
+    } else {
+      // brak waluty – weźmy samą liczbę (np. "9 876" z widgetu Booking)
+      const num = text.match(numberRe);
+      if (num) {
+        price = num[1].trim();
+        // currency zostaje null – LLM sobie poradzi, że to "cena bez waluty"
+      }
+    }
+  }
+
+  const clean = {
+    monitor_id: monitorId,
+    url: targetUrl,
+    final_url: finalUrl,
+    ts: new Date(),
+    mode,
+    blocked: !!blocked,
+    block_reason: blocked ? (extracted?.block_reason || 'BOT_PROTECTION') : null,
+    screenshot_b64: blocked ? screenshotB64 || null : null,
+    hash,
+
+    title: extracted?.title || null,
+    description: extracted?.description || null,
+    text: extracted?.text || null,
+    content_type: extracted?.contentType || null,
+
+    price: price || null,
+    currency: currency || null,
+
+    images: Array.isArray(extracted?.images) ? extracted.images.slice(0, 10) : [],
+    attributes: extracted?.attributes || {},
+
+    extractor: extracted?.extractor || null,
+    confidence: extracted?.confidence || null,
+
+    html_truncated: null,
+
+    // do debugowania – surowy tekst ceny z DOM
+    price_dom_text: domPriceText || null,
+  };
+
+  return clean;
+}
+
+
+
+
 
 function parseSelector(raw) {
   if (!raw) return null;
   const trimmed = String(raw).trim();
   if (!trimmed) return null;
-  try {
-    const parsed = JSON.parse(trimmed);
-    if (typeof parsed === 'string') return parsed;
-    if (typeof parsed.selector === 'string') return parsed.selector;
-    if (typeof parsed.css_selector === 'string') return parsed.css_selector;
-    if (typeof parsed.cssSelector === 'string') return parsed.cssSelector;
-  } catch (_) {}
   return trimmed;
 }
 
-async function runExecutionCycle(monitorId) {
-  if (!isUuid(monitorId)) throw new Error('INVALID_MONITOR_ID');
+function normalizeUrl(raw) {
   try {
-    const scheduled = await scheduleMonitorDue(monitorId);
-    if (scheduled) {
-      console.log(`[plan] scheduled ${scheduled} tasks`);
+    const url = new URL(raw);
+    url.hash = '';
+    return url.toString();
+  } catch (_) {
+    return raw;
+  }
+}
+
+function sha256(value) {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+
+function extractPlainTextFromHtml(html) {
+  if (!html) return null;
+  try {
+    const dom = new JSDOM(html);
+    const doc = dom.window.document;
+    if (!doc || !doc.body) return null;
+
+    // bierzemy tekst z body
+    let text = doc.body.textContent || '';
+
+    // normalizacja białych znaków
+    text = text.replace(/\s+/g, ' ').trim();
+
+    // globalne przycięcie, żeby nie mieć kilkuset KB
+    const MAX_LEN = 20000; // ~20k znaków wystarczy pod LLM-a
+    if (text.length > MAX_LEN) {
+      text = text.slice(0, MAX_LEN);
     }
-  } catch (err) {
-    console.error('[plan] schedule error', err);
-  }
 
+    return text || null;
+  } catch {
+    return null;
+  }
+}
+
+
+
+
+async function runExecutionCycle(singleMonitorId) {
   let tasks = [];
-  try {
-    tasks = await claimMonitorBatch(monitorId, SCHEDULE_BATCH_LIMIT);
-  } catch (err) {
-    console.error('[plan] claim error', err);
-    return;
+
+  if (singleMonitorId) {
+    const inserted = await scheduleMonitorDue(singleMonitorId);
+    console.log(`[plan] scheduled ${inserted} tasks (single monitor)`);
+
+    tasks = await loadPendingTasksForMonitor(singleMonitorId, MAX_CONCURRENCY);
+  } else {
+    const scheduled = await scheduleBatch();
+    console.log(`[plan] scheduled ${scheduled} tasks`);
+
+    tasks = await loadPendingTasks(MAX_CONCURRENCY);
   }
 
-  for (const task of tasks) {
-    queue.add(() => processTask(task)).catch((err) => {
-      console.error('[task] fatal error', err);
-    });
-  }
+  console.log(`[plan] picked ${tasks.length} tasks`);
+
+  tasks.forEach((t) => {
+    queue.add(() => processTask(t));
+  });
 
   await queue.onIdle();
 }
 
-async function resetData() {
-  await withPg(async (pg) => {
-    await pg.query('TRUNCATE TABLE zadania_skanu;');
-  });
-  const deleted = await clearMongoSnapshots();
-  console.log(`[reset] Mongo snapshots deleted: ${deleted}`);
-}
-
-async function sanityChecks() {
-  const { rows } = await pool.query('SELECT current_database() AS db, current_user AS usr');
-  console.log('PG OK:', rows[0]);
-  const mongoDb = await ensureMongo();
-  await mongoDb.command({ ping: 1 });
-  console.log('Mongo OK');
-}
-
 async function main() {
-  const args = process.argv.slice(2);
-  const has = (flag) => args.includes(flag);
-  const getArg = (name) => {
-    const idx = args.indexOf(name);
-    if (idx >= 0 && idx + 1 < args.length) return args[idx + 1];
-    return null;
-  };
+  const monitorId = process.argv.includes('--monitor-id')
+    ? process.argv[process.argv.indexOf('--monitor-id') + 1]
+    : null;
+  const once = process.argv.includes('--once');
+  const clearSnapshots = process.argv.includes('--clear-snapshots');
 
-  if (has('--reset')) {
-    await sanityChecks();
-    await resetData();
+  if (clearSnapshots) {
+    await clearMongoSnapshots();
     return;
   }
 
-  await sanityChecks();
-
-  const once = has('--once');
-  const monitorId = getArg('--monitor-id');
-  if (!monitorId || !isUuid(monitorId)) {
-    console.error('[cli] valid --monitor-id is required');
+  if (monitorId && !isUuid(monitorId)) {
+    console.error('Invalid monitor id');
     process.exit(1);
   }
 
@@ -825,3 +1214,4 @@ main().catch((err) => {
   console.error('FATAL:', err);
   process.exit(1);
 });
+

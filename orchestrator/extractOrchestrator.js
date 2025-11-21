@@ -257,6 +257,8 @@ export async function fetchAndExtract(url, options = {}) {
   const correlationId = options.correlationId || randomUUID();
   const logger = createLogger(correlationId);
   const allowRender = options.render;
+  const providedHtml = options.html || null;   // <--- NOWE
+
   const base = {
     url,
     fetchedAt: new Date().toISOString(),
@@ -276,22 +278,44 @@ export async function fetchAndExtract(url, options = {}) {
   };
 
   try {
-    const staticResult = await fetchStaticDocument(url, logger, correlationId);
-    if (staticResult.blocked) {
-      return enrichResult(base, staticResult.result);
+    let doc;
+    let html;
+    let finalUrl = url;
+    let status = 200;
+
+    if (providedHtml) {
+      // 1) UŻYWAMY HTML OD AGENTA – ŻADNEGO FETCHA
+      logger.log('info', 'use_provided_html', { url });
+      html = providedHtml;
+      doc = createDocument(html, finalUrl);
+    } else {
+      // 2) STARE ZACHOWANIE – FETCH STATYCZNY + EW. RENDER
+      const staticResult = await fetchStaticDocument(url, logger, correlationId);
+      if (staticResult.blocked) {
+        return enrichResult(base, staticResult.result);
+      }
+      ({ doc, html, finalUrl, status } = staticResult);
     }
-    const { doc, html, finalUrl } = staticResult;
+
     const extracted = await runExtractors(doc, html, { url: finalUrl }, logger);
     let combined = enrichResult(base, { ...extracted, url: finalUrl });
-    if (combined.confidence < 0.4 && allowRender !== false) {
+
+    // fallback z renderem TYLKO gdy NIE mieliśmy providedHtml
+    if (!providedHtml && combined.confidence < 0.4 && allowRender !== false) {
       logger.log('info', 'render_fallback_triggered', { confidence: combined.confidence });
       const renderResult = await renderDocument(finalUrl, logger, correlationId);
       if (renderResult.blocked) {
         return enrichResult(base, renderResult.result);
       }
-      const extractedRendered = await runExtractors(renderResult.doc, renderResult.html, { url: renderResult.finalUrl }, logger);
+      const extractedRendered = await runExtractors(
+        renderResult.doc,
+        renderResult.html,
+        { url: renderResult.finalUrl },
+        logger,
+      );
       combined = enrichResult(base, { ...extractedRendered, url: renderResult.finalUrl });
     }
+
     return combined;
   } catch (err) {
     logger.log('error', 'fetch_extract_failed', { message: err.message });
@@ -303,3 +327,5 @@ export async function fetchAndExtract(url, options = {}) {
     });
   }
 }
+
+
