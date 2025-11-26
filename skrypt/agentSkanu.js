@@ -9,11 +9,13 @@ import dotenv from 'dotenv';
 import PQueue from 'p-queue';
 import { JSDOM } from 'jsdom';
 import puppeteer from 'puppeteer-extra';
-// import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import AnonymizeUAPlugin from 'puppeteer-extra-plugin-anonymize-ua';
 
 import { pool } from './polaczeniePG.js';
 import { mongoClient } from './polaczenieMDB.js';
 import { fetchAndExtract } from '../orchestrator/extractOrchestrator.js';
+import { handleNewSnapshot } from './llm/pipelineZmian.js';
 
 setDefaultResultOrder('ipv4first');
 
@@ -22,6 +24,9 @@ const __dirname = path.dirname(__filename);
 
 dotenv.config({ path: path.resolve(__dirname, '.env') });
 console.log('AGENT VERSION: 2.1 clean snapshot');
+
+puppeteer.use(StealthPlugin());
+puppeteer.use(AnonymizeUAPlugin({ makeWindows: true }));
 // puppeteer.use(StealthPlugin());
 
 const fetchFn = globalThis.fetch ?? (await import('node-fetch')).default;
@@ -63,6 +68,24 @@ export const POLICY = {
   cookieScreenshotOnBlock: true,
 };
 
+
+// ===== browser fingerprint (nagłówki jak zwykły Chrome na Windows) =====
+const BROWSER_FINGERPRINT = {
+  userAgent:
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+    'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+    'Chrome/124.0.0.0 Safari/537.36',
+
+  platform: 'Win32',
+  acceptLanguage: 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+
+  secChUa: '"Chromium";v="124", "Not:A-Brand";v="99"',
+  secChUaPlatform: '"Windows"',
+  secChUaMobile: '?0',
+};
+
+
+
 // ===== determine-mode (policy-driven) =====
 export function determineModeByPolicy(url) {
   const host = new URL(url).hostname;
@@ -79,6 +102,18 @@ export function profilePath({ monitorId, url, rootDir = POLICY.session.rootDir }
 }
 
 // ===== browser launcher =====
+function randomViewport() {
+  const baseW = 1366;
+  const baseH = 768;
+  const jitterW = Math.floor(Math.random() * 120) - 60; // +/- 60px
+  const jitterH = Math.floor(Math.random() * 120) - 60;
+  return {
+    width: baseW + jitterW,
+    height: baseH + jitterH,
+  };
+}
+
+
 export async function launchWithPolicy({ userDataDir, proxyUrl } = {}) {
   const args = [
     '--no-sandbox',
@@ -86,6 +121,7 @@ export async function launchWithPolicy({ userDataDir, proxyUrl } = {}) {
     '--lang=pl-PL',
     '--window-size=1366,768',
     '--disable-blink-features=AutomationControlled',
+    '--disable-features=IsolateOrigins,site-per-process',
   ];
 
   if (proxyUrl) {
@@ -96,15 +132,18 @@ export async function launchWithPolicy({ userDataDir, proxyUrl } = {}) {
     headless: POLICY.chrome.headless,
     userDataDir,
     args,
-    defaultViewport: POLICY.chrome.viewport,
+    defaultViewport: randomViewport(),   // <---
     protocolTimeout: 120_000,
   });
 }
 
+
+// ===== page hardening (stealth tweaks) =====
 // ===== page hardening (stealth tweaks) =====
 export async function hardenPage(page) {
   const client = await page.target().createCDPSession();
 
+  // timezone / locale / geolokacja
   await client.send('Emulation.setTimezoneOverride', { timezoneId: POLICY.locale.timezone });
   await client.send('Emulation.setLocaleOverride', { locale: POLICY.locale.locale });
   await client.send('Emulation.setGeolocationOverride', {
@@ -113,14 +152,49 @@ export async function hardenPage(page) {
     accuracy: POLICY.locale.geolocation.accuracy,
   });
 
-  await page.evaluateOnNewDocument(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => false });
-    Object.defineProperty(navigator, 'languages', { get: () => ['pl-PL', 'pl', 'en-US', 'en'] });
-    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+  // user-agent + nagłówki jak przeglądarka
+  await page.setUserAgent(BROWSER_FINGERPRINT.userAgent);
+  await page.setExtraHTTPHeaders({
+    'Accept-Language': BROWSER_FINGERPRINT.acceptLanguage,
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-CH-UA': BROWSER_FINGERPRINT.secChUa,
+    'Sec-CH-UA-Platform': BROWSER_FINGERPRINT.secChUaPlatform,
+    'Sec-CH-UA-Mobile': BROWSER_FINGERPRINT.secChUaMobile,
   });
+
+  // drobne poprawki navigatora (na wierzchu stealth pluginu)
+  await page.evaluateOnNewDocument((fp) => {
+    const override = (obj, prop, value) => {
+      try {
+        Object.defineProperty(obj, prop, {
+          get: () => value,
+          configurable: true,
+        });
+      } catch (_) {}
+    };
+
+    override(navigator, 'webdriver', false);
+    override(navigator, 'languages', ['pl-PL', 'pl', 'en-US', 'en']);
+    override(navigator, 'platform', fp.platform);
+    override(navigator, 'userAgent', fp.userAgent);
+    override(navigator, 'hardwareConcurrency', 8);
+    override(navigator, 'deviceMemory', 8);
+
+    // proste "plugins" żeby nie było pustej listy
+    override(navigator, 'plugins', [1, 2, 3]);
+
+    // lekki patch permissions, żeby nie sypało „denied” dla notifications
+    const origQuery = window.navigator.permissions?.query;
+    if (origQuery) {
+      window.navigator.permissions.query = (parameters) => (
+        parameters && parameters.name === 'notifications'
+          ? Promise.resolve({ state: 'prompt' })
+          : origQuery(parameters)
+      );
+    }
+  }, BROWSER_FINGERPRINT);
 }
 
-// ===== session persistence (Mongo) =====
 export async function restoreSession(page, mongoDb, { monitorId, origin }) {
   if (!mongoDb || POLICY.session.persistToMongo === false) return;
 
@@ -129,13 +203,18 @@ export async function restoreSession(page, mongoDb, { monitorId, origin }) {
 
   const client = await page.target().createCDPSession();
   await client.send('Network.enable');
-  session.cookies.forEach(async (cookie) => {
+
+  for (const cookie of session.cookies || []) {
     try {
+      // upewniamy się, że path istnieje
       await client.send('Network.setCookie', { ...cookie, path: cookie.path || '/' });
-    } catch (_) {}
-  });
+    } catch (_) {
+      // ignoruj pojedyncze błędy ciasteczek
+    }
+  }
 
   await page.goto(origin, { waitUntil: 'domcontentloaded', timeout: 20_000 });
+
   if (session.localStorage && Object.keys(session.localStorage).length) {
     await page.evaluate((ls) => {
       Object.entries(ls).forEach(([k, v]) => {
@@ -202,13 +281,20 @@ export async function handleCookieConsent(page) {
 
 async function humanize(page) {
   const steps = 2 + Math.floor(Math.random() * 2);
+
+  // losowe pozycje myszy
+  await page.mouse.move(
+    200 + Math.random() * 400,
+    150 + Math.random() * 300,
+    { steps: 5 },
+  );
+
   for (let i = 0; i < steps; i += 1) {
-    // eslint-disable-next-line no-await-in-loop
     await sleep(300 + Math.random() * 400);
-    // eslint-disable-next-line no-await-in-loop
     await page.mouse.wheel({ deltaY: 250 + Math.random() * 300 });
   }
 }
+
 
 async function waitForAny(page, selectors, timeoutMs = 8_000) {
   const start = Date.now();
@@ -228,15 +314,29 @@ function detectBotProtection(html) {
   if (!html) return false;
 
   const patterns = [
+    // klasyczne WAF / bot protection
     /JavaScript is disabled/i,
     /verify that you'?re not a robot/i,
     /AwsWafIntegration/i,
     /__challenge_/i,
     /window\.awsWafCookieDomainList/i,
+
+    // strony wymagające włączenia JavaScript (również PL)
+    /enable javascript/i,
+    /please enable javascript/i,
+    /this (site|page) requires javascript/i,
+    /to use this (site|page),? (you )?must enable javascript/i,
+
+    /włącz javascript/i,
+    /wlacz javascript/i,
+    /aktywuj javascript/i,
+    /ta strona wymaga javascript/i,
+    /strona wymaga włączenia javascript/i,
   ];
 
   return patterns.some((re) => re.test(html));
 }
+
 
 
 export async function runBrowserFlow({ browser, url, mongoDb, monitorId, takeScreenshot = false }) {
@@ -266,6 +366,11 @@ export async function runBrowserFlow({ browser, url, mongoDb, monitorId, takeScr
   );
 
   const html = await page.content();
+
+  // dodatkowa detekcja WAF/challenge
+  const wafBlocked = detectBotProtection(html);
+  const effectiveOk = ok && !wafBlocked;
+
   const screenshot = takeScreenshot
     ? await page.screenshot({ type: 'jpeg', quality: 60, fullPage: false })
     : null;
@@ -365,8 +470,9 @@ export async function runBrowserFlow({ browser, url, mongoDb, monitorId, takeScr
   await persistSession(page, mongoDb, { monitorId, origin });
   await page.close();
 
-  return { ok, html, screenshot, finalUrl, domPriceText };
+  return { ok: effectiveOk, html, screenshot, finalUrl, domPriceText };
 }
+
 
 
 
@@ -437,12 +543,14 @@ function isUuid(value) {
 }
 
 async function ensureMongo() {
+  const dbName = process.env.MONGO_DB || 'inzynierka';
   if (mongoClient.topology?.isConnected?.()) {
-    return mongoClient.db(process.env.MONGO_DB || 'monitor');
+    return mongoClient.db(dbName);
   }
   await mongoClient.connect();
-  return mongoClient.db(process.env.MONGO_DB || 'monitor');
+  return mongoClient.db(dbName);
 }
+
 
 async function saveSnapshotToMongo(doc) {
   const db = await ensureMongo();
@@ -450,6 +558,8 @@ async function saveSnapshotToMongo(doc) {
   const { insertedId } = await collection.insertOne(doc);
   return insertedId?.toString() ?? null;
 }
+
+
 
 async function clearMongoSnapshots() {
   const db = await ensureMongo();
@@ -479,12 +589,19 @@ async function scanStatic({ url, selector }) {
     response = await fetchFn(url, {
       redirect: 'follow',
       signal: controller.signal,
-      headers: {
-        'user-agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-          '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'accept-language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
-      },
+          headers: {
+      'user-agent': BROWSER_FINGERPRINT.userAgent,
+      'accept-language': BROWSER_FINGERPRINT.acceptLanguage,
+      accept:
+        'text/html,application/xhtml+xml,application/xml;q=0.9,' +
+        'image/avif,image/webp,image/apng,*/*;q=0.8,' +
+        'application/signed-exchange;v=b3;q=0.7',
+      'upgrade-insecure-requests': '1',
+      'sec-ch-ua': BROWSER_FINGERPRINT.secChUa,
+      'sec-ch-ua-platform': BROWSER_FINGERPRINT.secChUaPlatform,
+      'sec-ch-ua-mobile': BROWSER_FINGERPRINT.secChUaMobile,
+    },
+
     });
   } finally {
     clearTimeout(timer);
@@ -504,21 +621,18 @@ async function scanStatic({ url, selector }) {
     };
   }
 
-  const buffer = await response.arrayBuffer();
-  const content = Buffer.from(buffer).toString('utf8');
+const buffer = await response.arrayBuffer();
+const content = Buffer.from(buffer).toString('utf8');
 
-  const lower = content.toLowerCase();
-  const isChallenge =
-    lower.includes('javascript is disabled') ||
-    lower.includes('awswafintegration') ||
-    lower.includes('__challenge_') ||
-    lower.includes("verify that you're not a robot");
+// używamy tej samej logiki co w trybie browser
+const isChallenge = detectBotProtection(content);
 
-  const ok = status >= 200 && status < 400 && !isChallenge;
+const ok = status >= 200 && status < 400 && !isChallenge;
 
-  if (isChallenge) {
-    console.log('[static] detected WAF/challenge page, static ok=false');
-  }
+if (isChallenge) {
+  console.log('[static] detected WAF/challenge or JS-required page, static ok=false');
+}
+
 
   let meta = null;
   try {
@@ -775,6 +889,30 @@ async function markMonitorRequiresIntervention(monitorId, { reason, snapshotId }
   }
 }
 
+
+const browserPool = new Map(); // key: userDataDir / monitorId / proxy
+
+async function getBrowser({ userDataDir, proxyUrl }) {
+  const key = `${userDataDir || 'default'}|${proxyUrl || 'none'}`;
+  const existing = browserPool.get(key);
+  if (existing && existing.isConnected()) return existing;
+
+  const browser = await launchWithPolicy({ userDataDir, proxyUrl });
+  browserPool.set(key, browser);
+  return browser;
+}
+
+async function closeAllBrowsers() {
+  for (const br of browserPool.values()) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await br.close();
+    } catch (_) {}
+  }
+  browserPool.clear();
+}
+
+
 const queue = new PQueue({ concurrency: MAX_CONCURRENCY });
 
 async function processTask(task) {
@@ -859,30 +997,27 @@ async function processTask(task) {
       mode = 'browser';
 
       const userDataDir = profilePath({ monitorId, url: targetUrl });
-      const proxyUrl = pickProxy(monitorId);
-      const browser = await launchWithPolicy({ userDataDir, proxyUrl });
+    const proxyUrl = pickProxy(monitorId);
+    const browser = await getBrowser({ userDataDir, proxyUrl });
 
-      try {
-        const {
-          ok,
-          html: browserHtml,
-          screenshot,
-          finalUrl: browserFinalUrl,
-        } = await runBrowserFlow({
-          browser,
-          url: targetUrl,
-          mongoDb,
-          monitorId,
-        });
+    const {
+      ok,
+      html: browserHtml,
+      screenshot,
+      finalUrl: browserFinalUrl,
+    } = await runBrowserFlow({
+      browser,
+      url: targetUrl,
+      mongoDb,
+      monitorId,
+    });
 
-        blocked = !ok;
-        html = browserHtml;
-        finalUrl = browserFinalUrl;
-        status = ok ? (status || 200) : (status || 403);
-        screenshotB64 = screenshot ? Buffer.from(screenshot).toString('base64') : null;
-      } finally {
-        await browser.close();
-      }
+    blocked = !ok;
+    html = browserHtml;
+    finalUrl = browserFinalUrl;
+    status = ok ? (status || 200) : (status || 403);
+    screenshotB64 = screenshot ? Buffer.from(screenshot).toString('base64') : null;
+
     } else {
       // statyczny scan był OK
       mode = 'static';
@@ -899,12 +1034,18 @@ async function processTask(task) {
   }
 
   // ===== 2.5) TOTALNA PORAŻKA HTML/BLOKADA → tryb plugin Fallback =====
-  if (!html || blocked) {
+  // Uwaga:
+  //  - dla monitorów nastawionych na CENĘ (llm_prompt zawiera "cena"/"price")
+  //    nie używamy trybu "fallback" – zamiast tego później tworzymy zadanie
+  //    pluginu w trybie "price_only", które dorzuci ceny do najnowszego snapshota.
+  //  - tryb "fallback" zostaje tylko dla monitorów, które NIE są cenowe.
+  if (!monitorWantsPrice && (!html || blocked)) {
     // utwórz zadanie dla pluginu w trybie "fallback" (screenshot, pełna strona)
     await createPluginTask({
       monitorId,
       taskId,
-      url: finalUrl || targetUrl,
+      // używamy zawsze oryginalnego URL-a monitora (pełny link z parametrami)
+      url: targetUrl,
       mode: 'fallback',
     });
 
@@ -924,6 +1065,7 @@ async function processTask(task) {
     return;
   }
 
+
   // ===== 3) EKSTRAKCJA LLM =====
   let extracted = null;
   try {
@@ -939,8 +1081,9 @@ async function processTask(task) {
 
   const hash = html ? sha256(html) : null;
 
-  const snapshotDoc = {
+const snapshotDoc = {
   monitor_id: monitorId,
+  zadanie_id: taskId,       // <<< TO MUSI BYĆ
   url: targetUrl,
   ts: new Date(),
   mode,
@@ -951,6 +1094,8 @@ async function processTask(task) {
   extracted_v2: extracted || null,
 };
 
+
+
   try {
     snapshot = await saveSnapshotToMongo(snapshotDoc);
     console.log(`[task] snapshot stored id=${snapshot}`);
@@ -959,38 +1104,43 @@ async function processTask(task) {
   }
 
   // ===== 3.5) BOT PROTECTION mimo wszystko (np. challenge HTML) =====
-  if (blocked) {
-    if (
-      POLICY.cookieScreenshotOnBlock
-      && mode === 'static'
-      && typeof status === 'number'
-      && (status === 403 || status === 429)
-    ) {
-      try {
-        await runCookieScreenshotFlow({
-          monitorId,
-          url: finalUrl || targetUrl,
-          mongoDb,
-        });
-      } catch (err) {
-        console.warn('[task] cookie screenshot flow failed', err?.message || err);
-      }
+  // ===== 3.5) BOT PROTECTION mimo wszystko (np. challenge HTML) =====
+if (blocked && !monitorWantsPrice) {
+  if (
+    POLICY.cookieScreenshotOnBlock
+    && mode === 'static'
+    && typeof status === 'number'
+    && (status === 403 || status === 429)
+  ) {
+    try {
+      await runCookieScreenshotFlow({
+        monitorId,
+        url: finalUrl || targetUrl,
+        mongoDb,
+      });
+    } catch (err) {
+      console.warn('[task] cookie screenshot flow failed', err?.message || err);
     }
-
-    await markMonitorRequiresIntervention(monitorId, { reason: 'BOT_PROTECTION', snapshotId: snapshot });
-    await finishTask(taskId, {
-      status: 'blad',
-      blad_opis: 'BOT_PROTECTION',
-      tresc_hash: null,
-      snapshot_mongo_id: snapshot,
-    });
-    return;
   }
 
-  // ===== 4) PRICE-ONLY: brak ceny, ale user w promptcie zaznaczył "CENA" =====
+  await markMonitorRequiresIntervention(monitorId, { reason: 'BOT_PROTECTION', snapshotId: snapshot });
+  await finishTask(taskId, {
+    status: 'blad',
+    blad_opis: 'BOT_PROTECTION',
+    tresc_hash: null,
+    snapshot_mongo_id: snapshot,
+  });
+  return;
+}
+
+
+// ===== 4) PRICE-ONLY: brak ceny, ale user w promptcie zaznaczył "CENA" =====
+  // Dla monitorów, które w promptcie mają słowo "cena" lub "price",
+  // jeśli po całym flow (static + browser + extract) dalej NIE mamy ceny,
+  // tworzymy zadanie pluginu w trybie "price_only". Plugin dorzuci wtedy
+  // tablicę wszystkich znalezionych cen do najnowszego snapshota.
   const shouldCreatePriceOnlyTask =
-    !blocked
-    && monitorWantsPrice
+    monitorWantsPrice
     && isPriceMissing(extracted);
 
   if (shouldCreatePriceOnlyTask) {
@@ -998,7 +1148,8 @@ async function processTask(task) {
       await createPluginTask({
         monitorId,
         taskId,
-        url: finalUrl || targetUrl,
+        // zawsze podajemy pełny URL z monitora
+        url: targetUrl,
         mode: 'price_only',
       });
       console.log(
@@ -1008,6 +1159,12 @@ async function processTask(task) {
       console.warn('[task] failed to create price_only plugin task', err?.message || err);
     }
   }
+    if (!shouldCreatePriceOnlyTask && snapshot) {
+    handleNewSnapshot(snapshot).catch((err) => {
+      console.error('[task] Błąd pipelineZmian dla snapshotu:', snapshot, err);
+    });
+  }
+
 
   // ===== 5) SKAN UDANY – ZAPISZ UŻYTY TRYB W "monitory.tryb_skanu" =====
   await updateMonitorScanMode(monitorId, mode);
