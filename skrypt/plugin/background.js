@@ -42,6 +42,32 @@ async function fetchNextPluginTask() {
   }
 }
 
+// ===== DOM extractor do backendu (HTML + tekst) =====
+
+function extractDomForBackend() {
+  try {
+    const htmlEl = document.documentElement;
+    const body = document.body;
+
+    const html = htmlEl ? htmlEl.outerHTML : null;
+    const text = body ? body.innerText : null;
+
+    return {
+      html,
+      text,
+      finalUrl: window.location.href,
+    };
+  } catch (e) {
+    return {
+      html: null,
+      text: null,
+      finalUrl: window.location.href,
+    };
+  }
+}
+
+
+
 // ===== Fallback: screenshot =====
 
 async function sendPluginScreenshotResult({ task_id, monitor_id, screenshotDataUrl, url }) {
@@ -68,6 +94,52 @@ async function sendPluginScreenshotResult({ task_id, monitor_id, screenshotDataU
     console.error('[plugin] sendPluginScreenshotResult error', err);
   }
 }
+
+// ===== Fallback: DOM (plus opcjonalny screenshot) =====
+
+async function sendPluginDomResult({
+  task_id,
+  monitor_id,
+  url,
+  html,
+  text,
+  screenshotDataUrl,
+}) {
+  try {
+    const body = {
+      monitor_id,
+      url: url || null,
+    };
+
+    if (typeof html === 'string') body.html = html;
+    if (typeof text === 'string') body.text = text;
+
+    if (screenshotDataUrl) {
+      // obetnij prefix data:image/png;base64,
+      body.screenshot_b64 =
+        screenshotDataUrl.split(',')[1] || screenshotDataUrl;
+    }
+
+    const res = await apiFetch(
+      `/api/plugin-tasks/${encodeURIComponent(task_id)}/result`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+    );
+
+    if (!res.ok) {
+      console.warn('[plugin] sendPluginDomResult non-OK', res.status);
+    } else {
+      console.log('[plugin] sendPluginDomResult OK');
+    }
+  } catch (err) {
+    console.error('[plugin] sendPluginDomResult error', err);
+  }
+}
+
+
 
 function openWindowForTask(task) {
   return new Promise((resolve, reject) => {
@@ -96,30 +168,88 @@ function waitForLoadAndScreenshot(windowId, tabId, task) {
       if (updatedTabId === tabId && changeInfo.status === 'complete') {
         chrome.tabs.onUpdated.removeListener(listener);
 
-        setTimeout(() => {
-          chrome.tabs.captureVisibleTab(windowId, { format: 'png' }, async (dataUrl) => {
-            if (chrome.runtime.lastError || !dataUrl) {
-              console.error('[plugin] captureVisibleTab error', chrome.runtime.lastError);
-              resolve(false);
+        // mały delay żeby JS na stronie zdążył się odpalić
+        setTimeout(async () => {
+          try {
+            // 1) spróbuj wyciągnąć DOM (HTML + tekst)
+            const [result] = await chrome.scripting.executeScript({
+              target: { tabId },
+              func: extractDomForBackend,
+            });
+
+            const payload = (result && result.result) || {};
+            const html = payload?.html || null;
+            const text = payload?.text || null;
+            const finalUrl = payload?.finalUrl || tab.url;
+
+            if (html || text) {
+              console.log(
+                '[plugin] DOM extracted, sending to backend (bez screena)...',
+              );
+
+              await sendPluginDomResult({
+                task_id: task.task_id,
+                monitor_id: task.monitor_id,
+                url: finalUrl,
+                html,
+                text,
+                screenshotDataUrl: null,
+              });
+
+              chrome.windows.remove(windowId, () => {
+                if (chrome.runtime.lastError) {
+                  console.warn(
+                    '[plugin] windows.remove error',
+                    chrome.runtime.lastError,
+                  );
+                }
+              });
+
+              resolve(true);
               return;
             }
 
-            console.log('[plugin] screenshot captured, sending to backend...');
-            await sendPluginScreenshotResult({
-              task_id: task.task_id,
-              monitor_id: task.monitor_id,
-              screenshotDataUrl: dataUrl,
-              url: task.url,
-            });
+            // 2) jeśli DOM pusty – dopiero wtedy screenshot jako fallback
+            console.warn(
+              '[plugin] DOM empty/undefined – robimy screenshot jako fallback...',
+            );
 
-            chrome.windows.remove(windowId, () => {
-              if (chrome.runtime.lastError) {
-                console.warn('[plugin] windows.remove error', chrome.runtime.lastError);
-              }
-            });
+            chrome.tabs.captureVisibleTab(
+              windowId,
+              { format: 'png' },
+              async (dataUrl) => {
+                if (chrome.runtime.lastError || !dataUrl) {
+                  console.error(
+                    '[plugin] captureVisibleTab error',
+                    chrome.runtime.lastError,
+                  );
+                  resolve(false);
+                  return;
+                }
 
-            resolve(true);
-          });
+                await sendPluginScreenshotResult({
+                  task_id: task.task_id,
+                  monitor_id: task.monitor_id,
+                  screenshotDataUrl: dataUrl,
+                  url: finalUrl,
+                });
+
+                chrome.windows.remove(windowId, () => {
+                  if (chrome.runtime.lastError) {
+                    console.warn(
+                      '[plugin] windows.remove error',
+                      chrome.runtime.lastError,
+                    );
+                  }
+                });
+
+                resolve(true);
+              },
+            );
+          } catch (err) {
+            console.error('[plugin] waitForLoadAndScreenshot error', err);
+            resolve(false);
+          }
         }, 3000);
       }
     };
@@ -128,19 +258,20 @@ function waitForLoadAndScreenshot(windowId, tabId, task) {
   });
 }
 
+
 // ===== Price only: wyciąganie cen z DOM =====
 
-async function sendPluginPriceResult({ task_id, monitor_id, url, prices }) {
-  try {
-    const res = await apiFetch(`/api/plugin-tasks/${encodeURIComponent(task_id)}/price`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        monitor_id: monitor_id,
-        url: url || null,
-        prices,
-      }),
-    });
+async function sendPluginPriceResult({ task_id, monitor_id, zadanie_id, url, prices }) {
+  const res = await apiFetch(`/api/plugin-tasks/${encodeURIComponent(task_id)}/price`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      monitor_id: monitor_id,
+      zadanie_id: zadanie_id,   // <--- KLUCZ MUSI BYĆ dokładnie "zadanie_id"
+      url: url || null,
+      prices,
+    }),
+  });
 
     if (!res.ok) {
       console.warn('[plugin] sendPluginPriceResult non-OK', res.status);
@@ -190,12 +321,13 @@ function waitForLoadAndExtractPrices(windowId, tabId, task) {
             const prices = (result && result.result) || [];
             console.log('[plugin] extracted prices:', prices);
 
-            await sendPluginPriceResult({
-              task_id: task.task_id,
-              monitor_id: task.monitor_id,
-              url: tab.url,
-              prices,
-            });
+        await sendPluginPriceResult({
+          task_id: task.task_id,
+          monitor_id: task.monitor_id,
+          zadanie_id: task.zadanie_id,   // <--- bierzemy z /next endpointu
+          url: tab.url,
+          prices,
+        });
 
             chrome.windows.remove(windowId, () => {
               if (chrome.runtime.lastError) {

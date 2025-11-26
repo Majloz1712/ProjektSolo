@@ -2,6 +2,8 @@
 import express from 'express';
 import { pool } from '../polaczeniePG.js';
 import { mongoClient } from '../polaczenieMDB.js';
+import { fetchAndExtract } from '../../orchestrator/extractOrchestrator.js';
+import { handleNewSnapshot } from '../llm/pipelineZmian.js';
 
 const router = express.Router();
 
@@ -9,7 +11,7 @@ async function ensureMongoDb() {
   if (!mongoClient.topology || !mongoClient.topology.isConnected?.()) {
     await mongoClient.connect();
   }
-  const dbName = process.env.MONGO_DB || 'monitor';
+  const dbName = process.env.MONGO_DB || 'inzynierka';
   return mongoClient.db(dbName);
 }
 
@@ -22,7 +24,7 @@ router.get('/next', async (req, res) => {
        FROM plugin_tasks
        WHERE status = 'pending'
        ORDER BY utworzone_at
-       LIMIT 1`
+       LIMIT 1`,
     );
 
     if (!rows.length) {
@@ -33,8 +35,8 @@ router.get('/next', async (req, res) => {
 
     await client.query(
       `UPDATE plugin_tasks
-       SET status = 'in_progress',
-           zaktualizowane_at = NOW()
+         SET status = 'in_progress',
+             zaktualizowane_at = NOW()
        WHERE id = $1`,
       [task.id],
     );
@@ -57,18 +59,31 @@ router.get('/next', async (req, res) => {
 // POST /api/plugin-tasks/:id/result  (screenshot z pluginu)
 router.post('/:id/result', async (req, res) => {
   const { id } = req.params;
-  const { monitor_id: monitorId, screenshot_b64: screenshotB64, url } = req.body || {};
+  const {
+    monitor_id: monitorId,
+    screenshot_b64: screenshotB64,
+    url,
+    html,
+    text,
+  } = req.body || {};
 
-  if (!monitorId || !screenshotB64) {
+  const hasScreenshot =
+    typeof screenshotB64 === 'string' && screenshotB64.length > 0;
+  const hasDom =
+    (typeof html === 'string' && html.length > 0) ||
+    (typeof text === 'string' && text.length > 0);
+
+  if (!monitorId || (!hasScreenshot && !hasDom)) {
     return res.status(400).json({ error: 'MISSING_FIELDS' });
   }
 
+  // 1) oznacz task jako done w PG
   const client = await pool.connect();
   try {
     await client.query(
       `UPDATE plugin_tasks
-       SET status = 'done',
-           zaktualizowane_at = NOW()
+         SET status = 'done',
+             zaktualizowane_at = NOW()
        WHERE id = $1`,
       [id],
     );
@@ -82,55 +97,113 @@ router.post('/:id/result', async (req, res) => {
     const db = await ensureMongoDb();
     const snapshots = db.collection('snapshots');
 
+    const now = new Date();
+
+    // 2) jeśli mamy DOM – przepuść przez extractory
+    let extracted = null;
+    if (hasDom) {
+      try {
+        const htmlForExtractors =
+          typeof html === 'string' && html.length > 0
+            ? html
+            : `<html><body>${text}</body></html>`;
+
+        extracted = await fetchAndExtract(url || '', {
+          render: false,
+          correlationId: `plugin-${id}`,
+          html: htmlForExtractors,
+        });
+      } catch (err) {
+        console.warn('[plugin-tasks] /:id/result extractors failed', err);
+      }
+    }
+
+    // 3) zbuduj dokument snapshotu (oddzielny, typ "plugin")
     const doc = {
       monitor_id: monitorId,
       url: url || null,
-      ts: new Date(),
+      ts: now,
       mode: 'plugin',
       final_url: url || null,
-      html: null,
-      meta: null,
-      hash: null,
       blocked: false,
       block_reason: null,
-      screenshot_b64: screenshotB64,
-      extracted_v2: null,
+      plugin_dom_text: hasDom ? text || null : null,
+      plugin_dom_fetched_at: hasDom ? now : null,
+      screenshot_b64: hasScreenshot ? screenshotB64 : null,
+      extracted_v2: extracted || null,
     };
 
     const { insertedId } = await snapshots.insertOne(doc);
+        
+    try {
+      await handleNewSnapshot(insertedId);
+    } catch (err) {
+      console.error('[plugin] LLM pipeline error (result mode):', err);
+    }
 
-    return res.json({ ok: true, snapshot_id: insertedId?.toString() ?? null });
+    return res.json({
+      ok: true,
+      snapshot_id: insertedId?.toString() ?? null,
+    });
   } catch (err) {
     console.error('[plugin-tasks] /:id/result mongo error', err);
-    return res.status(500).json({ error: 'INTERNAL_ERROR' });
+    return res.status(500).json({ error: 'SERVER_ERROR' });
   }
 });
 
 // POST /api/plugin-tasks/:id/price  (price_only z DOM)
+// POST /api/plugin-tasks/:id/price  (price_only z DOM)
 router.post('/:id/price', async (req, res) => {
   const { id } = req.params;
-  const { monitor_id: monitorId, url, prices } = req.body || {};
+  const { url, prices } = req.body || {};
 
-  if (!monitorId || !Array.isArray(prices) || !prices.length) {
-    console.warn('[plugin-tasks] /:id/price missing fields', {
-      monitorId,
+  console.log('[plugin-tasks] /:id/price RAW BODY =', req.body);
+
+  if (!Array.isArray(prices) || !prices.length) {
+    console.warn('[plugin-tasks] /:id/price missing prices', {
       hasPrices: !!prices,
     });
-    return res.status(400).json({ error: 'MISSING_FIELDS' });
+    return res.status(400).json({ error: 'MISSING_PRICES' });
   }
 
-  // 1) oznacz zadanie jako zakończone w PG
+  // 1) wyciągamy monitor_id i zadanie_id z plugin_tasks po ID zadania
   const client = await pool.connect();
+  let monitorId;
+  let zadanieId;
+
   try {
+    const { rows } = await client.query(
+      `SELECT monitor_id, zadanie_id
+         FROM plugin_tasks
+        WHERE id = $1`,
+      [id],
+    );
+
+    if (!rows.length) {
+      console.warn('[plugin-tasks] /:id/price plugin_task NOT FOUND', { id });
+      return res.status(404).json({ error: 'TASK_NOT_FOUND' });
+    }
+
+    monitorId = rows[0].monitor_id;
+    zadanieId = rows[0].zadanie_id;
+
+    console.log('[plugin-tasks] /:id/price TASK FROM DB =', {
+      id,
+      monitorId,
+      zadanieId,
+    });
+
+    // 2) oznaczamy zadanie jako zakończone
     await client.query(
       `UPDATE plugin_tasks
-       SET status = 'done',
-           zaktualizowane_at = NOW()
+         SET status = 'done',
+             zaktualizowane_at = NOW()
        WHERE id = $1`,
       [id],
     );
   } catch (err) {
-    console.error('[plugin-tasks] /:id/price PG update error', err);
+    console.error('[plugin-tasks] /:id/price PG error', err);
+    return res.status(500).json({ error: 'PG_ERROR' });
   } finally {
     client.release();
   }
@@ -139,27 +212,33 @@ router.post('/:id/price', async (req, res) => {
     const db = await ensureMongoDb();
     const snapshots = db.collection('snapshots');
 
-    // 2) bierzemy najnowszy snapshot po monitor_id
-    const snapshot = await snapshots
-      .find({ monitor_id: monitorId })
-      .sort({ ts: -1 })
-      .limit(1)
-      .next();
+    // 3) bierzemy snapshot po monitor_id + zadanie_id (TEN SAM co zrobił agent)
+    const snapshot = await snapshots.findOne({
+      monitor_id: monitorId,
+      zadanie_id: zadanieId,
+    });
 
     if (!snapshot) {
       console.warn(
-        '[plugin-tasks] /:id/price snapshot not found for monitor_id=',
-        monitorId,
-        'url=',
-        url,
+        '[plugin-tasks] /:id/price snapshot NOT FOUND',
+        { monitorId, zadanieId, url },
       );
       return res.json({ ok: true, snapshot_id: null });
     }
 
-    // 3) zapisujemy CAŁĄ tablicę wyników z pluginu w jednym polu
+    console.log(
+      '[plugin-tasks] /:id/price FOUND snapshot',
+      snapshot._id.toString(),
+      'for monitor_id=',
+      monitorId,
+      'zadanie_id=',
+      zadanieId,
+    );
+
+    // 4) aktualizujemy snapshot o ceny z pluginu
     const update = {
-      plugin_prices: prices,               // <--- JEDNO pole z wszystkimi cenami
-      plugin_price_enriched_at: new Date()
+      plugin_prices: prices,
+      plugin_price_enriched_at: new Date(),
     };
 
     await snapshots.updateOne(
@@ -167,19 +246,31 @@ router.post('/:id/price', async (req, res) => {
       { $set: update },
     );
 
+    const snapshotId = snapshot._id.toString();
+
     console.log(
       '[plugin-tasks] /:id/price saved plugin_prices for snapshot',
-      snapshot._id.toString(),
+      snapshotId,
       'count=',
       prices.length,
     );
 
-    return res.json({ ok: true, snapshot_id: snapshot._id.toString() });
+    // 5) odpalamy pipeline LLM (tu możesz mieć już swoją wersję handleNewSnapshot)
+    try {
+      console.log('[plugin] calling handleNewSnapshot for', snapshotId);
+      await handleNewSnapshot(snapshotId, { forceAnalysis: true });
+      console.log('[plugin] LLM pipeline finished for snapshot', snapshotId);
+    } catch (err) {
+      console.error('[plugin] LLM pipeline error:', err);
+    }
+
+    return res.json({ ok: true, snapshot_id: snapshotId });
   } catch (err) {
     console.error('[plugin-tasks] /:id/price mongo error', err);
     return res.status(500).json({ error: 'INTERNAL_ERROR' });
   }
 });
+
 
 export default router;
 
