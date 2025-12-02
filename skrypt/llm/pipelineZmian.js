@@ -76,22 +76,53 @@ const llmDecision = await evaluateChangeWithLLM({
   newAnalysis,
   diff,
 });
-
-
-  if (llmDecision.important === true) {
-    await saveDetectionAndNotification({
-      monitorId: snapshot.monitor_id,
-      zadanieId: snapshot.zadanie_id,        // <<< ewentualnie również tu
-      snapshotMongoId: snapshot._id,
-      diff,
-      llmDecision,
-    });
     console.log(
-      '[pipeline] Zmiana uznana za istotną – zapisano detection/notification',
-    );
-  } else {
-    console.log(
-      '[pipeline] LLM uznał zmianę za nieistotną – bez powiadomienia.',
-    );
+  '[pipeline] LLM decision =',
+  JSON.stringify(llmDecision, null, 2)
+);
+
+    // --- TWARDY WAJCHEN: zmiana cen = zawsze istotna ---
+  const pluginPricesChanged = !!(
+    diff &&
+    diff.metrics &&
+    diff.metrics.pluginPricesChanged
+  );
+
+  const importantByLLM = !!(llmDecision.parsed && llmDecision.parsed.important);
+
+  const isImportant = pluginPricesChanged || importantByLLM;
+
+  if (!isImportant) {
+    console.log('[pipeline] LLM uznał zmianę za nieistotną – bez powiadomienia.');
+    return;
   }
+
+  // Jeśli dotarliśmy tutaj, to albo LLM, albo twarde reguły mówią "ważne"
+    await saveDetectionAndNotification({
+    monitorId: snapshot.monitor_id,
+    zadanieId: snapshot.zadanie_id,
+    url: snapshot.url,               // <<< DODANE
+    snapshotMongoId: snapshot._id,
+    diff,
+    llmDecision: llmDecision.parsed || {
+      important: true,
+      category: pluginPricesChanged ? 'price_change' : 'llm_error',
+      importance_reason: pluginPricesChanged
+        ? 'Wymuszona istotność na podstawie diff.metrics.pluginPricesChanged == true.'
+        : 'Brak decyzji LLM; zapis wymuszony regułą.',
+      short_title: pluginPricesChanged
+        ? 'Zmiana cen na monitorowanej stronie'
+        : 'Zmiana uznana za istotną przez reguły',
+      short_description: pluginPricesChanged
+        ? 'Wykryto zmianę cen (plugin_prices) na monitorowanej stronie.'
+        : 'Zmiana uznana za istotną na podstawie twardych reguł.',
+    },
+  });
+
+
+  console.log('[pipeline] zapisano wykrycie/powiadomienie dla snapshot', snapshot._id.toString());
 }
+
+
+
+
