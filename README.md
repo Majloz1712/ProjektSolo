@@ -7,6 +7,7 @@ Monorepo łączące backend monitoringu stron (Express + PostgreSQL + MongoDB), 
 - [Szybki start](#szybki-start)
 - [Najważniejsze komponenty](#najważniejsze-komponenty)
 - [Dokumentacja architektury](#dokumentacja-architektury)
+- [Dokumentacja plików](#dokumentacja-plików)
 
 ## Struktura katalogów
 - `extractors/` – warstwa ekstrakcji HTML/DOM (JSON-LD, OpenGraph, Readability, heurystyka tekstu) i opis pipeline'u.
@@ -47,3 +48,6 @@ Monorepo łączące backend monitoringu stron (Express + PostgreSQL + MongoDB), 
 
 ## Dokumentacja architektury
 Szczegółowy opis przepływów (ekstraktory, API, plugin, pipeline LLM, powiadomienia) znajduje się w [`docs/architecture.md`](docs/architecture.md).
+
+## Dokumentacja plików
+Pełna lista plików z krótkimi opisami dostępna jest w [`docs/file_reference.md`](docs/file_reference.md).
