@@ -2,19 +2,42 @@
 import { generateTextWithOllama } from './ollamaClient.js';
 import { pool } from '../polaczeniePG.js';
 import { mongoClient } from '../polaczenieMDB.js';
+import { performance } from 'node:perf_hooks';
 
 const db = mongoClient.db('inzynierka');
 const analizyCol = db.collection('analizy');        // istniejące analizy snapshotów
 const ocenyZmienCol = db.collection('oceny_zmian'); // nowe/istniejące oceny zmian
 
-export async function evaluateChangeWithLLM({
-  monitorId,
-  zadanieId,
-  url,
-  prevAnalysis,
-  newAnalysis,
-  diff,
-}) {
+export async function evaluateChangeWithLLM(
+  {
+    monitorId,
+    zadanieId,
+    url,
+    prevAnalysis,
+    newAnalysis,
+    diff,
+  },
+  { logger } = {},
+) {
+  const log = logger || console;
+  const tEval0 = performance.now();
+  const finish = (result) => {
+  log.info('llm_change_eval_done', {
+    monitorId,
+    zadanieId,
+    url,
+    durationMs: Math.round(performance.now() - tEval0),
+    important: result?.parsed?.important ?? null,
+    category: result?.parsed?.category ?? null,
+  });
+  return result;
+};
+  log.info('llm_change_eval_start', {
+    monitorId,
+    zadanieId,
+    url,
+  });
+
   const prompt = `
 Jesteś systemem oceny zmian na stronach monitorowanych przez użytkownika.
 
@@ -70,7 +93,78 @@ FORMAT ODPOWIEDZI (ZWRÓĆ TYLKO JEDEN JSON, DOTYCZĄCY TEJ KONKRETNEJ ZMIANY):
 ZWRÓĆ TYLKO JEDEN POPRAWNY JSON, BEZ DODATKOWYCH TEKSTÓW, PRZYKŁADÓW ANI "or".
 `;
 
-  const raw = await generateTextWithOllama({ prompt });
+    // --- NOWE: bezpieczne wywołanie LLM z obsługą AbortError ---
+
+let raw;
+try {
+  const tLlm0 = performance.now();
+  raw = await generateTextWithOllama({ prompt });
+
+  log.info('llm_call_done', {
+    monitorId,
+    zadanieId,
+    url,
+    durationMs: Math.round(performance.now() - tLlm0),
+  });
+} catch (err) {
+
+    const isAbort = err?.name === 'AbortError';
+
+    log.error('llm_change_eval_request_error', {
+      monitorId,
+      zadanieId,
+      url,
+      error: err?.message || String(err),
+      name: err?.name || null,
+      stack: err?.stack,
+      aborted: isAbort,
+    });
+
+    // fallback podobny jak masz niżej dla "brak JSON", tylko z innym reason
+    const priceChange =
+      diff &&
+      diff.metrics &&
+      diff.metrics.pluginPricesChanged === true;
+
+    const fallback = {
+      important: !!priceChange,
+      importance_reason: priceChange
+        ? 'Brak odpowiedzi od LLM (AbortError / błąd requestu), ale diff wskazuje na zmianę cen (pluginPricesChanged == true).'
+        : 'Brak odpowiedzi od LLM (AbortError / błąd requestu); traktuję zmianę jako nieistotną.',
+      category: priceChange ? 'price_change' : 'llm_error',
+      short_title: priceChange ? 'Zmiana cen (LLM timeout)' : 'Błąd analizy zmiany (LLM timeout)',
+      short_description: priceChange
+        ? 'Wykryto zmianę cen na podstawie diff, mimo błędu / timeoutu odpowiedzi LLM.'
+        : 'Nie udało się uzyskać odpowiedzi od LLM (AbortError).',
+    };
+
+        const doc = {
+      zadanieId,
+      monitorId,
+      createdAt: new Date(),
+      type: 'change_evaluation',
+      url,
+      diff,
+      model: process.env.OLLAMA_TEXT_MODEL || 'llama3',
+      prompt,
+      llm_decision: fallback,
+      raw_response: null,
+      error: err?.message || String(err),
+      error_name: err?.name || null,
+      aborted: isAbort,
+    };
+
+
+    const { insertedId } = await ocenyZmienCol.insertOne(doc);
+
+    return {
+      parsed: fallback,
+      raw: null,
+      mongoId: insertedId,
+    };
+  }
+
+  // --- DALEJ zostawiasz swój istniejący kod: jsonText/parsed/fallback przy złym JSON ---
 
   let jsonText = null;
   let parsed = null;
@@ -92,19 +186,16 @@ ZWRÓĆ TYLKO JEDEN POPRAWNY JSON, BEZ DODATKOWYCH TEKSTÓW, PRZYKŁADÓW ANI "o
 
   // 3) wszystkie bloki { ... } – spróbuj wybrać ten z kluczem "important"
   if (!jsonText) {
-    const curlyMatches = raw.match(/\{[\s\S]*?\}/g); // lazy: wiele małych bloków
+    const curlyMatches = raw.match(/\{[\s\S]*?\}/g);
 
     if (curlyMatches && curlyMatches.length > 0) {
-      // Najpierw szukamy bloków, które wyglądają jak decyzja LLM
       const withImportant = curlyMatches.filter((block) =>
         block.includes('"important"'),
       );
 
       if (withImportant.length > 0) {
-        // weź ostatni blok z "important"
         jsonText = withImportant[withImportant.length - 1].trim();
       } else {
-        // fallback: jak nic nie ma z "important", bierz ostatni jak wcześniej
         jsonText = curlyMatches[curlyMatches.length - 1].trim();
       }
     }
@@ -112,9 +203,13 @@ ZWRÓĆ TYLKO JEDEN POPRAWNY JSON, BEZ DODATKOWYCH TEKSTÓW, PRZYKŁADÓW ANI "o
 
   // Jeśli dalej nic – fallback
   if (!jsonText) {
-    console.error('[LLM change-eval] Brak JSON w odpowiedzi LLM (warstwa 3). RAW =', raw);
+    log.error('llm_change_eval_no_json', {
+      monitorId,
+      zadanieId,
+      url,
+      raw,
+    });
 
-    // fallback: jeżeli LLM nie zwrócił JSON, ale diff mówi o zmianie cen → i tak ISTOTNE
     const priceChange =
       diff &&
       diff.metrics &&
@@ -145,6 +240,12 @@ ZWRÓĆ TYLKO JEDEN POPRAWNY JSON, BEZ DODATKOWYCH TEKSTÓW, PRZYKŁADÓW ANI "o
     };
 
     const { insertedId } = await ocenyZmienCol.insertOne(doc);
+    log.info('llm_change_eval_fallback_no_json_saved', {
+      monitorId,
+      zadanieId,
+      mongoId: insertedId,
+    });
+
     return { parsed: fallback, raw, mongoId: insertedId };
   }
 
@@ -152,22 +253,32 @@ ZWRÓĆ TYLKO JEDEN POPRAWNY JSON, BEZ DODATKOWYCH TEKSTÓW, PRZYKŁADÓW ANI "o
   try {
     parsed = JSON.parse(jsonText);
   } catch (e) {
-    console.error('[LLM change-eval] JSON.parse error (warstwa 3). JSONTEXT =', jsonText, 'ERR =', e);
+    log.error('llm_change_eval_json_parse_error', {
+      monitorId,
+      zadanieId,
+      url,
+      jsonText,
+      error: e?.message || String(e),
+    });
 
-    // spróbuj "ułagodzić" – np. brak końcowej klamry
     let fixed = jsonText.trim();
     if (fixed.startsWith('{') && !fixed.endsWith('}')) {
       fixed = fixed + '}';
       try {
         parsed = JSON.parse(fixed);
       } catch (e2) {
-        console.error('[LLM change-eval] JSON.parse error po auto-fixie. FIXED =', fixed, 'ERR =', e2);
+        log.error('llm_change_eval_json_parse_error_fixed', {
+          monitorId,
+          zadanieId,
+          url,
+          fixedJson: fixed,
+          error: e2?.message || String(e2),
+        });
       }
     }
   }
 
   if (!parsed) {
-    // fallback jak wyżej, ale z BAD_JSON
     const priceChange =
       diff &&
       diff.metrics &&
@@ -198,10 +309,15 @@ ZWRÓĆ TYLKO JEDEN POPRAWNY JSON, BEZ DODATKOWYCH TEKSTÓW, PRZYKŁADÓW ANI "o
     };
 
     const { insertedId } = await ocenyZmienCol.insertOne(doc);
+    log.info('llm_change_eval_fallback_bad_json_saved', {
+      monitorId,
+      zadanieId,
+      mongoId: insertedId,
+    });
+
     return { parsed: fallback, raw, mongoId: insertedId };
   }
 
-  // 5) Sukces – normalny zapis
   const doc = {
     zadanieId,
     monitorId,
@@ -216,30 +332,46 @@ ZWRÓĆ TYLKO JEDEN POPRAWNY JSON, BEZ DODATKOWYCH TEKSTÓW, PRZYKŁADÓW ANI "o
   };
 
   const { insertedId } = await ocenyZmienCol.insertOne(doc);
+
+  log.info('llm_change_eval_success', {
+    monitorId,
+    zadanieId,
+    mongoId: insertedId,
+    important: parsed?.important === true,
+    category: parsed?.category || null,
+  });
+
   return { parsed, raw, mongoId: insertedId };
 }
 
 
-// zapis do Postgresa – dopasowany do aktualnego schematu
-export async function saveDetectionAndNotification({
-  monitorId,
-  zadanieId,
-  url,
-  snapshotMongoId,
-  diff,
-  llmDecision,
-}) {
-  const client = await pool.connect();
+export async function saveDetectionAndNotification(
+  {
+    monitorId,
+    zadanieId,
+    url,
+    snapshotMongoId,
+    diff,
+    llmDecision,
+  },
+  { logger } = {},
+) {
+const log = logger || console;
+const tSave0 = performance.now();
+let detectionId = null;
+let ok = false;
+
+const client = await pool.connect();
+
+
   try {
     await client.query('BEGIN');
 
-    // 1) pewnosc – na razie na sztywno 1.0, lub z llmDecision.confidence
     const pewnosc =
       typeof llmDecision.confidence === 'number'
         ? llmDecision.confidence
         : 1.0;
 
-    // 2) INSERT do wykrycia
     const detectionsRes = await client.query(
       `
       INSERT INTO wykrycia (
@@ -271,15 +403,23 @@ export async function saveDetectionAndNotification({
       ],
     );
 
-    const detectionId = detectionsRes.rows[0].id;
+    detectionId = detectionsRes.rows[0].id;
 
-    // 3) Jeżeli nieważne – kończymy na wykryciu
+
+    // jeśli LLM uznał zmianę za nieistotną – zapisujemy wykrycie, ale bez powiadomienia
     if (llmDecision.important !== true) {
       await client.query('COMMIT');
-      return { detectionId };
+      log.info('saveDetectionAndNotification_not_important', {
+        monitorId,
+        zadanieId,
+        detectionId,
+      });
+      ok = true;
+return { detectionId };
+
     }
 
-    // 4) Pobierz uzytkownik_id z tabeli monitory
+    // pobranie użytkownika z monitora
     const monitorRes = await client.query(
       `SELECT uzytkownik_id FROM monitory WHERE id = $1`,
       [monitorId],
@@ -288,16 +428,18 @@ export async function saveDetectionAndNotification({
     const userRow = monitorRes.rows[0];
 
     if (!userRow || !userRow.uzytkownik_id) {
-      console.warn(
-        'saveDetectionAndNotification: monitor nie ma uzytkownik_id – zapisano wykrycie, pomijam powiadomienie.',
-      );
+      log.warn('saveDetectionAndNotification_missing_user', {
+        monitorId,
+        zadanieId,
+        detectionId,
+      });
       await client.query('COMMIT');
       return { detectionId };
     }
 
     const uzytkownikId = userRow.uzytkownik_id;
 
-    // 5) INSERT do powiadomienia – zgodny z obecną tabelą
+    // tworzymy powiadomienie
     await client.query(
       `
       INSERT INTO powiadomienia (
@@ -314,7 +456,7 @@ export async function saveDetectionAndNotification({
         uzytkownikId,
         monitorId,
         detectionId,
-        'oczekuje', // status NOT NULL, ma też default, ale dajemy jawnie
+        'oczekuje',
         llmDecision.short_description ||
           llmDecision.importance_reason ||
           'Wykryto istotną zmianę na monitorowanej stronie.',
@@ -323,18 +465,35 @@ export async function saveDetectionAndNotification({
     );
 
     await client.query('COMMIT');
+
+    log.info('saveDetectionAndNotification_created_notification', {
+      monitorId,
+      zadanieId,
+      detectionId,
+      uzytkownikId,
+    });
+
     return { detectionId };
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('Błąd zapisu wykrycia/powiadomienia do Postgres:', err);
+    log.error('saveDetectionAndNotification_pg_error', {
+      monitorId,
+      zadanieId,
+      error: err?.message || String(err),
+      stack: err?.stack,
+    });
     throw err;
-  } finally {
-    client.release();
-  }
+} finally {
+  log.info('save_detection_done', {
+    monitorId,
+    zadanieId,
+    url,
+    detectionId,
+    ok,
+    durationMs: Math.round(performance.now() - tSave0),
+  });
+
+  client.release();
 }
-
-
-
-
-
+}
 
