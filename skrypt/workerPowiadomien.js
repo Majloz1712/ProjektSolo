@@ -34,7 +34,7 @@ async function verifyTransport() {
   }
 }
 
-// 2. Pobranie powiadomień ze statusem "oczekuje"
+// 2. Pobranie powiadomień ze statusem "oczekuje" + info z wykrycia
 async function fetchPendingNotifications(client, limit = 20) {
   const sql = `
     SELECT
@@ -42,13 +42,17 @@ async function fetchPendingNotifications(client, limit = 20) {
       p.uzytkownik_id,
       p.monitor_id,
       p.wykrycie_id,
-      p.tytul,
-      p.tresc,
+      p.tytul AS powiadomienie_tytul,
+      p.tresc AS powiadomienie_tresc,
       p.status,
       p.utworzono_at,
-      u.email
+      u.email,
+      w.url AS wykrycie_url,
+      w.tytul AS wykrycie_tytul,
+      w.reason AS wykrycie_reason
     FROM powiadomienia p
     JOIN uzytkownicy u ON u.id = p.uzytkownik_id
+    LEFT JOIN wykrycia w ON w.id = p.wykrycie_id
     WHERE p.status = 'oczekuje'
     ORDER BY p.utworzono_at ASC
     LIMIT $1
@@ -56,6 +60,7 @@ async function fetchPendingNotifications(client, limit = 20) {
   const { rows } = await client.query(sql, [limit]);
   return rows;
 }
+
 
 // 3. Wysłanie pojedynczego maila
 async function sendNotificationEmail(notification) {
@@ -65,12 +70,19 @@ async function sendNotificationEmail(notification) {
   }
 
   const subject =
-    notification.tytul || 'Nowa istotna zmiana na monitorowanej stronie';
+    notification.powiadomienie_tytul ||
+    notification.wykrycie_tytul ||
+    'Nowa istotna zmiana na monitorowanej stronie';
 
   const textBody = `
 Cześć!
 
-${notification.tresc || 'Wykryto istotną zmianę na monitorowanej stronie.'}
+${notification.powiadomienie_tresc ||
+  notification.wykrycie_reason ||
+  'Wykryto istotną zmianę na monitorowanej stronie.'}
+
+Adres strony:
+${notification.wykrycie_url || 'brak url w bazie'}
 
 ID powiadomienia: ${notification.id}
 Monitor: ${notification.monitor_id}
@@ -89,6 +101,7 @@ Twoja sonda zmian
 
   await transporter.sendMail(mailOptions);
 }
+
 
 // 4. Oznaczenie powiadomienia jako wysłane
 async function markAsSent(client, notificationId) {
