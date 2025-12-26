@@ -1,7 +1,9 @@
 // skrypt/pipelineZmian.js
 import { mongoClient } from "../polaczenieMDB.js";
+import { pool } from '../polaczeniePG.js';
 import { ObjectId } from "mongodb";
 import { ensureSnapshotAnalysis } from "./analizaSnapshotu.js";
+import { ensureSnapshotOcr } from "./ocrSnapshotu.js";
 import { performance } from "node:perf_hooks";
 import {
   getPreviousSnapshot,
@@ -23,6 +25,40 @@ const snapshotsCol = db.collection("snapshots");
  *  - ocena zmiany (LLM #2)
  *  - zapis wykrycia / powiadomienia
  */
+ 
+ 
+ 
+ 
+ async function setTaskAnalysisMongoId(zadanieId, analizaId, log = console) {
+  if (!zadanieId || !analizaId) return;
+
+  try {
+    await pool.query(
+      `UPDATE zadania_skanu
+         SET analiza_mongo_id = $2
+       WHERE id = $1
+         AND (analiza_mongo_id IS NULL OR analiza_mongo_id = '')`,
+      [zadanieId, String(analizaId)],
+    );
+
+    log?.info?.('pg_analiza_mongo_id_updated', {
+      zadanieId,
+      analiza_mongo_id: String(analizaId),
+    });
+  } catch (err) {
+    log?.warn?.('pg_analiza_mongo_id_update_failed', {
+      zadanieId,
+      analiza_mongo_id: String(analizaId),
+      error: err?.message || String(err),
+    });
+  }
+}
+
+ 
+ 
+ 
+ 
+ 
 export async function handleNewSnapshot(snapshotRef, options = {}) {
   const { forceAnalysis = false, logger } = options;
   const log = logger || console;
@@ -59,6 +95,23 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
     force: forceAnalysis,
     logger,
   });
+  // ✅ Zapisz w PG link do analizy w Mongo
+// ✅ Zapisz w PG link do analizy w Mongo
+    const zadanieId = newAnalysis?.zadanieId || snapshot?.zadanie_id || snapshot?.zadanieId;
+    const analizaId = newAnalysis?._id;
+
+    await setTaskAnalysisMongoId(zadanieId, analizaId, log);
+    
+    if (!zadanieId) {
+  log.warn('pg_analiza_mongo_id_skip_no_zadanieId', {
+    snapshotId: snapshotIdStr,
+    analizaId: analizaId ? String(analizaId) : null,
+  });
+}
+
+
+
+
   log.info("pipeline_step_done", {
     step: "ensureSnapshotAnalysis",
     snapshotId: snapshotIdStr,
@@ -76,6 +129,31 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
     durationMs: Math.round(performance.now() - tPrev0),
   });
 
+
+
+  // 3) OCR jako extractor (tesseract) – tylko czytanie i zapis do snapshotu
+  const tOcrNew0 = performance.now();
+  const newOcr = await ensureSnapshotOcr(snapshot, { logger });
+  log.info("pipeline_step_done", {
+    step: "ensureSnapshotOcr_new",
+    snapshotId: snapshotIdStr,
+    monitorId: snapshot.monitor_id,
+    durationMs: Math.round(performance.now() - tOcrNew0),
+    ocrPresent: !!newOcr,
+  });
+
+  let prevOcr = null;
+  if (prevSnapshot) {
+    const tOcrPrev0 = performance.now();
+    prevOcr = await ensureSnapshotOcr(prevSnapshot, { logger });
+    log.info("pipeline_step_done", {
+      step: "ensureSnapshotOcr_prev",
+      snapshotId: snapshotIdStr,
+      monitorId: snapshot.monitor_id,
+      durationMs: Math.round(performance.now() - tOcrPrev0),
+      ocrPresent: !!prevOcr,
+    });
+  }
   // 3) diff
   const tDiff0 = performance.now();
   const diff = await computeMachineDiff(prevSnapshot, snapshot, { logger });
@@ -87,7 +165,9 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
     hasAnyChange: !!diff?.hasAnyChange,
   });
 
-  if (!diff.hasAnyChange) {
+  const screenshotChanged = !!diff?.metrics?.screenshotChanged;
+
+  if (!diff?.hasAnyChange && !screenshotChanged) {
     log.info("[pipeline] Brak zmian – kończę na warstwie 2.", {
       snapshotId: snapshotIdStr,
       monitorId: snapshot.monitor_id,
@@ -124,6 +204,8 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
       prevAnalysis,
       newAnalysis,
       diff,
+      prevOcr: prevSnapshot?.vision_ocr || null,
+      newOcr: snapshot?.vision_ocr || null,
     },
     { logger },
   );
@@ -141,7 +223,8 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
     diff.metrics.pluginPricesChanged
   );
 
-  const importantByLLM = !!(llmDecision.parsed && llmDecision.parsed.important);
+const importantByLLM = !!(llmDecision?.parsed?.important);
+
 
   const isImportant = pluginPricesChanged || importantByLLM;
 
@@ -171,7 +254,7 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
       : "Zmiana uznana za istotną na podstawie twardych reguł.",
   };
 
-  const decisionToSave = llmDecision.parsed || fallbackDecision;
+const decisionToSave = llmDecision?.parsed || fallbackDecision;
 
   const tSave0 = performance.now();
   const { detectionId: wykrycieId } = await saveDetectionAndNotification(
@@ -181,6 +264,8 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
       url: snapshot.url,
       snapshotMongoId: snapshot._id,
       diff,
+      prevOcr: prevSnapshot?.vision_ocr || null,
+      newOcr: snapshot?.vision_ocr || null,
       llmDecision: decisionToSave,
     },
     { logger },
