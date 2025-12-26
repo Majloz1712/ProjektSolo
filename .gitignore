@@ -13,3 +13,7 @@ Thumbs.db
 node_modules/
 log*.txt
 *.log
+
+# ignore runtime folders
+logs/
+exports/
