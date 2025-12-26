@@ -10,23 +10,37 @@ const analizyCol = db.collection('analizy');
 
 const MAX_TEXT_CHARS = 8000;
 
-export async function ensureSnapshotAnalysis(snapshot, { logger } = {}) {
+export async function ensureSnapshotAnalysis(snapshot, { force = false, logger } = {}) {
   // jeśli już jest analiza – zwracamy ją
   const t0 = performance.now();
   const existing = await analizyCol.findOne({
     snapshot_id: snapshot._id,
     type: 'snapshot',
   });
-  if (existing) {
-  logger?.info('snapshot_analysis_cached', {
-    snapshotId: snapshot._id.toString(),
-    monitorId: String(snapshot.monitor_id || ''),
-    zadanieId: String(snapshot.zadanie_id || ''),
-    url: snapshot.url,
-    durationMs: Math.round(performance.now() - t0),
-  });
-  return existing;
-}
+
+  // jeśli już jest analiza – zwracamy ją (chyba że force=true)
+  if (existing && !force) {
+    logger?.info('snapshot_analysis_cached', {
+      snapshotId: snapshot._id.toString(),
+      monitorId: String(snapshot.monitor_id || ''),
+      zadanieId: String(snapshot.zadanie_id || ''),
+      url: snapshot.url,
+      durationMs: Math.round(performance.now() - t0),
+    });
+    return existing;
+  }
+
+  // force=true → kasujemy starą analizę i generujemy nową
+  if (existing && force) {
+    await analizyCol.deleteOne({ _id: existing._id });
+    logger?.info('snapshot_analysis_force_regenerate', {
+      snapshotId: snapshot._id.toString(),
+      monitorId: String(snapshot.monitor_id || ''),
+      zadanieId: String(snapshot.zadanie_id || ''),
+      url: snapshot.url,
+    });
+  }
+
 
 
   const {

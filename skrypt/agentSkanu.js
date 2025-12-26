@@ -733,11 +733,18 @@ async function scheduleMonitorDue(monitorId) {
   return withPg(async (pg) => {
     await pg.query('BEGIN');
     try {
-      const { rowCount } = await pg.query(
-        `INSERT INTO zadania_skanu (id, monitor_id, zaplanowano_at, status)
-         VALUES (gen_random_uuid(), $1::uuid, NOW(), 'oczekuje')`,
-        [monitorId],
-      );
+        const { rowCount } = await pg.query(
+          `INSERT INTO zadania_skanu (id, monitor_id, zaplanowano_at, status)
+           SELECT gen_random_uuid(), $1::uuid, NOW(), 'oczekuje'
+           WHERE NOT EXISTS (
+             SELECT 1
+             FROM zadania_skanu z
+             WHERE z.monitor_id = $1::uuid
+               AND z.status IN ('oczekuje', 'w_trakcie')
+           )`,
+          [monitorId],
+        );
+
       await pg.query('COMMIT');
       return rowCount || 0;
     } catch (err) {
@@ -939,16 +946,17 @@ async function gracefulExit(code = 0, reason = 'exit') {
   try {
     console.warn(`[gracefulExit] reason=${reason} closing browsers...`);
     await closeAllBrowsers();
-  } catch (e) {
-    console.error('[gracefulExit] closeAllBrowsers error:', e);
-  } finally {
-    // daj Node/Chromium chwilę na domknięcie uchwytów i zwolnienie profilu
-    setTimeout(() => process.exit(code), 50).unref();
-    console.warn(`[gracefulExit] reason=${reason} closing browsers...`);
 
-    
+    // domknij DB (żeby nie zostawały wiszące sockety)
+    try { await mongoClient.close(); } catch (_) {}
+    try { await pool.end(); } catch (_) {}
+  } catch (e) {
+    console.error('[gracefulExit] cleanup error:', e);
+  } finally {
+    setTimeout(() => process.exit(code), 50).unref();
   }
 }
+
 
 process.on('SIGINT', () => gracefulExit(0, 'SIGINT'));
 process.on('SIGTERM', () => gracefulExit(0, 'SIGTERM'));
@@ -1010,6 +1018,14 @@ async function withMonitorLock(monitorId, fn) {
 
 const queue = new PQueue({ concurrency: MAX_CONCURRENCY });
 
+// --- CLI flags ---
+// Wymusza "ostatnią deskę ratunku" przez plugin Chrome (a nie Puppeteer).
+// Użycie: --screenshot / --screenShot / --plugin-screenshot
+const FORCE_PLUGIN_SCREENSHOT =
+  process.argv.includes('--screenshot') ||
+  process.argv.includes('--screenShot') ||
+  process.argv.includes('--plugin-screenshot');
+
 async function processTask(task) {
   // 1) logger per-zadanie (użytkownik + monitor + zadanie)
   const logger = await createTaskLogger({
@@ -1018,6 +1034,11 @@ async function processTask(task) {
   });
   const log = logger; // krótszy alias
   const tTask0 = performance.now();
+  const taskId = task?.id;
+  const monitorId = task?.monitor_id;
+  let snapshot = null; // mongo snapshot id (string) lub null
+  let hash = null;     // sha256(html) lub null
+
   try {
     log.info('task_start', {
       monitorId: task.monitor_id,
@@ -1027,7 +1048,7 @@ async function processTask(task) {
       zaplanowano_at: task.zaplanowano_at,
     });
 
-    const { id: taskId, monitor_id: monitorId } = task;
+    
     console.log(`[task] start monitor=${monitorId} task=${taskId}`);
 
     if (!isUuid(taskId) || !isUuid(monitorId)) {
@@ -1077,7 +1098,85 @@ async function processTask(task) {
     // Czy użytkownik ewidentnie oczekuje ceny? (llm_prompt zawiera "cena"/"price")
     const monitorWantsPrice = wantsPricePlugin(monitor);
 
-    let snapshot = null;
+
+
+    // ===== 0) WYMUSZENIE "OSTATNIEJ DESKI RATUNKU" – PRZEZ PLUGIN CHROME =====
+    // To NIE uruchamia Puppeteera. Zamiast tego:
+    // - tworzymy "pusty" snapshot (żeby plugin mógł go wzbogacić po zadanie_id)
+    // - tworzymy plugin_task (price_only lub fallback)
+    // - kończymy zadanie odpowiednim statusem
+    if (FORCE_PLUGIN_SCREENSHOT) {
+      const now = new Date();
+      try {
+        const snapshots = mongoDb.collection('snapshots');
+        const stubDoc = {
+          monitor_id: monitorId,
+          zadanie_id: taskId,
+          url: targetUrl,
+          ts: now,
+          mode: 'plugin_stub',
+          final_url: targetUrl,
+          blocked: true,
+          block_reason: 'FORCED_PLUGIN',
+          html: null,
+          extracted_v2: null,
+          screenshot_b64: null,
+        };
+        const { insertedId } = await snapshots.insertOne(stubDoc);
+        snapshot = insertedId?.toString?.() ?? null;
+        log.info('snapshot_saved', {
+          monitorId,
+          zadanieId: taskId,
+          snapshotId: snapshot,
+          mode: 'plugin_stub',
+        });
+      } catch (err) {
+        log.warn('snapshot_stub_insert_failed', {
+          monitorId,
+          zadanieId: taskId,
+          error: err?.message || String(err),
+        });
+      }
+
+      const pluginMode = 'plugin_screenshot';
+      await createPluginTask({ monitorId, taskId, url: targetUrl, mode: pluginMode });
+
+      log.warn('task_forwarded_to_plugin_forced', {
+        monitorId,
+        zadanieId: taskId,
+        pluginMode,
+        snapshotId: snapshot,
+      });
+
+      if (!monitorWantsPrice) {
+        await markMonitorRequiresIntervention(monitorId, {
+          reason: 'PLUGIN_SCREENSHOT_REQUIRED',
+          snapshotId: snapshot || null,
+        });
+
+        await finishTask(taskId, {
+          status: 'blad',
+          blad_opis: 'WAITING_FOR_PLUGIN_RESULT',
+          tresc_hash: null,
+          snapshot_mongo_id: snapshot || null,
+        });
+      } else {
+        // Price-only działa jak dotychczas: zadanie w PG może być "ok",
+        // bo pipeline i tak odpali się dopiero po /price z pluginu.
+        await finishTask(taskId, {
+          status: 'ok',
+          blad_opis: null,
+          tresc_hash: null,
+          snapshot_mongo_id: snapshot || null,
+        });
+      }
+
+      console.log(
+        `[task] monitor=${monitorId} task=${taskId} -> przekazany do pluginu (forced, mode=${pluginMode})`,
+      );
+      return;
+    }
+
     let blocked = false;
     let finalUrl = targetUrl;
     let html = '';
@@ -1144,7 +1243,7 @@ async function processTask(task) {
         blocked = !ok;
         html = browserHtml;
         finalUrl = browserFinalUrl;
-        status = ok ? (status || 200) : (status || 403);
+        status = ok ? 200 : (status || 403);
         screenshotB64 = screenshot
           ? Buffer.from(screenshot).toString('base64')
           : null;
@@ -1185,7 +1284,7 @@ async function processTask(task) {
         monitorId,
         taskId,
         url: targetUrl,
-        mode: 'fallback',
+        mode: 'plugin_screenshot',
       });
 
       log.warn('task_forwarded_to_plugin_fallback', {
@@ -1236,7 +1335,7 @@ async function processTask(task) {
       });
     }
 
-    const hash = html ? sha256(html) : null;
+    hash = html ? sha256(html) : null;
 
     const snapshotDoc = {
       monitor_id: monitorId,
@@ -1376,19 +1475,40 @@ async function processTask(task) {
       httpStatus: status,
       durationMs: Math.round(performance.now() - tTask0),
     });
-  } catch (err) {
-    log.error('task_error', {
-      monitorId: task?.monitor_id,
-      zadanieId: task?.id,
-      error: err?.message || String(err),
-      stack: err?.stack,
-      durationMs: Math.round(performance.now() - tTask0),
-    });
-    throw err;
-  } finally {
-    logger.close();
+} catch (err) {
+  log.error('task_error', {
+    monitorId,
+    zadanieId: taskId,
+    error: err?.message || String(err),
+    stack: err?.stack,
+    durationMs: Math.round(performance.now() - tTask0),
+  });
+
+  // Krytyczne: domknij task w PG, żeby nie wisiał jako w_trakcie (blokuje scheduler)
+  if (isUuid(taskId)) {
+    try {
+      await finishTask(taskId, {
+        status: 'blad',
+        blad_opis: (err?.message || String(err)).slice(0, 500),
+        tresc_hash: hash || null,
+        snapshot_mongo_id: snapshot || null,
+      });
+    } catch (e2) {
+      log.error('finishTask_failed', {
+        monitorId,
+        zadanieId: taskId,
+        error: e2?.message || String(e2),
+      });
+    }
   }
+
+  // NIE throw — inaczej łatwo o unhandledRejection + task zostaje w_trakcie
+  return;
+} finally {
+  logger.close();
 }
+}
+
 
 
 
@@ -1542,11 +1662,19 @@ async function runExecutionCycle(singleMonitorId) {
 
   console.log(`[plan] picked ${tasks.length} tasks`);
 
-  tasks.forEach((t) => {
-    queue.add(() =>
-      withMonitorLock(t.monitor_id, () => processTask(t))
-    );
-  });
+tasks.forEach((t) => {
+  queue.add(() =>
+    withMonitorLock(t.monitor_id, () => processTask(t))
+      .catch((err) => {
+        console.error('[queue] task rejected', {
+          monitorId: t.monitor_id,
+          zadanieId: t.id,
+          error: err?.message || String(err),
+        });
+      })
+  );
+});
+
 
   await queue.onIdle();
 }
@@ -1571,8 +1699,13 @@ async function main() {
 
 if (once) {
   await runExecutionCycle(monitorId);
+
+  // SPRZĄTANIE po trybie --once (żeby nie wisiał proces i nie blokował profilu)
   await closeAllBrowsers();
-  return;
+  try { await mongoClient.close(); } catch (_) {}
+  try { await pool.end(); } catch (_) {}
+
+  process.exit(0);
 }
 
 

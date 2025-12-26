@@ -1,12 +1,483 @@
-// skrypt/ocenaZmianyLLM.js
+// skrypt/llm/ocenaZmianyLLM.js
+// ZMIANA (krok 1 w tym pliku):
+// - Uogólnione OCR (vision prompt): rating, reviews_count, labels, numbers, key_lines
+// - Decyzję nadal podejmuje kod deterministycznie (mniej halucynacji / mniej spamu)
+//
+// ZMIANA (krok 2 w tym pliku):
+// - Bardziej konserwatywna filtracja list (labels/numbers/key_lines) po confidence + evidence,
+//   żeby ograniczyć halucynacje z vision.
+// - Opcjonalny sygnał "numbers" (bardzo ostrożnie) – tylko gdy OCR poda sensowną listę
+//   i podobieństwo jest naprawdę niskie (żeby nie spamować).
+
 import { generateTextWithOllama } from './ollamaClient.js';
+
 import { pool } from '../polaczeniePG.js';
 import { mongoClient } from '../polaczenieMDB.js';
 import { performance } from 'node:perf_hooks';
 
 const db = mongoClient.db('inzynierka');
-const analizyCol = db.collection('analizy');        // istniejące analizy snapshotów
-const ocenyZmienCol = db.collection('oceny_zmian'); // nowe/istniejące oceny zmian
+const analizyCol = db.collection('analizy'); // (zostawiamy – może używasz gdzie indziej)
+const ocenyZmienCol = db.collection('oceny_zmian');
+
+function stripBase64Prefix(b64) {
+  if (!b64 || typeof b64 !== 'string') return null;
+  return b64.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '');
+}
+
+function extractJsonText(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+
+  // 1) cała odpowiedź to JSON
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) return trimmed;
+
+  // 2) blok ```json ... ```
+  const codeBlockMatch = raw.match(/```json([\s\S]*?)```/i);
+  if (codeBlockMatch && codeBlockMatch[1]) return codeBlockMatch[1].trim();
+
+  // 3) blok ``` ... ``` (bez json)
+  const anyCodeBlock = raw.match(/```([\s\S]*?)```/);
+  if (anyCodeBlock && anyCodeBlock[1] && anyCodeBlock[1].trim().startsWith('{')) {
+    return anyCodeBlock[1].trim();
+  }
+
+  // 4) wszystkie bloki { ... } – wybierz ostatni który ma "prev"/"new" lub "important"
+  const curlyMatches = raw.match(/\{[\s\S]*?\}/g);
+  if (curlyMatches && curlyMatches.length) {
+    const preferred = curlyMatches.filter((b) => b.includes('"prev"') || b.includes('"new"') || b.includes('"important"'));
+    return (preferred.length ? preferred[preferred.length - 1] : curlyMatches[curlyMatches.length - 1]).trim();
+  }
+
+  return null;
+}
+
+function safeParseJsonFromLLM(raw) {
+  const jsonText = extractJsonText(raw);
+  if (!jsonText) return null;
+  try {
+    return JSON.parse(jsonText);
+  } catch {
+    // szybki fix: trailing commas
+    try {
+      const fixed = jsonText.replace(/,\s*}/g, '}').replace(/,\s*]/g, ']');
+      return JSON.parse(fixed);
+    } catch {
+      return null;
+    }
+  }
+}
+
+
+function ocrPreview(ocr, maxChars = 2000) {
+  const t = ocr?.clean_text || ocr?.text || '';
+  const s = String(t).replace(/\s+/g, ' ').trim();
+  return s.length > maxChars ? s.slice(0, maxChars) + '...[TRUNCATED]' : s;
+}
+
+function summarizeOcrForStorage(ocr) {
+  if (!ocr) return null;
+  return {
+    engine: ocr.engine || null,
+    sourceHash: ocr.sourceHash || null,
+    confidence: typeof ocr.confidence === 'number' ? ocr.confidence : null,
+    clean_text_preview: ocrPreview(ocr, 500),
+  };
+}
+
+function toNumberMaybe(v) {
+  if (v == null) return null;
+  const s = String(v)
+    .replace(/\u00A0/g, ' ')
+    .replace(/[^\d.,-]/g, ' ')
+    .trim();
+
+  const m = s.match(/-?\d[\d ]*(?:[.,]\d+)?/);
+  if (!m) return null;
+
+  const n = Number(m[0].replace(/ /g, '').replace(',', '.'));
+  return Number.isFinite(n) ? n : null;
+}
+
+function pickBestPriceFromTesseract(ocrSide) {
+  const lines = ocrSide?.lines || [];
+  if (!Array.isArray(lines) || lines.length === 0) return null;
+
+  // szukamy "coś + waluta", bierzemy linię o najwyższym confidence
+  const moneyRe = /(-?\d[\d\s]*([.,]\d{1,2})?)\s*(zł|zl|pln|eur|€|usd|\$|gbp|£)/i;
+
+  let best = null;
+
+  for (const ln of lines) {
+    const t = String(ln?.text || "");
+    const m = t.match(moneyRe);
+    if (!m) continue;
+
+    const n = toNumberMaybe(m[1]);
+    if (n == null) continue;
+
+    const conf = typeof ln?.confidence === "number" ? ln.confidence : 0;
+
+    if (!best || conf > best.confidence) {
+      best = {
+        value: n,
+        evidence: t,
+        confidence: conf,
+      };
+    }
+  }
+
+  // próg ostrożny — żeby nie “strzelać” po słabym OCR
+  if (best && best.confidence >= 0.65) return best;
+  return null;
+}
+
+
+
+function toIntMaybe(v) {
+  const n = toNumberMaybe(v);
+  if (n == null) return null;
+  return Math.trunc(n);
+}
+
+function parseRatingMaybe(v) {
+  if (v == null) return null;
+  const s = String(v).replace(/\u00A0/g, ' ').trim();
+  // np. "4,8/5", "4.8", "4,8"
+  const m = s.match(/(\d+(?:[.,]\d+)?)/);
+  if (!m) return null;
+  const n = Number(m[1].replace(',', '.'));
+  if (!Number.isFinite(n)) return null;
+  // ratingy zwykle 0..5
+  if (n < 0 || n > 5.5) return null;
+  return n;
+}
+
+function hasCurrencyHint(text) {
+  const s = String(text || '').toLowerCase();
+  return (
+    s.includes('zł') ||
+    s.includes('zl') ||
+    s.includes('pln') ||
+    s.includes('eur') ||
+    s.includes('€') ||
+    s.includes('$') ||
+    s.includes('usd')
+  );
+}
+
+function normText(v) {
+  return String(v || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function ocrField(side, key) {
+  const f = side?.[key];
+  const value = f?.value ?? f ?? null;
+  const evidence = f?.evidence ?? null;
+  const confidence = typeof f?.confidence === 'number' ? f.confidence : null;
+  return { value, evidence, confidence };
+}
+
+function fieldIsReliable(f, minConf = 0.65) {
+  if (!f) return false;
+  const conf = typeof f.confidence === 'number' ? f.confidence : 0;
+  const ev = f.evidence != null ? String(f.evidence).trim() : '';
+  const val = f.value != null ? String(f.value).trim() : '';
+  return conf >= minConf && ev.length >= 2 && val.length >= 1;
+}
+
+function pickMainPriceFromOcrSide(side) {
+  if (!side || typeof side !== 'object') return null;
+
+  // 1) main_price.value / evidence
+  const mp = side.main_price || side.mainPrice;
+  const mpValue = mp?.value ?? mp;
+  const mpEvidence = mp?.evidence ?? '';
+
+  if (hasCurrencyHint(mpValue) || hasCurrencyHint(mpEvidence)) {
+    const n = toNumberMaybe(mpValue ?? mpEvidence);
+    if (n != null) return n;
+  }
+
+  // 2) all_prices[]
+  const arr = side.all_prices || side.allPrices || side.prices || [];
+  if (Array.isArray(arr)) {
+    for (const it of arr) {
+      const v = it?.value ?? it;
+      const e = it?.evidence ?? '';
+      const c = typeof it?.confidence === 'number' ? it.confidence : null;
+      // jeśli model poda "123" bez waluty – ignoruj, chyba że evidence ma walutę
+      if (!hasCurrencyHint(v) && !hasCurrencyHint(e)) continue;
+      // jeśli poda confidence i jest niskie – ignoruj
+      if (c != null && c < 0.55) continue;
+
+      const n = toNumberMaybe(v ?? e);
+      if (n != null) return n;
+    }
+  }
+
+  return null;
+}
+
+function pickRatingFromOcrSide(side) {
+  const r = ocrField(side, 'rating');
+  if (!fieldIsReliable(r, 0.6)) return null;
+  return parseRatingMaybe(r.value ?? r.evidence);
+}
+
+function pickReviewsCountFromOcrSide(side) {
+  const rc = ocrField(side, 'reviews_count');
+  if (!fieldIsReliable(rc, 0.6)) return null;
+  return toIntMaybe(rc.value ?? rc.evidence);
+}
+
+function normalizeList(arr) {
+  if (!Array.isArray(arr)) return [];
+  return arr
+    .map((x) => (typeof x === 'object' && x ? x : { value: x, evidence: null, confidence: null }))
+    .map((x) => ({
+      value: x?.value ?? null,
+      evidence: x?.evidence ?? null,
+      confidence: typeof x?.confidence === 'number' ? x.confidence : null,
+    }));
+}
+
+function listToSet(arr, { minConf = 0.65, minLen = 2 } = {}) {
+  const items = normalizeList(arr);
+  const out = new Set();
+
+  for (const it of items) {
+    const val = it.value != null ? String(it.value).trim() : '';
+    const ev = it.evidence != null ? String(it.evidence).trim() : '';
+    const conf = typeof it.confidence === 'number' ? it.confidence : null;
+
+    // jeśli model poda confidence -> wymagamy minimum
+    if (conf != null && conf < minConf) continue;
+
+    // evidence ma być “cytatem” -> jeśli brak evidence, to chociaż value musi być sensowne
+    const text = normText(val || ev);
+    if (!text || text.length < minLen) continue;
+
+    // unikaj śmieci typu pojedyncze znaki
+    if (text.length < minLen) continue;
+
+    out.add(text);
+  }
+
+  return out;
+}
+
+function jaccardSet(a, b) {
+  const A = a instanceof Set ? a : new Set(a || []);
+  const B = b instanceof Set ? b : new Set(b || []);
+  if (A.size === 0 && B.size === 0) return 1;
+  let inter = 0;
+  for (const x of A) if (B.has(x)) inter++;
+  const union = new Set([...A, ...B]).size;
+  return union ? inter / union : 0;
+}
+
+/**
+ * Vision (OCR) ma tylko “czytać” obraz.
+ * Decyzję o important podejmuje KOD deterministycznie.
+ */
+function buildDecisionFromOcrBundle(ocrBundle) {
+  const prev = ocrBundle?.prev || ocrBundle?.before || ocrBundle?.old || null;
+  const next = ocrBundle?.new || ocrBundle?.after || ocrBundle?.now || null;
+
+  const oldPrice = pickMainPriceFromOcrSide(prev);
+  const newPrice = pickMainPriceFromOcrSide(next);
+
+  // 1) Cena
+  if (oldPrice != null && newPrice != null && Math.abs(newPrice - oldPrice) >= 0.01) {
+    return {
+      important: true,
+      category: 'price_change',
+      importance_reason: 'OCR ze screenshotów potwierdził zmianę ceny (dwie różne ceny).',
+      short_title: 'Zmiana ceny',
+      short_description: `Cena zmieniła się z ${oldPrice} na ${newPrice}.`,
+      old_price: oldPrice,
+      new_price: newPrice,
+    };
+  }
+
+  // 2) Dostępność
+  const oldAvail = ocrField(prev, 'availability');
+  const newAvail = ocrField(next, 'availability');
+  if (fieldIsReliable(oldAvail, 0.65) && fieldIsReliable(newAvail, 0.65)) {
+    const a = normText(oldAvail.value);
+    const b = normText(newAvail.value);
+    if (a && b && a !== b) {
+      return {
+        important: true,
+        category: 'availability_change',
+        importance_reason: 'OCR ze screenshotów potwierdził zmianę dostępności.',
+        short_title: 'Zmiana dostępności',
+        short_description: `"${a}" → "${b}"`,
+        old_price: oldPrice ?? null,
+        new_price: newPrice ?? null,
+      };
+    }
+  }
+
+  // 3) Dostawa
+  const oldDel = ocrField(prev, 'delivery');
+  const newDel = ocrField(next, 'delivery');
+  if (fieldIsReliable(oldDel, 0.65) && fieldIsReliable(newDel, 0.65)) {
+    const a = normText(oldDel.value);
+    const b = normText(newDel.value);
+    if (a && b && a !== b) {
+      return {
+        important: true,
+        category: 'delivery_change',
+        importance_reason: 'OCR ze screenshotów potwierdził zmianę dostawy.',
+        short_title: 'Zmiana dostawy',
+        short_description: `"${a}" → "${b}"`,
+        old_price: oldPrice ?? null,
+        new_price: newPrice ?? null,
+      };
+    }
+  }
+
+  // 4) Sprzedawca
+  const oldSeller = ocrField(prev, 'seller');
+  const newSeller = ocrField(next, 'seller');
+  if (fieldIsReliable(oldSeller, 0.65) && fieldIsReliable(newSeller, 0.65)) {
+    const a = normText(oldSeller.value);
+    const b = normText(newSeller.value);
+    if (a && b && a !== b) {
+      return {
+        important: true,
+        category: 'seller_change',
+        importance_reason: 'OCR ze screenshotów potwierdził zmianę sprzedawcy/źródła oferty.',
+        short_title: 'Zmiana sprzedawcy',
+        short_description: `"${a}" → "${b}"`,
+        old_price: oldPrice ?? null,
+        new_price: newPrice ?? null,
+      };
+    }
+  }
+
+  // 5) Ocena / liczba opinii
+  const oldRating = pickRatingFromOcrSide(prev);
+  const newRating = pickRatingFromOcrSide(next);
+  if (oldRating != null && newRating != null && Math.abs(newRating - oldRating) >= 0.1) {
+    return {
+      important: true,
+      category: 'content_update',
+      importance_reason: 'OCR potwierdził zmianę oceny/gwiazdek.',
+      short_title: 'Zmiana oceny',
+      short_description: `Ocena zmieniła się z ${oldRating} na ${newRating}.`,
+      old_price: oldPrice ?? null,
+      new_price: newPrice ?? null,
+    };
+  }
+
+  const oldReviews = pickReviewsCountFromOcrSide(prev);
+  const newReviews = pickReviewsCountFromOcrSide(next);
+  if (oldReviews != null && newReviews != null && Math.abs(newReviews - oldReviews) >= 10) {
+    // podnosimy próg do 10, żeby nie spamować na popularnych stronach
+    return {
+      important: true,
+      category: 'content_update',
+      importance_reason: 'OCR potwierdził istotną zmianę liczby opinii/ocen.',
+      short_title: 'Zmiana liczby opinii',
+      short_description: `Liczba opinii zmieniła się z ${oldReviews} na ${newReviews}.`,
+      old_price: oldPrice ?? null,
+      new_price: newPrice ?? null,
+    };
+  }
+
+  // 6) Etykiety / badge (promocja, smart, niedostępny...)
+  const oldLabels = listToSet(prev?.labels || [], { minConf: 0.65, minLen: 2 });
+  const newLabels = listToSet(next?.labels || [], { minConf: 0.65, minLen: 2 });
+  const labelSim = jaccardSet(oldLabels, newLabels);
+
+  if ((oldLabels.size + newLabels.size) > 0 && labelSim < 0.5) {
+    const joined = [...newLabels].join(' ');
+    if (joined.includes('niedost') || joined.includes('brak') || joined.includes('out of stock')) {
+      return {
+        important: true,
+        category: 'availability_change',
+        importance_reason: 'Zmiana etykiet/badge sugeruje zmianę dostępności.',
+        short_title: 'Zmiana dostępności',
+        short_description: `Etykiety zmieniły się: "${[...oldLabels].join(', ')}" → "${[...newLabels].join(', ')}"`,
+        old_price: oldPrice ?? null,
+        new_price: newPrice ?? null,
+      };
+    }
+
+    return {
+      important: true,
+      category: 'content_update',
+      importance_reason: 'OCR wykrył zmianę istotnych etykiet/badge na widoku.',
+      short_title: 'Zmiana oznaczeń',
+      short_description: `Etykiety zmieniły się: "${[...oldLabels].join(', ')}" → "${[...newLabels].join(', ')}"`,
+      old_price: oldPrice ?? null,
+      new_price: newPrice ?? null,
+    };
+  }
+
+  // 7) Ogólna treść: key_lines (uogólnienie na dowolne strony)
+  // BARDZO konserwatywnie, żeby nie spamować: wymagamy dużej zmiany + sensowna liczba linii.
+  const oldLines = listToSet(prev?.key_lines || prev?.keyLines || [], { minConf: 0.65, minLen: 3 });
+  const newLines = listToSet(next?.key_lines || next?.keyLines || [], { minConf: 0.65, minLen: 3 });
+  const lineSim = jaccardSet(oldLines, newLines);
+
+  if ((oldLines.size >= 14 || newLines.size >= 14) && lineSim < 0.45) {
+    return {
+      important: true,
+      category: 'content_update',
+      importance_reason: 'Wykryto większą zmianę widocznych tekstów na stronie (OCR key_lines).',
+      short_title: 'Zmiana treści strony',
+      short_description: 'Wykryto większą zmianę widocznych komunikatów/tekstu na stronie.',
+      old_price: oldPrice ?? null,
+      new_price: newPrice ?? null,
+    };
+  }
+
+  // 8) (Opcjonalnie) "numbers" – tylko jeśli lista jest duża i bardzo się różni.
+  // Uwaga: to potrafi spamować, więc jest bardzo konserwatywne.
+  const oldNums = listToSet(prev?.numbers || [], { minConf: 0.7, minLen: 2 });
+  const newNums = listToSet(next?.numbers || [], { minConf: 0.7, minLen: 2 });
+  const numSim = jaccardSet(oldNums, newNums);
+
+  if ((oldNums.size >= 10 || newNums.size >= 10) && numSim < 0.35) {
+    return {
+      important: true,
+      category: 'content_update',
+      importance_reason: 'Wykryto istotną zmianę ważnych wartości liczbowych na widoku (OCR numbers).',
+      short_title: 'Zmiana danych liczbowych',
+      short_description: 'Zmieniły się istotne wartości liczbowe widoczne na stronie.',
+      old_price: oldPrice ?? null,
+      new_price: newPrice ?? null,
+    };
+  }
+
+  return {
+    important: false,
+    category: 'minor_change',
+    importance_reason:
+      'OCR nie potwierdził jednoznacznej zmiany ceny/dostępności/dostawy/sprzedawcy ani wyraźnej zmiany treści.',
+    short_title: 'Brak istotnej zmiany',
+    short_description: 'Różnice wyglądają na nieistotne lub niejednoznaczne.',
+    old_price: oldPrice ?? null,
+    new_price: newPrice ?? null,
+  };
+}
+
+function shouldUseVisionCompare({ diff, prevAnalysis, newAnalysis }) {
+  if (diff?.metrics?.pluginPricesChanged === true) return false;
+  if (prevAnalysis?.error || newAnalysis?.error) return true;
+
+  const reasonsLen = Array.isArray(diff?.reasons) ? diff.reasons.length : 0;
+  const textScore = typeof diff?.metrics?.textDiffScore === 'number' ? diff.metrics.textDiffScore : 0;
+
+  const absPrice = diff?.metrics?.price && typeof diff.metrics.price.absChange === 'number' ? diff.metrics.price.absChange : 0;
+  if (absPrice !== 0) return false;
+
+  if (diff?.metrics?.screenshotChanged === true) return true;
+  return reasonsLen === 0 || textScore < 0.01;
+}
 
 export async function evaluateChangeWithLLM(
   {
@@ -16,334 +487,156 @@ export async function evaluateChangeWithLLM(
     prevAnalysis,
     newAnalysis,
     diff,
+    prevOcr,
+    newOcr,
   },
   { logger } = {},
 ) {
   const log = logger || console;
   const tEval0 = performance.now();
-  const finish = (result) => {
-  log.info('llm_change_eval_done', {
-    monitorId,
-    zadanieId,
-    url,
-    durationMs: Math.round(performance.now() - tEval0),
-    important: result?.parsed?.important ?? null,
-    category: result?.parsed?.category ?? null,
-  });
-  return result;
-};
-  log.info('llm_change_eval_start', {
-    monitorId,
-    zadanieId,
-    url,
-  });
 
-  const prompt = `
-Jesteś systemem oceny zmian na stronach monitorowanych przez użytkownika.
+  log.info('llm_change_eval_start', { monitorId, zadanieId, url });
 
-Twoje zadanie: NA PODSTAWIE PONIŻSZYCH DANYCH zdecyduj,
-czy KONKRETNA ZMIANA jest istotna dla użytkownika.
+  // 0) twarda reguła: zmiana ceny z plugin_prices zawsze istotna
+  if (diff?.metrics?.pluginPricesChanged === true) {
+    const decision = {
+      important: true,
+      category: 'price_change',
+      importance_reason: 'wykryto zmianę cen (plugin_prices)',
+      short_title: 'Cena zmieniona',
+      short_description: 'Wykryto zmianę cen przez plugin (JS na stronie).',
+    };
 
-1) Analiza poprzedniego snapshota (JSON):
-${JSON.stringify(prevAnalysis || {}, null, 2)}
+    const { insertedId } = await ocenyZmienCol.insertOne({
+      createdAt: new Date(),
+      monitorId,
+      zadanieId,
+      url,
+      llm_mode: 'rule_plugin_prices',
+      model: null,
+      prompt_used: null,
+      raw_response: null,
+      // OCR nie podejmuje decyzji — zapisujemy tylko meta dla debug
+      vision_ocr: {
+        prev: summarizeOcrForStorage(prevOcr),
+        next: summarizeOcrForStorage(newOcr),
+      },
+      llm_decision: decision,
+      error: null,
+      durationMs: Math.round(performance.now() - tEval0),
+    });
 
-2) Analiza nowego snapshota (JSON):
-${JSON.stringify(newAnalysis || {}, null, 2)}
+    log.info('llm_change_eval_success', {
+      monitorId,
+      zadanieId,
+      mongoId: insertedId,
+      important: true,
+      category: decision.category,
+    });
 
-3) Twardy diff (JSON):
-${JSON.stringify(diff || {}, null, 2)}
+    return { parsed: decision, raw: null, mongoId: insertedId };
+  }
 
-------------------------------------------------------------------------------------
-ZASADY OCENY ISTOTNOŚCI (BARDZO WAŻNE – PRZESTRZEGAJ ICH BEZWZGLĘDNIE):
+  const usedMode = 'text';
+  const usedModel = process.env.OLLAMA_TEXT_MODEL || process.env.LLM_MODEL || 'llama3';
 
-1. Jeżeli diff.metrics.pluginPricesChanged == true → ZAWSZE traktuj to jako zmianę ISTOTNĄ.
-   Ustaw:
-   {
-     "important": true,
-     "category": "price_change",
-     "importance_reason": "wykryto zmianę cen (plugin_prices)"
-   }
+  const prevOcrText = ocrPreview(prevOcr, 2000);
+  const newOcrText = ocrPreview(newOcr, 2000);
 
-2. Jeżeli zmieniają się liczby dotyczące:
-   - opinii / recenzji / ocen
-   - średniej oceny (rating)
-   - liczby ofert / planów / wariantów
-   - liczby dostępnych sztuk / wyników
-   to także traktuj zmianę jako ISTOTNĄ (kategorie: rating_change / offers_change / engagement_change).
+  const usedPrompt = `
+Masz dane JSON: prevAnalysis, newAnalysis, diff.
+Dodatkowo masz OCR ze screenshotu (prevOcr/newOcr) – to TYLKO tekst odczytany z obrazka.
 
-3. Istotne są też:
-   - zmiana dostępności oferty (dostępny/niedostępny),
-   - wejście/wyjście z promocji,
-   - istotna zmiana typu oferty/strony.
+Twoje zadanie: oceń istotność zmiany NA PODSTAWIE DANYCH.
+NIE WOLNO zgadywać ani dopowiadać. Jeśli brak dowodu w danych -> uznaj za nieistotne.
 
-4. Nieistotne:
-   - zmiany w nawigacji, stopce, kosmetyczne modyfikacje tekstu bez wpływu na cenę/dostępność/opinie/oferty.
-
-------------------------------------------------------------------------------------
-FORMAT ODPOWIEDZI (ZWRÓĆ TYLKO JEDEN JSON, DOTYCZĄCY TEJ KONKRETNEJ ZMIANY):
-
+Zwróć WYŁĄCZNIE JSON:
 {
-  "important": true lub false,
-  "importance_reason": "krótko dlaczego",
-  "category": "price_change / rating_change / offers_change / engagement_change / availability_change / content_update / minor_change",
-  "short_title": "krótki tytuł",
-  "short_description": "krótki opis zmiany"
+  "important": boolean,
+  "category": string,
+  "importance_reason": string,
+  "short_title": string,
+  "short_description": string
 }
 
-ZWRÓĆ TYLKO JEDEN POPRAWNY JSON, BEZ DODATKOWYCH TEKSTÓW, PRZYKŁADÓW ANI "or".
-`;
+prevAnalysis:
+${JSON.stringify(prevAnalysis ?? null)}
 
-    // --- NOWE: bezpieczne wywołanie LLM z obsługą AbortError ---
+newAnalysis:
+${JSON.stringify(newAnalysis ?? null)}
 
-let raw;
-try {
-  const tLlm0 = performance.now();
-  raw = await generateTextWithOllama({ prompt });
+diff:
+${JSON.stringify(diff ?? null)}
 
-  log.info('llm_call_done', {
-    monitorId,
-    zadanieId,
-    url,
-    durationMs: Math.round(performance.now() - tLlm0),
-  });
-} catch (err) {
+prevOcr (clean_text preview):
+${prevOcrText || null}
 
-    const isAbort = err?.name === 'AbortError';
+newOcr (clean_text preview):
+${newOcrText || null}
+`.trim();
 
-    log.error('llm_change_eval_request_error', {
-      monitorId,
-      zadanieId,
-      url,
-      error: err?.message || String(err),
-      name: err?.name || null,
-      stack: err?.stack,
-      aborted: isAbort,
-    });
+  let raw = null;
+  let llmDecision = null;
 
-    // fallback podobny jak masz niżej dla "brak JSON", tylko z innym reason
-    const priceChange =
-      diff &&
-      diff.metrics &&
-      diff.metrics.pluginPricesChanged === true;
-
-    const fallback = {
-      important: !!priceChange,
-      importance_reason: priceChange
-        ? 'Brak odpowiedzi od LLM (AbortError / błąd requestu), ale diff wskazuje na zmianę cen (pluginPricesChanged == true).'
-        : 'Brak odpowiedzi od LLM (AbortError / błąd requestu); traktuję zmianę jako nieistotną.',
-      category: priceChange ? 'price_change' : 'llm_error',
-      short_title: priceChange ? 'Zmiana cen (LLM timeout)' : 'Błąd analizy zmiany (LLM timeout)',
-      short_description: priceChange
-        ? 'Wykryto zmianę cen na podstawie diff, mimo błędu / timeoutu odpowiedzi LLM.'
-        : 'Nie udało się uzyskać odpowiedzi od LLM (AbortError).',
-    };
-
-        const doc = {
-      zadanieId,
-      monitorId,
-      createdAt: new Date(),
-      type: 'change_evaluation',
-      url,
-      diff,
-      model: process.env.OLLAMA_TEXT_MODEL || 'llama3',
-      prompt,
-      llm_decision: fallback,
-      raw_response: null,
-      error: err?.message || String(err),
-      error_name: err?.name || null,
-      aborted: isAbort,
-    };
-
-
-    const { insertedId } = await ocenyZmienCol.insertOne(doc);
-
-    return {
-      parsed: fallback,
-      raw: null,
-      mongoId: insertedId,
-    };
-  }
-
-  // --- DALEJ zostawiasz swój istniejący kod: jsonText/parsed/fallback przy złym JSON ---
-
-  let jsonText = null;
-  let parsed = null;
-
-  const trimmed = raw.trim();
-
-  // 1) cała odpowiedź to JSON
-  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
-    jsonText = trimmed;
-  }
-
-  // 2) blok ```json ... ```
-  if (!jsonText) {
-    const codeBlockMatch = raw.match(/```json([\s\S]*?)```/i);
-    if (codeBlockMatch && codeBlockMatch[1]) {
-      jsonText = codeBlockMatch[1].trim();
-    }
-  }
-
-  // 3) wszystkie bloki { ... } – spróbuj wybrać ten z kluczem "important"
-  if (!jsonText) {
-    const curlyMatches = raw.match(/\{[\s\S]*?\}/g);
-
-    if (curlyMatches && curlyMatches.length > 0) {
-      const withImportant = curlyMatches.filter((block) =>
-        block.includes('"important"'),
-      );
-
-      if (withImportant.length > 0) {
-        jsonText = withImportant[withImportant.length - 1].trim();
-      } else {
-        jsonText = curlyMatches[curlyMatches.length - 1].trim();
-      }
-    }
-  }
-
-  // Jeśli dalej nic – fallback
-  if (!jsonText) {
-    log.error('llm_change_eval_no_json', {
-      monitorId,
-      zadanieId,
-      url,
-      raw,
-    });
-
-    const priceChange =
-      diff &&
-      diff.metrics &&
-      diff.metrics.pluginPricesChanged === true;
-
-    const fallback = {
-      important: !!priceChange,
-      importance_reason: priceChange
-        ? 'Brak JSON od LLM, ale diff wskazuje na zmianę cen (pluginPricesChanged == true).'
-        : 'LLM nie zwrócił żadnego JSON; traktuję zmianę jako nieistotną.',
-      category: priceChange ? 'price_change' : 'llm_error',
-      short_title: priceChange ? 'Zmiana cen (fallback)' : 'Błąd analizy zmiany',
-      short_description: priceChange
-        ? 'Wykryto zmianę cen na podstawie diff, mimo błędu odpowiedzi LLM.'
-        : 'Nie udało się znaleźć JSON-a w odpowiedzi LLM.',
-    };
-
-    const doc = {
-      zadanieId,
-      monitorId,
-      createdAt: new Date(),
-      type: 'change_evaluation',
-      url,
-      diff,
-      llm_decision: fallback,
-      raw_response: raw,
-      error: 'NO_JSON',
-    };
-
-    const { insertedId } = await ocenyZmienCol.insertOne(doc);
-    log.info('llm_change_eval_fallback_no_json_saved', {
-      monitorId,
-      zadanieId,
-      mongoId: insertedId,
-    });
-
-    return { parsed: fallback, raw, mongoId: insertedId };
-  }
-
-  // 4) Parsowanie + ewentualny auto-fix
   try {
-    parsed = JSON.parse(jsonText);
-  } catch (e) {
-    log.error('llm_change_eval_json_parse_error', {
-      monitorId,
-      zadanieId,
-      url,
-      jsonText,
-      error: e?.message || String(e),
+    raw = await generateTextWithOllama({
+      prompt: usedPrompt,
+      model: usedModel,
+      temperature: 0,
     });
 
-    let fixed = jsonText.trim();
-    if (fixed.startsWith('{') && !fixed.endsWith('}')) {
-      fixed = fixed + '}';
-      try {
-        parsed = JSON.parse(fixed);
-      } catch (e2) {
-        log.error('llm_change_eval_json_parse_error_fixed', {
-          monitorId,
-          zadanieId,
-          url,
-          fixedJson: fixed,
-          error: e2?.message || String(e2),
-        });
-      }
-    }
+    const parsed = safeParseJsonFromLLM(raw);
+    llmDecision =
+      parsed && typeof parsed.important === 'boolean'
+        ? parsed
+        : {
+            important: false,
+            category: 'minor_change',
+            importance_reason: 'Brak poprawnego JSON z LLM lub brak twardych dowodów w danych.',
+            short_title: 'Brak istotnej zmiany',
+            short_description: 'Nie udało się potwierdzić istotnej zmiany na podstawie dostarczonych danych.',
+          };
+  } catch (err) {
+    llmDecision = {
+      important: false,
+      category: 'minor_change',
+      importance_reason: `Błąd text LLM: ${err?.message || String(err)}`,
+      short_title: 'Brak istotnej zmiany',
+      short_description: 'Nie udało się wykonać oceny tekstowej.',
+    };
   }
 
-  if (!parsed) {
-    const priceChange =
-      diff &&
-      diff.metrics &&
-      diff.metrics.pluginPricesChanged === true;
-
-    const fallback = {
-      important: !!priceChange,
-      importance_reason: priceChange
-        ? 'JSON od LLM był nieparsowalny, ale diff wskazuje na zmianę cen (pluginPricesChanged == true).'
-        : 'LLM zwrócił nieparsowalny JSON; traktuję zmianę jako nieistotną.',
-      category: priceChange ? 'price_change' : 'llm_error',
-      short_title: priceChange ? 'Zmiana cen (bad JSON)' : 'Błąd analizy zmiany',
-      short_description: priceChange
-        ? 'Wykryto zmianę cen na podstawie diff, mimo błędnego JSON-a od LLM.'
-        : 'Nie udało się sparsować JSON-a z odpowiedzi LLM.',
-    };
-
-    const doc = {
-      zadanieId,
-      monitorId,
-      createdAt: new Date(),
-      type: 'change_evaluation',
-      url,
-      diff,
-      llm_decision: fallback,
-      raw_response: raw,
-      error: 'BAD_JSON',
-    };
-
-    const { insertedId } = await ocenyZmienCol.insertOne(doc);
-    log.info('llm_change_eval_fallback_bad_json_saved', {
-      monitorId,
-      zadanieId,
-      mongoId: insertedId,
-    });
-
-    return { parsed: fallback, raw, mongoId: insertedId };
-  }
-
-  const doc = {
-    zadanieId,
-    monitorId,
-    score: 1.0,
+  // Zapis do Mongo ZAWSZE
+  const { insertedId } = await ocenyZmienCol.insertOne({
     createdAt: new Date(),
-    type: 'change_evaluation',
+    monitorId,
+    zadanieId,
     url,
-    diff,
-    llm_decision: parsed,
+    llm_mode: usedMode, // 'text'
+    model: usedModel,
+    prompt_used: usedPrompt,
     raw_response: raw,
+    vision_ocr: {
+      prev: summarizeOcrForStorage(prevOcr),
+      next: summarizeOcrForStorage(newOcr),
+    },
+    llm_decision: llmDecision,
     error: null,
-  };
-
-  const { insertedId } = await ocenyZmienCol.insertOne(doc);
+    durationMs: Math.round(performance.now() - tEval0),
+  });
 
   log.info('llm_change_eval_success', {
     monitorId,
     zadanieId,
     mongoId: insertedId,
-    important: parsed?.important === true,
-    category: parsed?.category || null,
+    important: !!llmDecision?.important,
+    category: llmDecision?.category || null,
+    usedMode,
+    usedModel,
   });
 
-  return { parsed, raw, mongoId: insertedId };
+  return { parsed: llmDecision, raw, mongoId: insertedId };
 }
-
 
 export async function saveDetectionAndNotification(
   {
@@ -356,14 +649,12 @@ export async function saveDetectionAndNotification(
   },
   { logger } = {},
 ) {
-const log = logger || console;
-const tSave0 = performance.now();
-let detectionId = null;
-let ok = false;
+  const log = logger || console;
+  const tSave0 = performance.now();
+  let detectionId = null;
+  let ok = false;
 
-const client = await pool.connect();
-
-
+  const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
@@ -405,21 +696,13 @@ const client = await pool.connect();
 
     detectionId = detectionsRes.rows[0].id;
 
-
-    // jeśli LLM uznał zmianę za nieistotną – zapisujemy wykrycie, ale bez powiadomienia
+    // jeśli nieistotne – bez powiadomienia
     if (llmDecision.important !== true) {
       await client.query('COMMIT');
-      log.info('saveDetectionAndNotification_not_important', {
-        monitorId,
-        zadanieId,
-        detectionId,
-      });
       ok = true;
-return { detectionId };
-
+      return { detectionId };
     }
 
-    // pobranie użytkownika z monitora
     const monitorRes = await client.query(
       `SELECT uzytkownik_id FROM monitory WHERE id = $1`,
       [monitorId],
@@ -434,12 +717,12 @@ return { detectionId };
         detectionId,
       });
       await client.query('COMMIT');
+      ok = true;
       return { detectionId };
     }
 
     const uzytkownikId = userRow.uzytkownik_id;
 
-    // tworzymy powiadomienie
     await client.query(
       `
       INSERT INTO powiadomienia (
@@ -465,6 +748,7 @@ return { detectionId };
     );
 
     await client.query('COMMIT');
+    ok = true;
 
     log.info('saveDetectionAndNotification_created_notification', {
       monitorId,
@@ -483,17 +767,16 @@ return { detectionId };
       stack: err?.stack,
     });
     throw err;
-} finally {
-  log.info('save_detection_done', {
-    monitorId,
-    zadanieId,
-    url,
-    detectionId,
-    ok,
-    durationMs: Math.round(performance.now() - tSave0),
-  });
+  } finally {
+    log.info('save_detection_done', {
+      monitorId,
+      zadanieId,
+      url,
+      detectionId,
+      ok,
+      durationMs: Math.round(performance.now() - tSave0),
+    });
 
-  client.release();
+    client.release();
+  }
 }
-}
-
