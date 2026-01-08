@@ -1,0 +1,92 @@
+<div class="card card--full">
+  <div class="card-head">
+    <div>
+      <h2 class="title">Historia skanów</h2>
+      <p class="subtitle">Zakończone wykonania (ok / blad / anulowane). Kliknij „Szczegóły”, żeby podejrzeć migawkę i analizę.</p>
+    </div>
+    <button class="btn btn--ghost" id="histRefresh">Odśwież</button>
+  </div>
+
+  <div class="filters filters--history">
+    <input id="histQ" class="input" placeholder="Szukaj po nazwie monitora lub URL..." />
+    <select id="histStatus" class="input">
+      <option value="">Wszystkie statusy</option>
+      <option value="ok">ok</option>
+      <option value="blad">blad</option>
+      <option value="anulowane">anulowane</option>
+    </select>
+    <select id="histLimit" class="input">
+      <option value="20">20 / stronę</option>
+      <option value="50">50 / stronę</option>
+      <option value="100">100 / stronę</option>
+    </select>
+    <div class="filters-row">
+      <input id="histFrom" class="input" type="datetime-local" />
+      <input id="histTo" class="input" type="datetime-local" />
+    </div>
+    <div class="hint">Zakres czasu jest opcjonalny. Jeśli pusty — Trackly pokaże najnowsze wykonania.</div>
+  </div>
+
+  <div class="table-wrap">
+    <table class="table" aria-label="Historia skanów">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Monitor</th>
+          <th>Status</th>
+          <th>Start</th>
+          <th>Koniec</th>
+          <th>Czas</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="histBody"></tbody>
+    </table>
+    <div class="hint" id="histEmpty" style="display:none; margin-top:10px;">Brak zakończonych wykonań dla wybranych filtrów.</div>
+  </div>
+
+  <div class="pager">
+    <button class="btn btn--ghost" id="histPrev">◀ Poprzednia</button>
+    <div class="hint" id="histPageLabel"></div>
+    <button class="btn btn--ghost" id="histNext">Następna ▶</button>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="histModalBackdrop" style="display:none;">
+  <div class="card modal" role="dialog" aria-modal="true" aria-labelledby="histModalTitle">
+    <div class="modal-top">
+      <h3 class="modal-title" id="histModalTitle">Szczegóły wykonania</h3>
+      <button class="icon-btn" id="histModalClose" aria-label="Zamknij">✕</button>
+    </div>
+
+    <div class="modal-body">
+      <div class="row row--actions" style="margin-top:0; justify-content:flex-end;">
+        <button class="btn btn--ghost btn--sm" id="histDownload">Pobierz</button>
+        <button class="btn btn--ghost btn--sm" id="histCloseBtn">Zamknij</button>
+      </div>
+
+      <div class="hist-tabs" style="margin-top:12px;">
+        <button class="tab tab--active" data-hist-tab="meta">Meta</button>
+        <button class="tab" data-hist-tab="migawka">Migawka</button>
+        <button class="tab" data-hist-tab="analiza">Analiza / ocena</button>
+        <button class="tab" data-hist-tab="log">Log</button>
+      </div>
+
+      <div class="hist-tab-content" data-hist-pane="meta" style="margin-top:12px;">
+        <div id="histMeta" class="hint"></div>
+      </div>
+
+      <div class="hist-tab-content" data-hist-pane="migawka" style="display:none; margin-top:12px;">
+        <pre id="histMigawka" class="pre"></pre>
+      </div>
+
+      <div class="hist-tab-content" data-hist-pane="analiza" style="display:none; margin-top:12px;">
+        <pre id="histAnaliza" class="pre"></pre>
+      </div>
+
+      <div class="hist-tab-content" data-hist-pane="log" style="display:none; margin-top:12px;">
+        <pre id="histLog" class="pre"></pre>
+      </div>
+    </div>
+  </div>
+</div>

@@ -12,15 +12,19 @@
 }
 
 * { box-sizing: border-box; }
-html, body { height: 100%; }
-
-body {
+html, body {
   margin: 0;
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Inter, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji";
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+/* ====== AUTH PAGES (login/register/reset) ====== */
+body.auth {
   background: radial-gradient(1200px 1200px at 85% -10%, rgba(224,64,251,.15), transparent 60%),
               radial-gradient(1000px 1000px at -10% 100%, rgba(0,188,212,.12), transparent 60%),
               var(--bg);
-  color: var(--text);
   display: grid;
   place-items: center;
   padding: 24px;
@@ -28,7 +32,6 @@ body {
 
 .card {
   width: 100%;
-  max-width: 420px;
   background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02));
   border: 1px solid var(--muted-2);
   border-radius: var(--radius);
@@ -38,7 +41,10 @@ body {
   isolation: isolate;
 }
 
-.card::before {
+/* węższa karta tylko na auth */
+body.auth .card { max-width: 420px; }
+
+body.auth .card::before {
   content: "";
   position: absolute;
   inset: -2px;
@@ -47,7 +53,7 @@ body {
   z-index: -1;
 }
 
-header {
+body.auth .card > header {
   padding: 28px 28px 0 28px;
   display: flex;
   align-items: center;
@@ -101,6 +107,10 @@ label {
   border-color: var(--accent-blue);
   box-shadow: 0 0 0 4px rgba(0,188,212,.2);
 }
+.input::placeholder { color: #9aa0a6; }
+
+textarea.input { resize: vertical; min-height: 120px; }
+
 .input.error {
   border-color: var(--accent-red);
   box-shadow: 0 0 0 4px rgba(239,83,80,.18);
@@ -135,9 +145,13 @@ label {
 .link:hover { text-decoration: underline; }
 
 .btn {
-  width: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: auto;
   margin-top: 18px;
-  padding: 14px 16px;
+  padding: 12px 14px;
   border-radius: 12px;
   border: none;
   font-weight: 700;
@@ -145,7 +159,36 @@ label {
   color: #001015;
   background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
   cursor: pointer;
-  transition: transform .06s ease, filter .2s ease;
+  transition: transform .06s ease, filter .2s ease, box-shadow .2s ease;
+}
+body.auth .btn { width: 100%; }
+
+.btn:hover { filter: brightness(1.05); }
+.btn:active { transform: translateY(1px); }
+.btn:disabled { opacity: .6; cursor: not-allowed; }
+
+.btn:focus-visible,
+.input:focus-visible,
+.link:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 4px rgba(0,188,212,.22);
+}
+
+/* warianty */
+.btn--ghost{
+  background: #181818;
+  color: var(--text);
+  border: 1px solid var(--muted-2);
+}
+.btn--ghost:hover{ background:#ffffff10; filter:none; }
+.btn--danger{
+  background: linear-gradient(135deg, var(--accent-red), #ff8a80);
+}
+.btn--sm{
+  margin-top: 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  font-size: .92rem;
 }
 .btn:hover { filter: brightness(1.05); }
 .btn:active { transform: translateY(1px); }
@@ -207,6 +250,8 @@ body.app {
   color: var(--text);
   min-height: 100vh;
 }
+
+body.app .btn{ margin-top: 0; }
 
 /* Siatka: sidebar + content */
 .app-layout {
@@ -299,8 +344,9 @@ body.app {
 
 /* Główna treść */
 .app-content .card{
-  max-width: 66.666%;
-  margin: 16px auto;  /* center */
+  width: 100%;
+  max-width: 980px;
+  margin: 16px auto;
 }
 
 /* Hamburger (mobile) */
@@ -376,25 +422,27 @@ body.app {
 }
 
 /* przyciski – trzymajmy przy prawej, ale w obrębie 2/3 */
-.card.card--full .row:last-child{
-  display: flex;
-  justify-content: flex-end;
-  gap: 12px;
-}
-
 .app-content .card .row{
   display: grid;
   grid-template-columns: 1fr 180px; /* input liczbowy + select */
   gap: 12px;
 }
 
-/* Przyciski na dole przy prawej krawędzi karty */
-.app-content .card .row:last-child{
+.row--actions{
   display: flex;
   justify-content: flex-end;
   gap: 12px;
+  align-items: center;
 }
 
+.row--pager{
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+body.app .row--pager .btn{ width: 100%; } /* pager: dwa równe przyciski */
+/* Przyciski na dole przy prawej krawędzi karty */
 /* --- Moje sondy: idealne wyrównanie kart --- */
 #msList {
   display: grid;
@@ -416,3 +464,147 @@ body.app {
   box-sizing: border-box;
 }
 
+
+
+/* ====== MODAL ====== */
+.modal-backdrop{
+  position: fixed;
+  inset: 0;
+  background: rgb(0,0,0);
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  z-index: 1000;
+}
+.modal{
+  width: min(820px, 96vw);
+  max-height: 92vh;
+  overflow: auto;
+}
+.modal-top{
+  display:flex;
+  align-items:center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 20px 0 20px;
+}
+.modal-title{
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 800;
+}
+.icon-btn{
+  border: 1px solid var(--muted-2);
+  background: transparent;
+  color: var(--text);
+  border-radius: 10px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.icon-btn:hover{ background: #ffffff10; }
+.modal-body{
+  padding: 0 20px 18px 20px;
+}
+
+
+/* ====== STATYSTYKI ====== */
+.kpi-grid{
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 8px;
+}
+.kpi{
+  background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02));
+  border: 1px solid var(--muted-2);
+  border-radius: 14px;
+  padding: 14px 14px;
+}
+.kpi-label{ font-size:.85rem; color:#cfcfcf; }
+.kpi-value{ margin-top:6px; font-size:1.35rem; font-weight: 800; letter-spacing:.2px; }
+.kpi-hint{ margin-top:6px; font-size:.8rem; color:#bdbdbd; }
+
+.section{ margin-top: 18px; }
+.section-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.section-head h3{
+  margin: 0;
+  font-size: 1rem;
+}
+.table-wrap{
+  overflow:auto;
+  border: 1px solid var(--muted-2);
+  border-radius: 14px;
+  background: rgba(255,255,255,.02);
+}
+.table{
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 860px;
+}
+.table th, .table td{
+  padding: 12px 12px;
+  border-bottom: 1px solid rgba(255,255,255,.06);
+  vertical-align: top;
+}
+.table th{
+  text-align: left;
+  font-size: .85rem;
+  color: #dcdcdc;
+  background: rgba(255,255,255,.03);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.table td{ font-size: .9rem; }
+.mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: .82rem; color:#d0d0d0; }
+
+@media (max-width: 960px){
+  .kpi-grid{ grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 520px){
+  .kpi-grid{ grid-template-columns: 1fr; }
+}
+
+/* ====== HISTORIA ====== */
+.pill{
+  display:inline-block;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-weight: 700;
+  font-size: 12px;
+  background: #ffffff10;
+  border: 1px solid #ffffff18;
+}
+.pill--ok{ background:#1f8f4a33; border-color:#1f8f4a66; }
+.pill--blad{ background:#ff4d4d33; border-color:#ff4d4d66; }
+.pill--anulowane{ background:#88888833; border-color:#88888866; }
+
+.pre{
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #0b0b0b;
+  border: 1px solid #ffffff12;
+  border-radius: 14px;
+  padding: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.tab{
+  border: 1px solid #ffffff18;
+  background: #ffffff08;
+  color: #fff;
+  border-radius: 999px;
+  padding: 8px 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.tab:hover{ background:#ffffff12; }
+.tab--active{ background:#ffffff18; border-color:#ffffff30; }
