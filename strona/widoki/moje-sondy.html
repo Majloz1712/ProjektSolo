@@ -14,13 +14,13 @@
 </div>
 
 <!-- WYRÓWNANIE DO PRAWEJ: select + przycisk w jednym wierszu -->
-<div class="row" style="margin: 6px 0 16px 0; justify-content: flex-end; gap: 12px;">
+<div class="row row--actions" style="margin: 6px 0 16px 0;">
   <select id="msLimit" class="input" style="max-width:180px">
     <option value="10">10 / stronę</option>
     <option value="20" selected>20 / stronę</option>
     <option value="50">50 / stronę</option>
   </select>
-  <button id="msRefresh" class="btn" style="max-width:220px">Odśwież</button>
+  <button id="msRefresh" class="btn btn--sm" style="max-width:220px">Odśwież</button>
 </div>
     <div id="msInfo" class="hint"></div>
 
@@ -30,9 +30,9 @@
       Brak sond. Dodaj pierwszą w zakładce „Dodaj sondę”.
     </div>
 
-    <div id="msPager" class="row" style="margin-top:16px; grid-template-columns: 1fr 1fr;">
-      <button id="msPrev" class="btn" style="max-width:200px">◀ Poprzednia</button>
-      <button id="msNext" class="btn" style="max-width:200px">Następna ▶</button>
+    <div id="msPager" class="row row--pager" style="margin-top:16px;">
+      <button id="msPrev" class="btn btn--sm">◀ Poprzednia</button>
+      <button id="msNext" class="btn btn--sm">Następna ▶</button>
     </div>
   </div>
 </div>

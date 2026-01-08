@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Aplikacja Sondowa – Panel</title>
+  <title>Trackly – Panel</title>
   <link rel="stylesheet" href="/styl/styles.css" />
 
   <!-- Minimalne style layoutu (nie gryzą się z Twoim styles.css) -->
@@ -14,7 +14,7 @@
     <div class="app-brand">
       <button class="app-hamburger" id="btnHamburger" aria-label="Menu">&#9776;</button>
       <div class="app-logo">LOGO</div>
-      <div>Aplikacja Sondowa</div>
+      <div>Trackly</div>
     </div>
 
     <div class="app-userbox">
@@ -32,8 +32,8 @@
     <aside class="app-sidebar" id="sidebar">
       <button class="app-nav-btn" data-view="moje-sondy">Moje sondy</button>
       <button class="app-nav-btn" data-view="dodaj-sonde">Dodaj sondę</button>
-      <button class="app-nav-btn" data-view="edytuj-sonde">Edytuj sondę</button>
-      <button class="app-nav-btn" data-view="statystyki">Statystyki</button>
+<button class="app-nav-btn" data-view="statystyki">Statystyki</button>
+        <button class="app-nav-btn" data-view="historia">Historia</button>
       <button class="app-nav-btn app-nav-btn--logout" data-view="wyloguj">Wyloguj</button>
     </aside>
 
@@ -41,7 +41,7 @@
   </div>
 
   <!-- FOOTER -->
-  <footer class="app-footer">© 2025 Twoja Aplikacja Sondowa • <a class="link" href="#">Kontakt</a></footer>
+  <footer class="app-footer">© 2025 Trackly • <a class="link" href="#">Kontakt</a></footer>
 </body>
 
   <script src="/skrypt/app.js"></script>
@@ -71,7 +71,42 @@
       if (!act) return;
       if (act === "logout") logoutUser();
       if (act === "change-password") window.location.href = "/resetHasla.html";
-      if (act === "account-settings") alert("Ustawienia konta – w przygotowaniu.");
+      if (act === "account-settings") {
+  const name = localStorage.getItem("userFullname") || "—";
+  const email = localStorage.getItem("userEmail") || "—";
+
+  createModal({
+    title: "Ustawienia konta",
+    contentHtml: `
+      <div class="hint" style="margin-bottom:12px;">
+        Poniżej podstawowe informacje o koncie (reszta opcji może dojść później).
+      </div>
+
+      <div class="card" style="padding:14px; margin-bottom:12px;">
+        <div style="display:grid; gap:8px;">
+          <div><strong>Imię i nazwisko:</strong> ${name}</div>
+          <div><strong>E-mail:</strong> ${email}</div>
+        </div>
+      </div>
+
+      <div class="row row--actions" style="margin-top:10px;">
+        <button class="btn btn--sm" type="button" id="accChangePass">Zmień hasło</button>
+        <button class="btn btn--ghost btn--sm" type="button" id="accLogout">Wyloguj</button>
+      </div>
+    `
+  });
+
+  // obsługa przycisków modala
+  setTimeout(() => {
+    document.getElementById("accChangePass")?.addEventListener("click", () => {
+      window.location.href = "/resetHasla.html";
+    });
+    document.getElementById("accLogout")?.addEventListener("click", () => {
+      logoutUser();
+    });
+  }, 0);
+}
+
     });
   })();
 
@@ -85,6 +120,188 @@
     });
   })();
 
+  
+// ====== MODAL + EDYCJA SONDY (UI) ======
+function createModal({ title, contentHtml }){
+  const wrap = document.createElement('div');
+  wrap.className = 'modal-backdrop';
+  wrap.innerHTML = `
+    <div class="card modal" role="dialog" aria-modal="true" aria-label="${title}">
+      <div class="modal-top">
+        <div class="modal-title">${title}</div>
+        <button class="icon-btn" type="button" data-modal-close aria-label="Zamknij">✕</button>
+      </div>
+      <div class="modal-body">${contentHtml}</div>
+    </div>
+  `;
+  const close = () => wrap.remove();
+  wrap.addEventListener('click', (e) => { if (e.target === wrap) close(); });
+  wrap.querySelector('[data-modal-close]')?.addEventListener('click', close);
+
+  const esc = (ev) => { if (ev.key === 'Escape'){ close(); document.removeEventListener('keydown', esc); } };
+  document.addEventListener('keydown', esc);
+
+  document.body.appendChild(wrap);
+  return { el: wrap, close };
+}
+
+function intervalPartsFromSeconds(seconds){
+  const s = Number(seconds || 0);
+  if (!s || s < 60) return { value: s || 1, unit: 'second' };
+  if (s % 3600 === 0) return { value: s / 3600, unit: 'hour' };
+  if (s % 60 === 0)   return { value: s / 60, unit: 'minute' };
+  return { value: s, unit: 'second' };
+}
+
+function secondsFromInterval(value, unit){
+  const v = Number(value);
+  const multiplier = unit === 'hour' ? 3600 : (unit === 'minute' ? 60 : 1);
+  return v * multiplier;
+}
+
+async function fetchMonitorDetails(id){
+  const jwt = localStorage.getItem('jwt') || '';
+  const headers = jwt ? { 'Authorization': `Bearer ${jwt}` } : {};
+  let r = await fetch(`/api/monitory/${id}`, { headers, cache: 'no-store' });
+  if (r.status === 404) r = await fetch(`/api/monitory?id=${encodeURIComponent(id)}`, { headers, cache: 'no-store' });
+  if (!r.ok) throw new Error('Nie udało się pobrać danych sondy.');
+  const data = await r.json().catch(() => ({}));
+  return data?.item || data;
+}
+
+function renderEditFormHTML(probe){
+  const p = probe || {};
+  const parts = intervalPartsFromSeconds(p.interval_seconds);
+  const prompt = (p.prompt || p.llm_prompt || '') ?? '';
+  const type = p.type || p.scan_type || 'screenshot';
+  const esc = (s) => String(s ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('"','&quot;');
+
+  return `
+    <form id="formEditProbe" novalidate>
+      <div class="field">
+        <label for="editName">Nazwa sondy</label>
+        <input id="editName" class="input" name="name" type="text" maxlength="150" required value="${esc(p.name)}" />
+      </div>
+
+      <div class="field">
+        <label for="editUrl">Link do strony (URL)</label>
+        <input id="editUrl" class="input" name="url" type="url" required value="${esc(p.url)}" />
+      </div>
+
+      <div class="field">
+        <label for="editType">Typ skanowania</label>
+        <select id="editType" class="input" name="type" required>
+          <option value="screenshot" ${type === 'screenshot' ? 'selected' : ''}>Screenshot (wizualnie)</option>
+          <option value="html" ${type === 'html' ? 'selected' : ''}>Tradycyjna (tekst/HTML)</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="editIntervalValue">Co ile wykonywać sondę</label>
+        <div class="row">
+          <input id="editIntervalValue" class="input" name="interval_value" type="number" min="1" step="1" required value="${parts.value}" />
+          <select id="editIntervalUnit" class="input" name="interval_unit" required>
+            <option value="minute" ${parts.unit === 'minute' ? 'selected' : ''}>minut(y)</option>
+            <option value="hour" ${parts.unit === 'hour' ? 'selected' : ''}>godzin(y)</option>
+            <option value="second" ${parts.unit === 'second' ? 'selected' : ''}>sekund(y)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="editPrompt">Dodatkowy prompt (opcjonalnie)</label>
+        <textarea id="editPrompt" class="input" name="prompt" rows="6" maxlength="1200">${esc(prompt)}</textarea>
+        <div class="row" style="justify-content:flex-end; margin-top:8px;">
+          <div class="hint" id="editPromptCounter">0 / 1200</div>
+        </div>
+      </div>
+
+      <div class="messages" id="editMessages" aria-live="polite"></div>
+
+      <div class="row row--actions" style="margin-top:14px;">
+        <button type="button" class="btn btn--ghost btn--sm" data-cancel>Anuluj</button>
+        <button type="submit" class="btn btn--sm" data-submit>Zatwierdź</button>
+      </div>
+    </form>
+  `;
+}
+
+function initEditForm(modalRoot, { id, onDone, onCancel }){
+  const form = modalRoot.querySelector('#formEditProbe');
+  if (!form) return;
+
+  const nameEl = form.querySelector('#editName');
+  const urlEl  = form.querySelector('#editUrl');
+  const typeEl = form.querySelector('#editType');
+  const intVEl = form.querySelector('#editIntervalValue');
+  const intUEl = form.querySelector('#editIntervalUnit');
+  const promptEl = form.querySelector('#editPrompt');
+  const msgEl  = form.querySelector('#editMessages');
+  const counterEl = form.querySelector('#editPromptCounter');
+  const submitBtn = form.querySelector('[data-submit]');
+  const cancelBtn = form.querySelector('[data-cancel]');
+
+  const updateCounter = () => { counterEl.textContent = `${(promptEl.value?.length || 0)} / 1200`; };
+  promptEl.addEventListener('input', updateCounter);
+  updateCounter();
+
+  const showMessage = (t, ok=false) => {
+    msgEl.textContent = t;
+    msgEl.className = 'messages ' + (ok ? 'msg-ok' : 'msg-error');
+  };
+  const clearErrors = () => {
+    [nameEl, urlEl, typeEl, intVEl, intUEl].forEach(el => el?.classList.remove('error'));
+    showMessage('');
+  };
+
+  cancelBtn.addEventListener('click', () => onCancel?.());
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    clearErrors();
+
+    const name = (nameEl.value || '').trim();
+    const url  = (urlEl.value || '').trim();
+    const type = (typeEl.value || '').trim();
+    const val  = Number(intVEl.value);
+    const unit = intUEl.value;
+    const prompt = (promptEl.value || '').trim() || null;
+
+    // prosta walidacja
+    if (!name) { nameEl.classList.add('error'); return showMessage('Podaj nazwę sondy.'); }
+    try { const u = new URL(url); if (!['http:','https:'].includes(u.protocol)) throw 0; }
+    catch { urlEl.classList.add('error'); return showMessage('Podaj poprawny URL (http/https).'); }
+    if (!type) { typeEl.classList.add('error'); return showMessage('Wybierz typ skanowania.'); }
+    if (!val || val < 1) { intVEl.classList.add('error'); return showMessage('Częstotliwość musi być ≥ 1.'); }
+
+    const interval_seconds = secondsFromInterval(val, unit);
+    const payload = { name, url, type, interval_seconds, prompt };
+
+    const jwt = localStorage.getItem('jwt') || '';
+    const headers = {
+      'Content-Type': 'application/json',
+      ...(jwt ? { 'Authorization': `Bearer ${jwt}` } : {})
+    };
+
+    try {
+      submitBtn.disabled = true;
+      let r = await fetch(`/api/monitory/${id}`, { method: 'PATCH', headers, body: JSON.stringify(payload) });
+      if (r.status === 404) r = await fetch(`/api/monitory?id=${encodeURIComponent(id)}`, { method: 'PATCH', headers, body: JSON.stringify(payload) });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err?.message || 'Nie udało się zapisać zmian.');
+      }
+      showMessage('Zapisano zmiany.', true);
+      onDone?.();
+    } catch (err){
+      showMessage(err.message || 'Wystąpił błąd.');
+    } finally {
+      submitBtn.disabled = false;
+    }
+  });
+}
+
+
   // ====== FUNKCJA INICJALIZUJĄCA FORMULARZ "DODAJ SONDĘ" ======
   function initDodajSonde(root) {
     const form      = root.querySelector('#formAddProbe');
@@ -92,6 +309,7 @@
 
     const nameEl    = root.querySelector('#probeName');
     const urlEl     = root.querySelector('#probeUrl');
+    const typeEl    = root.querySelector('#scanType');
     const intValEl  = root.querySelector('#intervalValue');
     const intUnitEl = root.querySelector('#intervalUnit');
     const promptEl  = root.querySelector('#llmPrompt');
@@ -130,16 +348,18 @@
       const val   = Number(intValEl.value);
       const unit  = intUnitEl.value; // 'second' | 'minute' | 'hour'
       const llm_prompt = (promptEl.value || '').trim() || null;
+      const type  = (typeEl?.value || 'screenshot');
 
       if (!nazwa) { nameEl.classList.add('error'); return showMessage('Podaj nazwę sondy.'); }
       if (!isValidUrl(url)) { urlEl.classList.add('error'); return showMessage('Podaj poprawny URL (http/https).'); }
       if (!val || val < 1) { intValEl.classList.add('error'); return showMessage('Częstotliwość musi być ≥ 1.'); }
+      if (typeEl && !type) { typeEl.classList.add('error'); return showMessage('Wybierz typ skanowania.'); }
       if (!unit) { intUnitEl.classList.add('error'); return showMessage('Wybierz jednostkę czasu.'); }
 
       const multiplier = unit === 'hour' ? 3600 : (unit === 'minute' ? 60 : 1);
       const interval_seconds = val * multiplier;
 
-      const payload = { name: nazwa, url, interval_seconds, prompt: llm_prompt };
+      const payload = { name: nazwa, url, type, interval_seconds, prompt: llm_prompt };
 
       try {
         btnAdd.disabled = true;
@@ -161,42 +381,55 @@
       }
     });
   }
-  function msRenderCard(item){
-    const interval = (s) => {
-      if (!s || s < 60) return `${s ?? '?'} s`;
-      if (s < 3600)     return `${Math.round(s/60)} min`;
-      return `${(s/3600).toFixed(1)} h`;
-    };
-    const last = item.last_check_at ? new Date(item.last_check_at).toLocaleString() : '—';
-    const statusBadge =
-      item.status === 'paused' ? 'Wstrzymana' :
-      item.status === 'error'  ? 'Błąd' :
-      'Aktywna';
+function msRenderCard(item){
+  const interval = (s) => {
+    if (!s || s < 60) return `${s ?? '?'} s`;
+    if (s < 3600)     return `${Math.round(s/60)} min`;
+    return `${(s/3600).toFixed(1)} h`;
+  };
 
-    return `
-      <div class="card" data-id="${item.id}">
-        <div class="card-body" style="padding:18px">
-          <div style="display:flex; justify-content:space-between; gap:12px; align-items:center;">
-            <div>
-              <div style="font-weight:700; font-size:1.05rem">${item.name}</div>
-              <div class="hint" style="margin-top:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${item.url}</div>
-            </div>
-            <div class="hint" style="text-align:right; min-width:180px;">
-              <div><strong>Interwał:</strong> ${interval(item.interval_seconds)}</div>
-              <div><strong>Ostatnie sprawdz.</strong> ${last}</div>
-              <div><strong>Status:</strong> ${statusBadge}</div>
-            </div>
+  const last = item.last_check_at ? new Date(item.last_check_at).toLocaleString() : '—';
+
+  const statusBadge =
+    item.status === 'paused' ? 'Wstrzymana' :
+    item.status === 'error'  ? 'Błąd' :
+    'Aktywna';
+
+  const scanTypeRaw = item.type || item.scan_type || item.tryb_skanu || "screenshot";
+  const scanTypeLabel =
+    scanTypeRaw === "static" || scanTypeRaw === "html" ? "tradycyjna" : "screenshot";
+
+  // zamiast pełnego URL pokaż tylko host (krótko) — nie wypycha UI
+  let host = "—";
+  try { host = new URL(item.url).host; } catch {}
+
+  return `
+    <div class="card" data-id="${item.id}">
+      <div class="card-body" style="padding:18px">
+        <div style="display:flex; justify-content:space-between; gap:12px; align-items:center;">
+          <div style="min-width:0;">
+            <div style="font-weight:700; font-size:1.05rem">${item.name}</div>
+            <div class="hint" style="margin-top:4px;">${host}</div>
           </div>
 
-          <div class="row" style="margin-top:14px; display:flex; justify-content:flex-end; gap:10px;">
-            <button class="btn" data-action="toggle">${item.status==='paused' ? 'Uruchom' : 'Wstrzymaj'}</button>
-            <button class="btn" data-action="logs">Logi</button>
-            <button class="btn" data-action="delete" style="background:linear-gradient(135deg, var(--accent-red), #ff8a80)">Usuń</button>
+          <div class="hint" style="text-align:right; min-width:220px;">
+            <div><strong>Interwał:</strong> ${interval(item.interval_seconds)}</div>
+            <div><strong>Ostatnie sprawdz.</strong> ${last}</div>
+            <div><strong>Status:</strong> ${statusBadge}</div>
+            <div><strong>Typ:</strong> ${scanTypeLabel}</div>
           </div>
         </div>
+
+        <div class="row row--actions" style="margin-top:14px;">
+          <button class="btn btn--sm" data-action="toggle">${item.status==='paused' ? 'Uruchom' : 'Wstrzymaj'}</button>
+          <button class="btn btn--ghost btn--sm" data-action="edit">Edytuj</button>
+          <button class="btn btn--danger btn--sm" data-action="delete">Usuń</button>
+        </div>
       </div>
-    `;
-  }
+    </div>
+  `;
+}
+
 
   // === WIDOK "MOJE SONDY" (pełna, gotowa funkcja) ===
   function initMojeSondy(root){
@@ -355,10 +588,23 @@
           return;
         }
 
-        if (action === 'logs'){
-          window.open(`/api/monitory/${id}/logs`, '_blank');
-          return;
-        }
+
+if (action === 'edit'){
+  // pobierz pełne dane (fallback: to co mamy w karcie)
+  let probe;
+  try { probe = await fetchMonitorDetails(id); }
+  catch { probe = { id, name: card.querySelector('div[style*="font-weight:700"]')?.textContent || '', url: card.querySelector('.hint')?.textContent || '' }; }
+
+  const { el, close } = createModal({
+    title: 'Edytuj sondę',
+    contentHtml: renderEditFormHTML(probe)
+  });
+
+  const modalRoot = el.querySelector('.modal-body');
+  initEditForm(modalRoot, { id, onDone: async () => { close(); await load(); }, onCancel: close });
+  return;
+}
+
       } catch (err){
         alert(err.message || 'Operacja nie powiodła się.');
       }
@@ -382,7 +628,9 @@
 
       // podłączanie logik do widoków
       initDodajSonde(content); // już było
-      initMojeSondy(content);  // ⬅ NOWE
+      initMojeSondy(content);
+      initStatystyki(content);
+      initHistoria(content);  // ⬅ NOWE
 
       // aktywny przycisk + hash
       document.querySelectorAll(".app-nav-btn")
@@ -408,6 +656,483 @@
     const fromHash = location.hash.match(/view=([^&]+)/)?.[1];
     loadView(fromHash || "moje-sondy");
   })();
+
+
+
+  function fmtDateTimePL(iso){
+    if(!iso) return "—";
+    const d = new Date(iso);
+    return d.toLocaleString("pl-PL");
+  }
+  function fmtDurationSec(sec){
+    if(sec == null) return "—";
+    const s = Number(sec);
+    if(Number.isNaN(s)) return "—";
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const r = s % 60;
+    if(h>0) return `${h}h ${m}m`;
+    if(m>0) return `${m}m ${r}s`;
+    return `${r}s`;
+  }
+  function authHeaders(){
+    const jwt = localStorage.getItem("jwt");
+    return jwt ? { "Authorization": `Bearer ${jwt}` } : {};
+  }
+
+  async function initStatystyki(root){
+    const kpisEl = root.querySelector("#stKpis");
+    if(!kpisEl) return;
+
+    const btnRefresh = root.querySelector("#stRefresh");
+    const btnStopAllScan = root.querySelector("#stStopAllScan");
+    const btnStopAllPlugin = root.querySelector("#stStopAllPlugin");
+
+    async function load(){
+      kpisEl.innerHTML = "";
+      const scanBody = root.querySelector("#stScanBody");
+      const scanEmpty = root.querySelector("#stScanEmpty");
+      const plugBody = root.querySelector("#stPluginBody");
+      const plugEmpty = root.querySelector("#stPluginEmpty");
+      if(scanBody) scanBody.innerHTML = "";
+      if(plugBody) plugBody.innerHTML = "";
+      if(scanEmpty) scanEmpty.style.display = "none";
+      if(plugEmpty) plugEmpty.style.display = "none";
+
+      const r = await fetch("/api/statystyki", { headers: authHeaders(), cache:"no-store" });
+      if(!r.ok) throw new Error("Nie udało się pobrać statystyk.");
+      const data = await r.json();
+
+      const monitors = data.monitors_total ?? 0;
+      const total = data.scan_tasks?.total ?? 0;
+      const ok = data.scan_tasks?.by_status?.ok ?? 0;
+      const err = data.scan_tasks?.by_status?.blad ?? 0;
+      const inprog = data.scan_tasks?.in_progress_count ?? 0;
+      const analyses = data.analyses?.total ?? 0;
+
+      kpisEl.innerHTML = `
+        <div class="kpi">
+          <div class="kpi-title">Monitory</div>
+          <div class="kpi-value">${monitors}</div>
+          <div class="kpi-sub">Łącznie Twoich sond</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-title">Zadania skanu</div>
+          <div class="kpi-value">${total}</div>
+          <div class="kpi-sub">W trakcie: ${inprog}</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-title">Analizy</div>
+          <div class="kpi-value">${analyses}</div>
+          <div class="kpi-sub">Zapisane w Mongo/PG</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-title">Błędy</div>
+          <div class="kpi-value">${err}</div>
+          <div class="kpi-sub">Pomyślne: ${ok}</div>
+        </div>
+      `;
+
+      // scan in progress
+      const scanRows = data.scan_tasks?.in_progress ?? [];
+      if(!scanRows.length){
+        if(scanEmpty) scanEmpty.style.display = "block";
+      } else if(scanBody){
+        scanBody.innerHTML = scanRows.map(row => `
+          <tr>
+            <td class="mono">${row.id}</td>
+            <td>${row.monitor_name ?? row.monitorName ?? row.monitor ?? "—"}</td>
+            <td><span class="pill pill--warn">${row.status}</span></td>
+            <td>${fmtDateTimePL(row.rozpoczecie_at || row.started_at || row.start)}</td>
+            <td>${fmtDurationSec(row.duration_seconds ?? row.duration_sec ?? row.duration)}</td>
+            <td>${fmtDateTimePL(row.zakonczenie_at || row.end)}</td>
+            <td style="text-align:right">
+              <button class="btn btn--danger btn--sm" data-stop-scan="${row.id}">Zatrzymaj</button>
+            </td>
+          </tr>
+        `).join("");
+
+        scanBody.querySelectorAll("[data-stop-scan]").forEach(btn=>{
+          btn.addEventListener("click", async ()=>{
+            const id = btn.getAttribute("data-stop-scan");
+            btn.disabled = true;
+            try{
+              const rr = await fetch(`/api/statystyki/zadania/${id}/stop`, { method:"POST", headers: { ...authHeaders(), "Content-Type":"application/json" }});
+              if(!rr.ok) throw new Error();
+              await load();
+            }catch(e){
+              alert("Nie udało się zatrzymać zadania.");
+              btn.disabled = false;
+            }
+          });
+        });
+      }
+
+      // plugin in progress (may be empty)
+      const plugRows = data.plugin_tasks?.in_progress ?? [];
+      if(!plugRows.length){
+        if(plugEmpty) plugEmpty.style.display = "block";
+      } else if(plugBody){
+        plugBody.innerHTML = plugRows.map(row => `
+          <tr>
+            <td class="mono">${row.id ?? row._id ?? "—"}</td>
+            <td>${row.monitor_name ?? row.monitorName ?? row.monitorId ?? row.monitor_id ?? "—"}</td>
+            <td><span class="pill pill--warn">${row.status ?? "—"}</span></td>
+            <td>${fmtDateTimePL(row.startedAt || row.start || row.createdAt || row.utworzone_at)}</td>
+            <td>${fmtDurationSec(row.duration_seconds ?? row.duration_sec ?? row.duration)}</td>
+            <td style="text-align:right">
+              <button class="btn btn--danger btn--sm" data-stop-plugin="${row.id ?? row._id ?? ""}">Zatrzymaj</button>
+            </td>
+          </tr>
+        `).join("");
+
+        plugBody.querySelectorAll("[data-stop-plugin]").forEach(btn=>{
+          btn.addEventListener("click", async ()=>{
+            const id = btn.getAttribute("data-stop-plugin");
+            if(!id) return;
+            btn.disabled = true;
+            try{
+              const rr = await fetch(`/api/statystyki/plugin-tasks/${id}/stop`, { method:"POST", headers: { ...authHeaders(), "Content-Type":"application/json" }});
+              if(!rr.ok) throw new Error();
+              await load();
+            }catch(e){
+              alert("Nie udało się zatrzymać plugin taska.");
+              btn.disabled = false;
+            }
+          });
+        });
+      }
+    }
+
+    btnRefresh?.addEventListener("click", load);
+    btnStopAllScan?.addEventListener("click", async ()=>{
+      if(!confirm("Zatrzymać wszystkie zadania skanu w trakcie?")) return;
+      await fetch(`/api/statystyki/zadania/stop-all`, { method:"POST", headers: { ...authHeaders(), "Content-Type":"application/json" }});
+      await load();
+    });
+    btnStopAllPlugin?.addEventListener("click", async ()=>{
+      if(!confirm("Zatrzymać wszystkie plugin taski w trakcie?")) return;
+      await fetch(`/api/statystyki/plugin-tasks/stop-all`, { method:"POST", headers: { ...authHeaders(), "Content-Type":"application/json" }});
+      await load();
+    });
+
+    // initial
+    load().catch(e=>{
+      console.error(e);
+      kpisEl.innerHTML = `<div class="hint">Błąd: Nie udało się pobrać statystyk.</div>`;
+      const scanEmpty = root.querySelector("#stScanEmpty");
+      const plugEmpty = root.querySelector("#stPluginEmpty");
+      if(scanEmpty) scanEmpty.style.display = "block";
+      if(plugEmpty) plugEmpty.style.display = "block";
+    });
+  }
+
+async function initHistoria(root){
+  const bodyEl = root.querySelector("#histBody");
+  if(!bodyEl) return;
+
+  const qEl = root.querySelector("#histQ");
+  const statusEl = root.querySelector("#histStatus");
+  const limitEl = root.querySelector("#histLimit");
+  const fromEl = root.querySelector("#histFrom");
+  const toEl = root.querySelector("#histTo");
+  const refreshBtn = root.querySelector("#histRefresh");
+  const emptyEl = root.querySelector("#histEmpty");
+  const pageEl = root.querySelector("#histPageLabel");
+  const prevBtn = root.querySelector("#histPrev");
+  const nextBtn = root.querySelector("#histNext");
+
+  // ✅ Modal z historia.html
+  const backdrop = root.querySelector("#histModalBackdrop");
+  const modalCloseX = root.querySelector("#histModalClose");
+  const modalCloseBtn = root.querySelector("#histCloseBtn");
+  const modalTitle = root.querySelector("#histModalTitle");
+
+  const metaEl = root.querySelector("#histMeta");
+  const migawkaEl = root.querySelector("#histMigawka");
+  const analizaEl = root.querySelector("#histAnaliza");
+  const logEl = root.querySelector("#histLog");
+  const downloadBtn = root.querySelector("#histDownload");
+
+  // Tabs (meta/migawka/analiza/log)
+  const tabBtns = Array.from(root.querySelectorAll("[data-hist-tab]"));
+  const panes = Array.from(root.querySelectorAll("[data-hist-pane]"));
+
+  let page = 1;
+  let total = 0;
+  let pageSize = 20;
+
+  // tekst do pobrania (Pobierz)
+  let currentDownloadText = "";
+  let currentDownloadFileName = "szczegoly.txt";
+
+  function setActiveTab(name){
+    tabBtns.forEach(b => b.classList.toggle("tab--active", b.dataset.histTab === name));
+    panes.forEach(p => p.style.display = (p.dataset.histPane === name ? "" : "none"));
+  }
+
+  function openModal(){
+    if(!backdrop) return;
+    backdrop.style.display = "grid";
+    document.body.style.overflow = "hidden";
+    setActiveTab("meta");
+  }
+
+  function closeModal(){
+    if(!backdrop) return;
+    backdrop.style.display = "none";
+    document.body.style.overflow = "";
+  }
+
+  modalCloseX?.addEventListener("click", closeModal);
+  modalCloseBtn?.addEventListener("click", closeModal);
+  backdrop?.addEventListener("click", (e)=>{ if(e.target === backdrop) closeModal(); });
+
+  tabBtns.forEach(btn=>{
+    btn.addEventListener("click", ()=> setActiveTab(btn.dataset.histTab));
+  });
+
+  downloadBtn?.addEventListener("click", ()=>{
+    const blob = new Blob([currentDownloadText || ""], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = currentDownloadFileName || "szczegoly.txt";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+
+  function qs(){
+    const params = new URLSearchParams();
+    const q = (qEl?.value || "").trim();
+    const st = statusEl?.value || "";
+    const lim = parseInt(limitEl?.value || "20", 10);
+    const from = (fromEl?.value || "").trim();
+    const to = (toEl?.value || "").trim();
+
+    pageSize = Number.isFinite(lim) ? lim : 20;
+
+    if(q) params.set("q", q);
+    if(st) params.set("status", st);
+    if(from) params.set("from", from);
+    if(to) params.set("to", to);
+    params.set("page", String(page));
+    params.set("limit", String(pageSize));
+    return params.toString();
+  }
+
+  function safeJson(obj){
+    try { return JSON.stringify(obj, null, 2); }
+    catch { return String(obj); }
+  }
+
+  function computeDurationSeconds(it){
+    if(it?.duration_seconds != null) return Number(it.duration_seconds);
+    const s = it?.rozpoczecie_at ? new Date(it.rozpoczecie_at).getTime() : null;
+    const e = it?.zakonczenie_at ? new Date(it.zakonczenie_at).getTime() : null;
+    if(!s || !e) return null;
+    return Math.max(0, Math.floor((e - s) / 1000));
+  }
+
+  async function load(){
+    bodyEl.innerHTML = "";
+    emptyEl.style.display = "none";
+    pageEl.textContent = "";
+
+    const r = await fetch(`/api/historia?${qs()}`, { headers: authHeaders(), cache:"no-store" });
+    if(!r.ok) throw new Error("Nie udało się pobrać historii.");
+
+    const data = await r.json();
+    const items = data.items || [];
+    total = data.total || 0;
+
+    if(!items.length){
+      emptyEl.style.display = "block";
+    } else {
+      bodyEl.innerHTML = items.map(it=>{
+        const st = it.status || "—";
+        const pillClass =
+          st === "ok" ? "pill--ok"
+          : (st === "blad" ? "pill--blad"
+          : (st === "anulowane" ? "pill--anulowane" : ""));
+
+        const dur = computeDurationSeconds(it);
+
+        return `
+          <tr>
+            <td class="mono">${it.id}</td>
+            <td>${it.monitor_name || "—"}</td>
+            <td><span class="pill ${pillClass}">${st}</span></td>
+            <td>${fmtDateTimePL(it.rozpoczecie_at)}</td>
+            <td>${fmtDateTimePL(it.zakonczenie_at)}</td>
+            <td>${fmtDurationSec(dur)}</td>
+            <td style="text-align:right">
+              <button class="btn btn--primary btn--sm" data-hist-details="${it.id}">Szczegóły</button>
+            </td>
+          </tr>
+        `;
+      }).join("");
+
+      bodyEl.querySelectorAll("[data-hist-details]").forEach(btn=>{
+        btn.addEventListener("click", ()=>showDetails(btn.getAttribute("data-hist-details")));
+      });
+    }
+
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    pageEl.textContent = `Strona ${page} / ${totalPages}`;
+    prevBtn.disabled = page <= 1;
+    nextBtn.disabled = page >= totalPages;
+  }
+
+  async function showDetails(id){
+    openModal();
+
+    if(modalTitle) modalTitle.textContent = `Szczegóły wykonania: ${id}`;
+    if(metaEl) metaEl.textContent = "Ładowanie…";
+    if(migawkaEl) migawkaEl.textContent = "Ładowanie…";
+    if(analizaEl) analizaEl.textContent = "Ładowanie…";
+    if(logEl) logEl.textContent = "Ładowanie…";
+
+    const headers = authHeaders();
+
+    // Pobieramy wszystko równolegle, a potem składamy "log tekstowy" z Mongo/PG
+    const [metaRes, snapRes, analizaRes] = await Promise.allSettled([
+      fetch(`/api/historia/${id}`, { headers, cache:"no-store" }),
+      fetch(`/api/historia/${id}/migawka`, { headers, cache:"no-store" }),
+      fetch(`/api/historia/${id}/analiza`, { headers, cache:"no-store" }),
+    ]);
+
+    let meta = null;
+    let migawka = null;
+    let analiza = null;
+
+    // meta
+    try{
+      if(metaRes.status === "fulfilled" && metaRes.value.ok){
+        meta = await metaRes.value.json();
+        if(metaEl){
+          metaEl.innerHTML = `
+            <div class="hint">
+              <div><strong>Monitor:</strong> ${meta.monitor_name || "—"}</div>
+              <div><strong>Status:</strong> ${meta.status || "—"}</div>
+              <div><strong>Start:</strong> ${fmtDateTimePL(meta.rozpoczecie_at)}</div>
+              <div><strong>Koniec:</strong> ${fmtDateTimePL(meta.zakonczenie_at)}</div>
+              <div><strong>ID zadania:</strong> <span class="mono">${meta.id || id}</span></div>
+              <div><strong>Snapshot ID:</strong> <span class="mono">${meta.snapshot_mongo_id || "—"}</span></div>
+              <div><strong>Analiza ID:</strong> <span class="mono">${meta.analiza_mongo_id || "—"}</span></div>
+            </div>
+          `;
+        }
+      } else {
+        if(metaEl) metaEl.textContent = "Nie udało się pobrać metadanych.";
+      }
+    }catch{
+      if(metaEl) metaEl.textContent = "Nie udało się pobrać metadanych.";
+    }
+
+    // migawka
+    try{
+      if(snapRes.status === "fulfilled"){
+        const r = snapRes.value;
+        if(r.status === 404){
+          migawka = null;
+          if(migawkaEl) migawkaEl.textContent = "Brak migawki dla tego wykonania.";
+        } else if(r.ok){
+          migawka = await r.json();
+          if(migawkaEl) migawkaEl.textContent = migawka?.tekst || migawka?.text || safeJson(migawka);
+        } else {
+          if(migawkaEl) migawkaEl.textContent = "Nie udało się pobrać migawki.";
+        }
+      } else {
+        if(migawkaEl) migawkaEl.textContent = "Nie udało się pobrać migawki.";
+      }
+    }catch{
+      if(migawkaEl) migawkaEl.textContent = "Nie udało się pobrać migawki.";
+    }
+
+    // analiza
+    try{
+      if(analizaRes.status === "fulfilled"){
+        const r = analizaRes.value;
+        if(r.status === 404){
+          analiza = null;
+          if(analizaEl) analizaEl.textContent = "Brak analizy dla tego wykonania.";
+        } else if(r.ok){
+          analiza = await r.json();
+          if(analizaEl){
+            if(analiza?.podsumowanie || analiza?.summary){
+              analizaEl.textContent = analiza.podsumowanie || analiza.summary;
+            } else {
+              analizaEl.textContent = safeJson(analiza);
+            }
+          }
+        } else {
+          if(analizaEl) analizaEl.textContent = "Nie udało się pobrać analizy.";
+        }
+      } else {
+        if(analizaEl) analizaEl.textContent = "Nie udało się pobrać analizy.";
+      }
+    }catch{
+      if(analizaEl) analizaEl.textContent = "Nie udało się pobrać analizy.";
+    }
+
+    // ✅ Zamiast endpointu /log robimy "log tekstowy" z danych
+    const logDump = {
+      meta,
+      migawka,
+      analiza,
+    };
+
+    currentDownloadText =
+`TRACKLY — SZCZEGÓŁY WYKONANIA
+ID: ${id}
+
+=== META (PG) ===
+${safeJson(meta)}
+
+=== MIGAWKA (Mongo) ===
+${safeJson(migawka)}
+
+=== ANALIZA / OCENA (Mongo) ===
+${safeJson(analiza)}
+`;
+
+    currentDownloadFileName = `trackly_${id}.txt`;
+
+    if(logEl) logEl.textContent = currentDownloadText || "(pusty)";
+  }
+
+  refreshBtn?.addEventListener("click", ()=>{ page = 1; load().catch(console.error); });
+
+  [qEl, statusEl, limitEl, fromEl, toEl].forEach(el=>{
+    el?.addEventListener("change", ()=>{ page = 1; load().catch(console.error); });
+  });
+
+  qEl?.addEventListener("keydown", (e)=>{
+    if(e.key === "Enter"){ page = 1; load().catch(console.error); }
+  });
+
+  prevBtn?.addEventListener("click", ()=>{
+    if(page > 1){ page--; load().catch(console.error); }
+  });
+
+  nextBtn?.addEventListener("click", ()=>{
+    page++;
+    load().catch(console.error);
+  });
+
+  load().catch(e=>{
+    console.error(e);
+    if(emptyEl){
+      emptyEl.style.display = "block";
+      emptyEl.textContent = "Błąd: Nie udało się pobrać historii.";
+    }
+  });
+}
+
+
 </script>
 </html>
 

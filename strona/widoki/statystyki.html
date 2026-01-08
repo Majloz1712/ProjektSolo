@@ -1,0 +1,66 @@
+<div class="card card--full">
+  <div class="card-body" style="padding:18px">
+    <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px;">
+      <div>
+        <div style="font-weight:800; font-size:1.2rem">Statystyki</div>
+        <div class="hint" style="margin-top:6px">Podgląd bieżących zadań i podsumowań wykonania.</div>
+      </div>
+      <button class="btn btn--ghost btn--sm" id="stRefresh">Odśwież</button>
+    </div>
+
+    <div class="kpi-grid" id="stKpis" aria-live="polite"></div>
+
+    <div class="section">
+      <div class="section-head">
+        <h3>Zadania skanu (w trakcie)</h3>
+        <div class="row--actions" style="margin-top:0">
+          <button class="btn btn--danger btn--sm" id="stStopAllScan">Zatrzymaj wszystkie</button>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Monitor</th>
+              <th>Status</th>
+              <th>Start</th>
+              <th>Czas</th>
+              <th>Koniec</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="stScanBody"></tbody>
+        </table>
+      </div>
+      <div class="hint" id="stScanEmpty" style="display:none; margin-top:10px;">Brak zadań skanu w trakcie.</div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <h3>Plugin tasks (w trakcie)</h3>
+        <div class="row--actions" style="margin-top:0">
+          <button class="btn btn--danger btn--sm" id="stStopAllPlugin">Zatrzymaj wszystkie</button>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Monitor</th>
+              <th>Status</th>
+              <th>Start</th>
+              <th>Czas</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="stPluginBody"></tbody>
+        </table>
+      </div>
+      <div class="hint" id="stPluginEmpty" style="display:none; margin-top:10px;">Brak zadań pluginu w trakcie.</div>
+    </div>
+  </div>
+</div>

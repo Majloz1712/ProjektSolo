@@ -6,9 +6,12 @@ import express from 'express';
 
 import { pool } from './polaczeniePG.js';
 import { connectMongo } from './polaczenieMDB.js';
+
 import authRoutes from './routes/auth.js';
 import monitoryRoutes from './routes/monitory.js';
 import pluginTasksRouter from './routes/pluginTasks.js';
+import historiaRoutes from './routes/historia.js';
+import statystykiRoutes from './routes/statystyki.js';
 
 dotenv.config();
 
@@ -38,34 +41,31 @@ console.log('ℹ️ polaczeniePG path:', import.meta.url.replace(/serwerStart\.j
            inet_server_port() AS port,
            (SELECT setting FROM pg_settings WHERE name='search_path') AS search_path
   `);
-  console.log('🔎 PG info (real):', rows[0]);
-
-  const { rows: t } = await pool.query(`
-    SELECT table_schema, table_name
-      FROM information_schema.tables
-     WHERE table_schema IN (current_schema(), 'public')
-       AND table_name IN ('uzytkownicy','monitory','powiadomienia','wykrycia','zadania_skanu')
-     ORDER BY table_schema, table_name
-  `);
-  console.log('📋 Widoczne tabele:', t.map((r) => `${r.table_schema}.${r.table_name}`));
-})();
+  console.log('✅ PG connected:', rows[0]);
+})().catch((e) => console.error('❌ PG check failed:', e));
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-app.use((req, _res, next) => { req.pg = pool; next(); });
-
-
-pool.on('connect', (client) => {
-  client.query('SET search_path TO public');
+app.use((req, _res, next) => {
+  req.pg = pool;
+  next();
 });
 
 connectMongo()
   .then((mongoDb) => {
-    app.use((req, _res, next) => { req.mongo = mongoDb; next(); });
+    console.log('✅ Połączono z MongoDB');
+
+    app.use((req, _res, next) => {
+      req.mongo = mongoDb;
+      next();
+    });
 
     app.use('/auth', authRoutes);
     app.use('/api/monitory', monitoryRoutes);
     app.use('/api/plugin-tasks', pluginTasksRouter);
+    app.use('/api/historia', historiaRoutes);
+    app.use('/api/statystyki', statystykiRoutes);
+
     app.use(express.static(path.join(__dirname, '..', 'strona')));
     app.use('/styl', express.static(path.join(__dirname, '..', 'styl')));
     app.use('/skrypt', express.static(path.join(__dirname, '..', 'skrypt')));
@@ -84,3 +84,4 @@ connectMongo()
     console.error('❌ Błąd połączenia z MongoDB:', err);
     process.exit(1);
   });
+

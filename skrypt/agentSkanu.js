@@ -345,138 +345,145 @@ function detectBotProtection(html) {
 
 
 export async function runBrowserFlow({ browser, url, mongoDb, monitorId, takeScreenshot = false }) {
-  const page = await browser.newPage();
-  await hardenPage(page);
+  let page = null;
+
+  // wartości zwrotne (żeby return działał nawet jak coś poleci po drodze)
+  let html = null;
+  let screenshot = null;
+  let domPriceText = null;
+  let finalUrl = url;
+  let effectiveOk = false;
 
   const origin = new URL(url).origin;
 
-  await restoreSession(page, mongoDb, { monitorId, origin });
+  try {
+    page = await browser.newPage();
+    await hardenPage(page);
 
-  await page.goto(origin, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await handleCookieConsent(page);
-  await humanize(page);
+    await restoreSession(page, mongoDb, { monitorId, origin });
 
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await handleCookieConsent(page);
+    await page.goto(origin, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await handleCookieConsent(page);
+    await humanize(page);
 
-  const ok = await waitForAny(
-    page,
-    [
-      'meta[property="og:type"]',
-      '[itemtype*="schema.org/Product"]',
-      '[data-testid*="price"], [data-role*="price"]',
-      'h1',
-    ],
-    9000,
-  );
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await handleCookieConsent(page);
 
-  const html = await page.content();
+    const ok = await waitForAny(
+      page,
+      [
+        'meta[property="og:type"]',
+        '[itemtype*="schema.org/Product"]',
+        '[data-testid*="price"], [data-role*="price"]',
+        'h1',
+      ],
+      9000,
+    );
 
-  // dodatkowa detekcja WAF/challenge
-  const wafBlocked = detectBotProtection(html);
-  const effectiveOk = ok && !wafBlocked;
+    html = await page.content();
 
-  const screenshot = takeScreenshot
-    ? await page.screenshot({ type: 'jpeg', quality: 60, fullPage: false })
-    : null;
+    const wafBlocked = detectBotProtection(html);
+    effectiveOk = ok && !wafBlocked;
 
-  // 🔎 HEURYSTYKA CENY Z DOM (POPRAWIONA)
-  const domPriceText = await page.evaluate(() => {
-    const currencyRe = /(zł|pln|eur|€|usd|\$|£)/i;
-    const priceWithCurrRe = /(\d[\d\s.,]*\d?)\s*(zł|pln|eur|€|usd|\$|£)/i;
-    const numberRe = /(\d[\d\s.,]*\d?)/;
+    screenshot = takeScreenshot
+      ? await page.screenshot({ type: 'jpeg', quality: 60, fullPage: false })
+      : null;
 
-    // 0) NAJPIERW: szukamy "1234 zł" w CAŁYM tekście strony
-    const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
-    const globalMatch = bodyText.match(priceWithCurrRe);
-    if (globalMatch) {
-      // np. "968 zł"
-      return globalMatch[0];
-    }
+    domPriceText = await page.evaluate(() => {
+      const currencyRe = /(zł|pln|eur|€|usd|\$|£)/i;
+      const priceWithCurrRe = /(\d[\d\s.,]*\d?)\s*(zł|pln|eur|€|usd|\$|£)/i;
+      const numberRe = /(\d[\d\s.,]*\d?)/;
 
-    const candidates = [];
+      const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+      const globalMatch = bodyText.match(priceWithCurrRe);
+      if (globalMatch) return globalMatch[0];
 
-    const addCandidate = (el, reason, opts = {}) => {
-      const { requireCurrency = true } = opts;
-      if (!el) return;
-      const raw = el.textContent || '';
-      const text = raw.replace(/\s+/g, ' ').trim();
-      if (!text) return;
+      const candidates = [];
 
-      if (requireCurrency && !currencyRe.test(text)) return;
-      if (!priceWithCurrRe.test(text) && !numberRe.test(text)) return;
-
-      let score = 0;
-      const t = text.toLowerCase();
-      const cls = (el.className || '').toLowerCase();
-      const id = (el.id || '').toLowerCase();
-
-      if (cls.includes('price') || id.includes('price')) score += 3;
-      if (cls.includes('amount') || cls.includes('total')) score += 1;
-      if (t.includes('noc') || t.includes('night') || t.includes('pobyt')) score += 1;
-
-      const len = text.length;
-      if (len < 8) score += 1;
-      if (len > 120) score -= 1;
-
-      // Jeżeli nie ma waluty, ale wygląda jak "cena" – trochę podbijamy
-      if (!currencyRe.test(text) && (cls.includes('price') || id.includes('price'))) {
-        score += 1;
-      }
-
-      // ⚠️ Karzemy rzeczy typu "Personel 9,0", "Czystość 9,0" (to nie ceny)
-      if (/personel|czystość|komfort|lokalizacja|wifi|udogodnienia/i.test(t)) {
-        score -= 3;
-      }
-
-      candidates.push({ text, score, reason });
-    };
-
-    // 1) „mocne” selektory – waluta NIE jest wymagana
-    const strongSelectors = [
-      '[itemprop="price"]',
-      '[data-testid*="price"]',
-      '[class*="price"]',
-      '[id*="price"]',
-      '[aria-label*="price"]',
-      '[aria-label*="cena"]',
-      '[class*="prco-"]',               // Booking
-      '[class*="bui-price-display"]',   // Booking – box z ceną
-      '[class*="hprt-price"]',          // Booking – tabela pokoi
-    ];
-    strongSelectors.forEach((sel) => {
-      document.querySelectorAll(sel).forEach((el) => addCandidate(el, `selector:${sel}`, { requireCurrency: false }));
-    });
-
-    // 2) fallback po elementach – wymagamy waluty
-    if (!candidates.length) {
-      const all = Array.from(document.querySelectorAll('span,div,strong,b,p'));
-      for (const el of all) {
+      const addCandidate = (el, reason, opts = {}) => {
+        const { requireCurrency = true } = opts;
+        if (!el) return;
         const raw = el.textContent || '';
         const text = raw.replace(/\s+/g, ' ').trim();
-        if (!text) continue;
-        if (text.length < 4 || text.length > 120) continue;
-        if (!currencyRe.test(text)) continue;
-        addCandidate(el, 'fallback_generic', { requireCurrency: true });
+        if (!text) return;
+
+        if (requireCurrency && !currencyRe.test(text)) return;
+        if (!priceWithCurrRe.test(text) && !numberRe.test(text)) return;
+
+        let score = 0;
+        const t = text.toLowerCase();
+        const cls = (el.className || '').toLowerCase();
+        const id = (el.id || '').toLowerCase();
+
+        if (cls.includes('price') || id.includes('price')) score += 3;
+        if (cls.includes('amount') || cls.includes('total')) score += 1;
+        if (t.includes('noc') || t.includes('night') || t.includes('pobyt')) score += 1;
+
+        const len = text.length;
+        if (len < 8) score += 1;
+        if (len > 120) score -= 1;
+
+        if (!currencyRe.test(text) && (cls.includes('price') || id.includes('price'))) score += 1;
+
+        if (/personel|czystość|komfort|lokalizacja|wifi|udogodnienia/i.test(t)) score -= 3;
+
+        candidates.push({ text, score, reason });
+      };
+
+      const strongSelectors = [
+        '[itemprop="price"]',
+        '[data-testid*="price"]',
+        '[class*="price"]',
+        '[id*="price"]',
+        '[aria-label*="price"]',
+        '[aria-label*="cena"]',
+        '[class*="prco-"]',
+        '[class*="bui-price-display"]',
+        '[class*="hprt-price"]',
+      ];
+      strongSelectors.forEach((sel) => {
+        document.querySelectorAll(sel).forEach((el) =>
+          addCandidate(el, `selector:${sel}`, { requireCurrency: false }),
+        );
+      });
+
+      if (!candidates.length) {
+        const all = Array.from(document.querySelectorAll('span,div,strong,b,p'));
+        for (const el of all) {
+          const raw = el.textContent || '';
+          const text = raw.replace(/\s+/g, ' ').trim();
+          if (!text) continue;
+          if (text.length < 4 || text.length > 120) continue;
+          if (!currencyRe.test(text)) continue;
+          addCandidate(el, 'fallback_generic', { requireCurrency: true });
+        }
       }
+
+      if (candidates.length) {
+        candidates.sort((a, b) => b.score - a.score);
+        return candidates[0].text;
+      }
+      return null;
+    });
+
+    finalUrl = page.url();
+
+    // persist sesji – best effort
+    try {
+      await persistSession(page, mongoDb, { monitorId, origin });
+    } catch (_) {}
+
+    return { ok: effectiveOk, html, screenshot, finalUrl, domPriceText };
+  } finally {
+    // NAJWAŻNIEJSZE: strona ma się zawsze zamknąć
+    if (page) {
+      try {
+        if (!page.isClosed()) await page.close();
+      } catch (_) {}
     }
-
-    if (candidates.length) {
-      candidates.sort((a, b) => b.score - a.score);
-      return candidates[0].text;
-    }
-
-    // nic nie znaleziono
-    return null;
-  });
-
-  const finalUrl = page.url();
-
-  await persistSession(page, mongoDb, { monitorId, origin });
-  await page.close();
-
-  return { ok: effectiveOk, html, screenshot, finalUrl, domPriceText };
+  }
 }
+
 
 
 
@@ -687,27 +694,45 @@ async function withPg(fn) {
 
 // ===== plugin tasks helper (3-ci tryb) =====
 
-// Dodawanie zadania dla pluginu (fallback / price_only)
+// Dodawanie zadania dla pluginu (fallback / price_only / plugin_screenshot)
+// Dedup: nie twórz kolejnego taska, jeśli dla tego monitora i trybu już jest pending albo in_progress
 async function createPluginTask({
   monitorId,
   taskId,
   url,
-  mode = 'fallback', // 'fallback' | 'price_only'
+  mode = 'fallback', // 'fallback' | 'price_only' | 'plugin_screenshot'
 }) {
   if (!monitorId || !taskId || !url) return;
 
-  await withPg(async (pg) => {
-    await pg.query(
+  const inserted = await withPg(async (pg) => {
+    // 1) jeśli już jest aktywny task tego samego trybu dla monitora -> NIE twórz kolejnego
+    const { rowCount } = await pg.query(
       `INSERT INTO plugin_tasks (monitor_id, zadanie_id, url, status, mode)
-       VALUES ($1, $2, $3, 'pending', $4)`,
+       SELECT $1, $2, $3, 'pending', $4
+       WHERE NOT EXISTS (
+         SELECT 1
+           FROM plugin_tasks pt
+          WHERE pt.monitor_id = $1
+            AND pt.mode = $4
+            AND pt.status IN ('pending', 'in_progress')
+       )`,
       [monitorId, taskId, url, mode],
     );
+
+    return rowCount; // 1 = dodano, 0 = zablokowane dedupem
   });
 
-  console.log(
-    `[plugin-task] created mode=${mode} monitor=${monitorId} zadanie=${taskId} url=${url}`,
-  );
+  if (inserted) {
+    console.log(
+      `[plugin-task] created mode=${mode} monitor=${monitorId} zadanie=${taskId} url=${url}`,
+    );
+  } else {
+    console.log(
+      `[plugin-task] skipped (already active) mode=${mode} monitor=${monitorId} zadanie=${taskId}`,
+    );
+  }
 }
+
 
 
 
@@ -893,11 +918,12 @@ async function markMonitorRequiresIntervention(monitorId, { reason, snapshotId }
         : `Monitor wymaga interwencji: ${reason || 'BOT_PROTECTION'}`;
 
       // zapis powiadomienia
-      await pg.query(
-        `INSERT INTO powiadomienia (id, monitor_id, tresc, utworzone_at)
-           VALUES (gen_random_uuid(), $1, $2, NOW())`,
-        [monitorId, message],
-      );
+    await pg.query(
+      `INSERT INTO powiadomienia (id, monitor_id, tresc)
+         VALUES (gen_random_uuid(), $1, $2)`,
+      [monitorId, message],
+    );
+
     });
   } catch (err) {
     console.warn('[intervention] failed to persist status', err?.message || err);
@@ -981,37 +1007,33 @@ process.on('unhandledRejection', (err) => {
 const monitorLocks = new Map(); // monitorId -> Promise chain
 
 async function withMonitorLock(monitorId, fn) {
-  // awaryjnie – jakby z jakiegoś powodu task nie miał monitorId
-  if (!monitorId) {
-    return fn();
-  }
+  if (!monitorId) return fn();
 
-  // poprzedni "łańcuch" zadań dla tego monitora (albo natychmiast ukończony)
   const prev = monitorLocks.get(monitorId) || Promise.resolve();
 
   let release;
-  const current = new Promise((resolve) => {
+  const gate = new Promise((resolve) => {
     release = resolve;
   });
 
-  // nowy łańcuch: najpierw prev, potem current
-  monitorLocks.set(monitorId, prev.then(() => current));
+  // WAŻNE: zapisz dokładnie tę obietnicę, żeby dało się ją potem porównać i posprzątać
+  const chain = prev.then(() => gate);
+  monitorLocks.set(monitorId, chain);
 
   try {
-    // czekamy aż wszystkie wcześniejsze zadania tego monitora się zakończą
-    await prev;
-    // wykonujemy właściwą robotę (processTask)
+    await prev;       // czekamy na poprzednie taski tego monitora
     return await fn();
   } finally {
-    // sygnalizujemy, że to zadanie się skończyło
-    release();
+    // odblokuj następnego w kolejce
+    try { release(); } catch (_) {}
 
-    // sprzątanie – jeśli to był ostatni w łańcuchu
-    if (monitorLocks.get(monitorId) === current) {
+    // sprzątanie: usuń lock tylko jeśli nikt nie podmienił chaina nowszym
+    if (monitorLocks.get(monitorId) === chain) {
       monitorLocks.delete(monitorId);
     }
   }
 }
+
 
 
 
@@ -1025,13 +1047,30 @@ const FORCE_PLUGIN_SCREENSHOT =
   process.argv.includes('--screenshot') ||
   process.argv.includes('--screenShot') ||
   process.argv.includes('--plugin-screenshot');
+  
+function normalizeTrybSkanu(raw) {
+  const v = (raw || '').toString().trim().toLowerCase();
+  if (v === 'screenshot') return 'screenshot'; // z frontu
+  if (v === 'static') return 'static';
+  if (v === 'browser') return 'browser';       // legacy
+  if (v === 'plugin') return 'plugin';         // legacy
+  return '';
+}
+
 
 async function processTask(task) {
   // 1) logger per-zadanie (użytkownik + monitor + zadanie)
-  const logger = await createTaskLogger({
-    monitorId: task.monitor_id,
-    zadanieId: task.id,
-  });
+  let logger = console;
+  try {
+    logger = await createTaskLogger({
+      monitorId: task.monitor_id,
+      zadanieId: task.id,
+    });
+  } catch (e) {
+    console.warn('[logger] createTaskLogger failed, fallback console', e?.message || e);
+  }
+
+
   const log = logger; // krótszy alias
   const tTask0 = performance.now();
   const taskId = task?.id;
@@ -1097,6 +1136,9 @@ async function processTask(task) {
 
     // Czy użytkownik ewidentnie oczekuje ceny? (llm_prompt zawiera "cena"/"price")
     const monitorWantsPrice = wantsPricePlugin(monitor);
+    const monitorScanMode = normalizeTrybSkanu(monitor.tryb_skanu);
+    const forcePluginScreenshotForMonitor = (monitorScanMode === 'screenshot');
+
 
 
 
@@ -1105,41 +1147,41 @@ async function processTask(task) {
     // - tworzymy "pusty" snapshot (żeby plugin mógł go wzbogacić po zadanie_id)
     // - tworzymy plugin_task (price_only lub fallback)
     // - kończymy zadanie odpowiednim statusem
-    if (FORCE_PLUGIN_SCREENSHOT) {
-      const now = new Date();
-      try {
-        const snapshots = mongoDb.collection('snapshots');
-        const stubDoc = {
-          monitor_id: monitorId,
-          zadanie_id: taskId,
-          url: targetUrl,
-          ts: now,
-          mode: 'plugin_stub',
-          final_url: targetUrl,
-          blocked: true,
-          block_reason: 'FORCED_PLUGIN',
-          html: null,
-          extracted_v2: null,
-          screenshot_b64: null,
-        };
-        const { insertedId } = await snapshots.insertOne(stubDoc);
-        snapshot = insertedId?.toString?.() ?? null;
-        log.info('snapshot_saved', {
-          monitorId,
-          zadanieId: taskId,
-          snapshotId: snapshot,
-          mode: 'plugin_stub',
-        });
-      } catch (err) {
-        log.warn('snapshot_stub_insert_failed', {
-          monitorId,
-          zadanieId: taskId,
-          error: err?.message || String(err),
-        });
-      }
+if (FORCE_PLUGIN_SCREENSHOT || forcePluginScreenshotForMonitor) {
+  const now = new Date();
+  try {
+    const snapshots = mongoDb.collection('snapshots');
+    const stubDoc = {
+      monitor_id: monitorId,
+      zadanie_id: taskId,
+      url: targetUrl,
+      ts: now,
+      mode: 'plugin_stub',
+      final_url: targetUrl,
+      blocked: true,
+      block_reason: 'FORCED_PLUGIN',
+      html: null,
+      extracted_v2: null,
+      screenshot_b64: null,
+    };
+    const { insertedId } = await snapshots.insertOne(stubDoc);
+    snapshot = insertedId?.toString?.() ?? null;
+    log.info('snapshot_saved', {
+      monitorId,
+      zadanieId: taskId,
+      snapshotId: snapshot,
+      mode: 'plugin_stub',
+    });
+  } catch (err) {
+    log.warn('snapshot_stub_insert_failed', {
+      monitorId,
+      zadanieId: taskId,
+      error: err?.message || String(err),
+    });
+  }
 
-      const pluginMode = 'plugin_screenshot';
-      await createPluginTask({ monitorId, taskId, url: targetUrl, mode: pluginMode });
+  const pluginMode = 'plugin_screenshot';
+  await createPluginTask({ monitorId, taskId, url: targetUrl, mode: pluginMode });
 
       log.warn('task_forwarded_to_plugin_forced', {
         monitorId,
@@ -1188,81 +1230,85 @@ async function processTask(task) {
     let mode = 'static';
 
     try {
-      // ===== 1) PROBA STATYCZNA =====
-      let staticResult = null;
+  // ===== 1) TRYB Z MONITORA: browser → pomijamy static =====
+  let staticResult = null;
+  let needBrowserFallback = (monitorScanMode === 'browser');
 
-      try {
-        staticResult = await scanStatic({ url: targetUrl, selector });
-        status = staticResult.status;
-        finalUrl = staticResult.finalUrl;
-        html = staticResult.html;
-        meta = staticResult.meta;
+  // ===== 1a) PROBA STATYCZNA (tylko jeśli nie wymuszono browser) =====
+  if (!needBrowserFallback) {
+    try {
+      staticResult = await scanStatic({ url: targetUrl, selector });
+      status = staticResult.status;
+      finalUrl = staticResult.finalUrl;
+      html = staticResult.html;
+      meta = staticResult.meta;
 
-        if (!staticResult.ok) {
-          log.info('static_scan_not_ok', {
-            monitorId,
-            zadanieId: taskId,
-            status,
-          });
-        }
-      } catch (err) {
-        log.warn('static_scan_failed_exception', {
-          monitorId,
-          zadanieId: taskId,
-          error: err?.message || String(err),
-        });
-      }
-
-      const needBrowserFallback =
-        !staticResult
-        || !staticResult.ok
-        || !html
-        || (typeof status === 'number' && status >= 400);
-
-      // ===== 2) FALLBACK DO BROWSER (PUPPETEER) =====
-      if (needBrowserFallback) {
-        blocked = false;
-        mode = 'browser';
-
-        const userDataDir = profilePath({ monitorId, url: targetUrl });
-        const proxyUrl = pickProxy(monitorId);
-        const browser = await getBrowser({ userDataDir, proxyUrl });
-
-        const {
-          ok,
-          html: browserHtml,
-          screenshot,
-          finalUrl: browserFinalUrl,
-        } = await runBrowserFlow({
-          browser,
-          url: targetUrl,
-          mongoDb,
-          monitorId,
-        });
-
-        blocked = !ok;
-        html = browserHtml;
-        finalUrl = browserFinalUrl;
-        status = ok ? 200 : (status || 403);
-        screenshotB64 = screenshot
-          ? Buffer.from(screenshot).toString('base64')
-          : null;
-
-        log.info('browser_scan_done', {
-          monitorId,
-          zadanieId: taskId,
-          blocked,
-          status,
-        });
-      } else {
-        mode = 'static';
-        log.info('static_scan_used', {
+      if (!staticResult.ok) {
+        log.info('static_scan_not_ok', {
           monitorId,
           zadanieId: taskId,
           status,
         });
       }
     } catch (err) {
+      log.warn('static_scan_failed_exception', {
+        monitorId,
+        zadanieId: taskId,
+        error: err?.message || String(err),
+      });
+    }
+
+    needBrowserFallback =
+      !staticResult
+      || !staticResult.ok
+      || !html
+      || (typeof status === 'number' && status >= 400);
+  }
+
+  // ===== 2) FALLBACK DO BROWSER (PUPPETEER) =====
+  if (needBrowserFallback) {
+    blocked = false;
+    mode = 'browser';
+
+    const userDataDir = profilePath({ monitorId, url: targetUrl });
+    const proxyUrl = pickProxy(monitorId);
+    const browser = await getBrowser({ userDataDir, proxyUrl });
+
+    const {
+      ok,
+      html: browserHtml,
+      screenshot,
+      finalUrl: browserFinalUrl,
+    } = await runBrowserFlow({
+      browser,
+      url: targetUrl,
+      mongoDb,
+      monitorId,
+    });
+
+    blocked = !ok;
+    html = browserHtml;
+    finalUrl = browserFinalUrl;
+    status = ok ? 200 : (status || 403);
+    screenshotB64 = screenshot
+      ? Buffer.from(screenshot).toString('base64')
+      : null;
+
+    log.info('browser_scan_done', {
+      monitorId,
+      zadanieId: taskId,
+      blocked,
+      status,
+    });
+  } else {
+    mode = 'static';
+    log.info('static_scan_used', {
+      monitorId,
+      zadanieId: taskId,
+      status,
+    });
+  }
+} catch (err) {
       log.error('task_scan_failed', {
         monitorId,
         zadanieId: taskId,
@@ -1455,7 +1501,9 @@ async function processTask(task) {
     }
 
     // ===== 5) SKAN UDANY – ZAPISZ UŻYTY TRYB W "monitory.tryb_skanu" =====
-    await updateMonitorScanMode(monitorId, mode);
+   if (!monitor.tryb_skanu) {
+  await updateMonitorScanMode(monitorId, mode);
+    }
 
     await finishTask(taskId, {
       status: 'ok',
@@ -1505,8 +1553,9 @@ async function processTask(task) {
   // NIE throw — inaczej łatwo o unhandledRejection + task zostaje w_trakcie
   return;
 } finally {
-  logger.close();
+  try { logger?.close?.(); } catch (_) {}
 }
+
 }
 
 
