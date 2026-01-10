@@ -10,7 +10,31 @@ const analizyCol = db.collection('analizy');
 
 const MAX_TEXT_CHARS = 8000;
 
+function extractPriceHintFromText(text) {
+  if (!text) return { value: null, currency: null };
+
+  const s = String(text).replace(/\s+/g, ' ').trim();
+
+  // np. "1769,00 zł", "1 699 PLN", "199 €"
+  const priceWithCurrRe = /(\d[\d\s.,]*\d?)\s*(zł|pln|eur|€|usd|\$|£)/i;
+  const m = s.match(priceWithCurrRe);
+  if (!m) return { value: null, currency: null };
+
+  const value = m[1].trim().replace(/\s+/g, ' ');
+  const currRaw = m[2].trim();
+  const c = currRaw.toLowerCase();
+
+  let currency = null;
+  if (c.includes('zł') || c === 'pln') currency = 'PLN';
+  else if (c.includes('eur') || c === '€') currency = 'EUR';
+  else if (c.includes('usd') || c === '$') currency = 'USD';
+  else if (c.includes('£')) currency = 'GBP';
+
+  return { value, currency };
+}
+
 export async function ensureSnapshotAnalysis(snapshot, { force = false, logger } = {}) {
+
   // jeśli już jest analiza – zwracamy ją
   const t0 = performance.now();
   const existing = await analizyCol.findOne({
@@ -68,13 +92,29 @@ export async function ensureSnapshotAnalysis(snapshot, { force = false, logger }
     url,
   });
 
-  const title = extracted_v2?.title || '';
-  const description = extracted_v2?.description || '';
-  let text = extracted_v2?.text || '';
+  const title = (extracted_v2?.title || '').toString();
+  const description = (extracted_v2?.description || '').toString();
+
+  // OCR może być jedynym sensownym źródłem treści (np. Allegro/Booking, dużo JS)
+  const ocrTextFull =
+    snapshot?.vision_ocr?.clean_text ||
+    snapshot?.vision_ocr?.clean_text_preview ||
+    '';
+
+  let text = (extracted_v2?.text || '').toString();
+
+  // fallback: extractor dał pusty tekst → bierz OCR
+  if (!text.trim() && ocrTextFull) {
+    text = ocrTextFull;
+  }
 
   if (text.length > MAX_TEXT_CHARS) {
     text = text.slice(0, MAX_TEXT_CHARS) + '\n...[TRUNCATED]';
   }
+
+  const ocrPreview = ocrTextFull
+    ? ocrTextFull.slice(0, Math.min(MAX_TEXT_CHARS, 3500))
+    : '';
 
   // ceny z pluginu (jeśli są)
   const pluginPrices = Array.isArray(plugin_prices)
@@ -83,11 +123,18 @@ export async function ensureSnapshotAnalysis(snapshot, { force = false, logger }
       ? snapshot.plugin_prices
       : [];
 
+  const ocrPrice = extractPriceHintFromText(ocrTextFull);
+
   let priceInfo;
 
+  // extractor: obsłuż i "object", i "string"
   if (extracted_v2?.price) {
     const p = extracted_v2.price;
-    priceInfo = `Cena główna z extractora: ${p.value} ${p.currency}`;
+    if (typeof p === 'string') {
+      priceInfo = `Cena główna z extractora: ${p}`;
+    } else {
+      priceInfo = `Cena główna z extractora: ${p.value ?? ''} ${p.currency ?? ''}`.trim();
+    }
   } else if (pluginPrices.length) {
     const values = pluginPrices
       .map((p) => Number(p.value))
@@ -99,9 +146,41 @@ export async function ensureSnapshotAnalysis(snapshot, { force = false, logger }
     } else {
       priceInfo = `Ceny znalezione przez plugin: ${JSON.stringify(pluginPrices).slice(0, 500)}`;
     }
+  } else if (ocrPrice.value) {
+    priceInfo = `Cena z OCR: ${ocrPrice.value}${ocrPrice.currency ? ` ${ocrPrice.currency}` : ''}`;
   } else {
-    priceInfo = 'Brak ceny w extractorze i w pluginie.';
+    priceInfo = 'Brak ceny w extractorze i w pluginie (i nie wykryto jej z OCR).';
   }
+
+  // twardy guard: jak naprawdę nie ma danych → nie odpalaj LLM
+  const hasAnyInput =
+    !!title.trim() || !!description.trim() || !!text.trim() || (pluginPrices.length > 0) || !!ocrTextFull.trim();
+
+  if (!hasAnyInput) {
+    const doc = {
+      zadanieId: String(zadanie_id),
+      monitorId: String(monitor_id),
+      score: new Double(0.0),
+      createdAt: new Date(),
+      type: 'snapshot',
+      snapshot_id: _id,
+      url,
+      model: process.env.OLLAMA_TEXT_MODEL || 'llama3',
+      prompt: null,
+      summary: null,
+      podsumowanie: null,
+      product_type: null,
+      main_currency: null,
+      price_hint: { min: null, max: null },
+      features: [],
+      raw_response: null,
+      error: 'NO_INPUT_DATA',
+    };
+
+    await analizyCol.insertOne(doc);
+    return doc;
+  }
+
 
   const prompt = `
 Jesteś asystentem analizującym strony e-commerce.
@@ -126,9 +205,12 @@ Tytuł: ${title}
 Opis: ${description}
 ${priceInfo}
 
-Tekst strony (przycięty):
+Tekst strony (extractor/OCR fallback, przycięty):
 ${text}
+
+${ocrPreview ? `\nOCR ze screenshotu (preview):\n${ocrPreview}\n` : ''}
 `;
+
 
   let rawResponse = null;
   let parsed = null;

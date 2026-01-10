@@ -537,6 +537,70 @@ export async function evaluateChangeWithLLM(
     return { parsed: decision, raw: null, mongoId: insertedId };
   }
 
+  // 0.5) twarda reguła: jeśli to tylko "drift" screenshot/OCR (bez realnych zmian treści/ceny) → nieistotne
+  const m = diff?.metrics || {};
+  const ocrScore = typeof m.ocrTextDiffScore === 'number' ? m.ocrTextDiffScore : 0;
+  const textScore = typeof m.textDiffScore === 'number' ? m.textDiffScore : 0;
+
+  const priceRel = m.price?.relChange;
+  const hasPriceMove = typeof priceRel === 'number' && Math.abs(priceRel) >= 0.05;
+
+  const hasContentMove =
+    m.titleChanged === true ||
+    m.descriptionChanged === true ||
+    (typeof textScore === 'number' && textScore > 0.15);
+
+  const onlyOcrDrift =
+    !hasPriceMove &&
+    !hasContentMove &&
+    m.pluginPricesChanged !== true &&
+    (m.screenshotChanged === true || m.ocrTextChanged === true) &&
+    ocrScore > 0 &&
+    ocrScore < 0.20;
+
+  if (onlyOcrDrift) {
+    const decision = {
+      important: false,
+      category: 'minor_change',
+      importance_reason: `Zmiana wygląda na drift OCR/screenshot (ocrTextDiffScore=${ocrScore.toFixed(3)}), bez dowodu na realną zmianę treści/ceny.`,
+      short_title: 'Nieistotna zmiana',
+      short_description: 'Różnice wynikają z OCR/screenshot, a nie z treści produktu/ceny.',
+    };
+
+    const { insertedId } = await ocenyZmienCol.insertOne({
+      createdAt: new Date(),
+      monitorId,
+      zadanieId,
+      url,
+      llm_mode: 'rule',
+      model: 'rule',
+      prompt_used: null,
+      prevAnalysis,
+      newAnalysis,
+      diff,
+      raw_response: null,
+      vision_ocr: {
+        prev: summarizeOcrForStorage(prevOcr),
+        next: summarizeOcrForStorage(newOcr),
+      },
+      llm_decision: decision,
+      error: null,
+      durationMs: Math.round(performance.now() - tEval0),
+    });
+
+    log.info('llm_change_eval_success', {
+      monitorId,
+      zadanieId,
+      mongoId: insertedId,
+      important: false,
+      category: decision.category,
+      usedMode: 'rule',
+      usedModel: 'rule',
+    });
+
+    return { parsed: decision, raw: null, mongoId: insertedId };
+  }
+
   const usedMode = 'text';
   const usedModel = process.env.OLLAMA_TEXT_MODEL || process.env.LLM_MODEL || 'llama3';
 

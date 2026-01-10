@@ -44,8 +44,8 @@ console.log('ℹ️ polaczeniePG path:', import.meta.url.replace(/serwerStart\.j
   console.log('✅ PG connected:', rows[0]);
 })().catch((e) => console.error('❌ PG check failed:', e));
 
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+// UWAGA: nie ustawiamy globalnego express.json() przed /api/plugin-tasks,
+// bo wtedy duże screenshoty mogą dostać 413 zanim trafią do routera.
 app.use((req, _res, next) => {
   req.pg = pool;
   next();
@@ -60,11 +60,19 @@ connectMongo()
       next();
     });
 
+    // 1) najpierw plugin-tasks (router ma swój limit 50mb)
+    app.use('/api/plugin-tasks', pluginTasksRouter);
+
+    // 2) dopiero potem globalny parser dla reszty API
+    app.use(express.json({ limit: '10mb' }));
+    app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+    // 3) reszta tras
     app.use('/auth', authRoutes);
     app.use('/api/monitory', monitoryRoutes);
-    app.use('/api/plugin-tasks', pluginTasksRouter);
     app.use('/api/historia', historiaRoutes);
     app.use('/api/statystyki', statystykiRoutes);
+
 
     app.use(express.static(path.join(__dirname, '..', 'strona')));
     app.use('/styl', express.static(path.join(__dirname, '..', 'styl')));

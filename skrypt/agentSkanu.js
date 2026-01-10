@@ -704,34 +704,62 @@ async function createPluginTask({
 }) {
   if (!monitorId || !taskId || !url) return;
 
-  const inserted = await withPg(async (pg) => {
-    // 1) jeśli już jest aktywny task tego samego trybu dla monitora -> NIE twórz kolejnego
-    const { rowCount } = await pg.query(
+  const { inserted, upgraded } = await withPg(async (pg) => {
+    // 1) dedupe po zadanie_id (jeden aktywny plugin-task na jedno zadanie skanu)
+    const ins = await pg.query(
       `INSERT INTO plugin_tasks (monitor_id, zadanie_id, url, status, mode)
        SELECT $1, $2, $3, 'pending', $4
        WHERE NOT EXISTS (
          SELECT 1
            FROM plugin_tasks pt
-          WHERE pt.monitor_id = $1
-            AND pt.mode = $4
+          WHERE pt.zadanie_id = $2
             AND pt.status IN ('pending', 'in_progress')
        )`,
       [monitorId, taskId, url, mode],
     );
 
-    return rowCount; // 1 = dodano, 0 = zablokowane dedupem
+    let upgradedCount = 0;
+
+    // 2) jeśli już istnieje aktywny task dla zadania, a teraz chcemy screenshot,
+    // to "podbij" istniejący do plugin_screenshot zamiast tworzyć drugi.
+    if (ins.rowCount === 0 && mode === 'plugin_screenshot') {
+      const upd = await pg.query(
+        `UPDATE plugin_tasks
+            SET mode = 'plugin_screenshot',
+                url = $3,
+                monitor_id = $1,
+                zaktualizowane_at = NOW()
+          WHERE id = (
+            SELECT id
+              FROM plugin_tasks
+             WHERE zadanie_id = $2
+               AND status IN ('pending', 'in_progress')
+             ORDER BY utworzone_at DESC
+             LIMIT 1
+          )`,
+        [monitorId, taskId, url],
+      );
+      upgradedCount = upd.rowCount;
+    }
+
+    return { inserted: ins.rowCount === 1, upgraded: upgradedCount === 1 };
   });
 
   if (inserted) {
     console.log(
       `[plugin-task] created mode=${mode} monitor=${monitorId} zadanie=${taskId} url=${url}`,
     );
+  } else if (upgraded) {
+    console.log(
+      `[plugin-task] upgraded_existing_to_screenshot monitor=${monitorId} zadanie=${taskId} url=${url}`,
+    );
   } else {
     console.log(
-      `[plugin-task] skipped (already active) mode=${mode} monitor=${monitorId} zadanie=${taskId}`,
+      `[plugin-task] skipped (already active for zadanie_id) mode=${mode} monitor=${monitorId} zadanie=${taskId}`,
     );
   }
 }
+
 
 
 
@@ -880,6 +908,22 @@ function wantsPricePlugin(monitor) {
 }
 
 
+async function updateTask(taskId, {
+  status, blad_opis, tresc_hash, snapshot_mongo_id,
+}) {
+  await withPg(async (pg) => {
+    await pg.query(
+      `UPDATE zadania_skanu
+          SET status = $2,
+              blad_opis = $3,
+              tresc_hash = $4,
+              snapshot_mongo_id = $5
+        WHERE id = $1`,
+      [taskId, status, blad_opis || null, tresc_hash || null, snapshot_mongo_id || null],
+    );
+  });
+}
+
 async function finishTask(taskId, {
   status, blad_opis, tresc_hash, snapshot_mongo_id,
 }) {
@@ -896,6 +940,7 @@ async function finishTask(taskId, {
     );
   });
 }
+
 
 
 async function markMonitorRequiresIntervention(monitorId, { reason, snapshotId } = {}) {
@@ -1183,41 +1228,26 @@ if (FORCE_PLUGIN_SCREENSHOT || forcePluginScreenshotForMonitor) {
   const pluginMode = 'plugin_screenshot';
   await createPluginTask({ monitorId, taskId, url: targetUrl, mode: pluginMode });
 
-      log.warn('task_forwarded_to_plugin_forced', {
+            log.warn('task_forwarded_to_plugin_forced', {
         monitorId,
         zadanieId: taskId,
         pluginMode,
         snapshotId: snapshot,
       });
 
-      if (!monitorWantsPrice) {
-        await markMonitorRequiresIntervention(monitorId, {
-          reason: 'PLUGIN_SCREENSHOT_REQUIRED',
-          snapshotId: snapshot || null,
-        });
-
-        await finishTask(taskId, {
-          status: 'blad',
-          blad_opis: 'WAITING_FOR_PLUGIN_RESULT',
-          tresc_hash: null,
-          snapshot_mongo_id: snapshot || null,
-        });
-      } else {
-        // Price-only działa jak dotychczas: zadanie w PG może być "ok",
-        // bo pipeline i tak odpali się dopiero po /price z pluginu.
-        await finishTask(taskId, {
-          status: 'ok',
-          blad_opis: null,
-          tresc_hash: null,
-          snapshot_mongo_id: snapshot || null,
-        });
-      }
+      // WAŻNE: nie domykamy taska w PG — plugin zakończy lifecycle i zaktualizuje zadania_skanu
+      await updateTask(taskId, {
+        status: 'w_trakcie',
+        blad_opis: 'WAITING_FOR_PLUGIN_RESULT',
+        tresc_hash: null,
+        snapshot_mongo_id: snapshot || null,
+      });
 
       console.log(
         `[task] monitor=${monitorId} task=${taskId} -> przekazany do pluginu (forced, mode=${pluginMode})`,
       );
       return;
-    }
+}
 
     let blocked = false;
     let finalUrl = targetUrl;
@@ -1339,13 +1369,9 @@ if (FORCE_PLUGIN_SCREENSHOT || forcePluginScreenshotForMonitor) {
         blocked,
       });
 
-      await markMonitorRequiresIntervention(monitorId, {
-        reason: 'PLUGIN_SCREENSHOT_REQUIRED',
-        snapshotId: snapshot || null,
-      });
-
-      await finishTask(taskId, {
-        status: 'blad',
+      // WAŻNE: nie wyłączamy monitora i nie domykamy taska — plugin domknie task w zadania_skanu
+      await updateTask(taskId, {
+        status: 'w_trakcie',
         blad_opis: 'WAITING_FOR_PLUGIN_SCREENSHOT',
         tresc_hash: null,
         snapshot_mongo_id: snapshot || null,
@@ -1355,7 +1381,7 @@ if (FORCE_PLUGIN_SCREENSHOT || forcePluginScreenshotForMonitor) {
         `[task] monitor=${monitorId} -> przekazany do pluginu (fallback)`,
       );
       return;
-    }
+}
 
     // ===== 3) EKSTRAKCJA LLM =====
     let extracted = null;
@@ -1523,39 +1549,38 @@ if (FORCE_PLUGIN_SCREENSHOT || forcePluginScreenshotForMonitor) {
       httpStatus: status,
       durationMs: Math.round(performance.now() - tTask0),
     });
-} catch (err) {
-  log.error('task_error', {
-    monitorId,
-    zadanieId: taskId,
-    error: err?.message || String(err),
-    stack: err?.stack,
-    durationMs: Math.round(performance.now() - tTask0),
-  });
+  } catch (err) {
+    log.error('task_error', {
+      monitorId,
+      zadanieId: taskId,
+      error: err?.message || String(err),
+      stack: err?.stack,
+      durationMs: Math.round(performance.now() - tTask0),
+    });
 
-  // Krytyczne: domknij task w PG, żeby nie wisiał jako w_trakcie (blokuje scheduler)
-  if (isUuid(taskId)) {
-    try {
-      await finishTask(taskId, {
-        status: 'blad',
-        blad_opis: (err?.message || String(err)).slice(0, 500),
-        tresc_hash: hash || null,
-        snapshot_mongo_id: snapshot || null,
-      });
-    } catch (e2) {
-      log.error('finishTask_failed', {
-        monitorId,
-        zadanieId: taskId,
-        error: e2?.message || String(e2),
-      });
+    // Krytyczne: domknij task w PG, żeby nie wisiał jako w_trakcie (blokuje scheduler)
+    if (isUuid(taskId)) {
+      try {
+        await finishTask(taskId, {
+          status: 'blad',
+          blad_opis: (err?.message || String(err)).slice(0, 500),
+          tresc_hash: hash || null,
+          snapshot_mongo_id: snapshot || null,
+        });
+      } catch (e2) {
+        log.error('finishTask_failed', {
+          monitorId,
+          zadanieId: taskId,
+          error: e2?.message || String(e2),
+        });
+      }
     }
+
+    // NIE throw — inaczej łatwo o unhandledRejection + task zostaje w_trakcie
+    return;
+  } finally {
+    try { logger?.close?.(); } catch (_) {}
   }
-
-  // NIE throw — inaczej łatwo o unhandledRejection + task zostaje w_trakcie
-  return;
-} finally {
-  try { logger?.close?.(); } catch (_) {}
-}
-
 }
 
 

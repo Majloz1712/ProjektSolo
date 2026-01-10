@@ -80,6 +80,24 @@ async function setPluginTaskStatus(client, pluginTaskId, status, bladOpis = null
   );
 }
 
+async function finishScanTask(client, zadanieId, {
+  status,
+  blad_opis = null,
+  snapshot_mongo_id = null,
+}) {
+  if (!zadanieId) return;
+
+  await client.query(
+    `UPDATE zadania_skanu
+        SET status = $2,
+            zakonczenie_at = NOW(),
+            blad_opis = $3,
+            snapshot_mongo_id = $4
+      WHERE id = $1`,
+    [zadanieId, status, blad_opis, snapshot_mongo_id],
+  );
+}
+
 // ==========================================================
 // GET /api/plugin-tasks/next
 // ==========================================================
@@ -183,6 +201,10 @@ router.post("/:id/result", async (req, res) => {
     if (pluginTask.status === "pending") {
       await setPluginTaskStatus(pg, pluginTask.id, "in_progress", null);
     }
+
+    // do domykania PG taska (UI patrzy na zadania_skanu)
+    const scanTaskId = zadanieId || pluginTask.zadanie_id || null;
+
   } catch (err) {
     pg.release();
     logger?.error?.("plugin_result_pg_resolve_error", { error: String(err?.message || err) });
@@ -332,12 +354,29 @@ router.post("/:id/result", async (req, res) => {
         error: String(err?.message || err),
       });
       // pipeline error -> status error (żeby było widać, że coś nie pykło)
-      await setPluginTaskStatus(pg, pluginTask.id, "error", `PIPELINE_ERROR: ${(err?.message || err).toString().slice(0, 300)}`);
+      // pipeline error -> status error (żeby było widać, że coś nie pykło)
+      const errMsg = (err?.message || err).toString().slice(0, 300);
+      await setPluginTaskStatus(pg, pluginTask.id, "error", `PIPELINE_ERROR: ${errMsg}`);
+
+      await finishScanTask(pg, scanTaskId, {
+        status: "blad",
+        blad_opis: `PIPELINE_ERROR: ${errMsg}`.slice(0, 500),
+        snapshot_mongo_id: snapshotIdStr,
+      });
+
       return res.status(500).json({ error: "PIPELINE_ERROR" });
+
     }
+
 
     // 5) Finalnie: done
     await setPluginTaskStatus(pg, pluginTask.id, "done", null);
+
+    await finishScanTask(pg, scanTaskId, {
+      status: "ok",
+      blad_opis: null,
+      snapshot_mongo_id: snapshotIdStr,
+    });
 
     logger?.info?.("plugin_result_done", {
       pluginTaskId: pluginTask.id,
@@ -345,12 +384,28 @@ router.post("/:id/result", async (req, res) => {
     });
 
     return res.json({ ok: true, snapshot_id: snapshotIdStr });
+
+
+    return res.json({ ok: true, snapshot_id: snapshotIdStr });
   } catch (err) {
     // zawsze kończ taska, żeby nie wisiał
     try {
       if (pluginTask?.id) {
-        await setPluginTaskStatus(pg, pluginTask.id, "error", String(err?.message || err).slice(0, 500));
+        const msg = String(err?.message || err).slice(0, 500);
+        await setPluginTaskStatus(pg, pluginTask.id, "error", msg);
+
+        // scanTaskId może istnieć (dodany wyżej)
+        try {
+          await finishScanTask(pg, scanTaskId, {
+            status: "blad",
+            blad_opis: `PLUGIN_RESULT_ERROR: ${msg}`.slice(0, 500),
+            snapshot_mongo_id: null,
+          });
+        } catch {
+          // ignore
+        }
       }
+
     } catch {
       // ignore
     }
@@ -451,7 +506,15 @@ router.post("/:id/price", async (req, res) => {
         durationMs: Math.round(performance.now() - tPipe0),
       });
     } catch (err) {
-      await setPluginTaskStatus(pg, pluginTask.id, "error", `PIPELINE_ERROR: ${(err?.message || err).toString().slice(0, 300)}`);
+      const errMsg = (err?.message || err).toString().slice(0, 300);
+      await setPluginTaskStatus(pg, pluginTask.id, "error", `PIPELINE_ERROR: ${errMsg}`);
+
+      await finishScanTask(pg, zadanieId, {
+        status: "blad",
+        blad_opis: `PIPELINE_ERROR: ${errMsg}`.slice(0, 500),
+        snapshot_mongo_id: snapshotIdStr,
+      });
+
       logger?.error?.("plugin_price_pipeline_error", {
         snapshotId: snapshotIdStr,
         error: String(err?.message || err),
@@ -459,8 +522,16 @@ router.post("/:id/price", async (req, res) => {
       return res.status(500).json({ error: "PIPELINE_ERROR" });
     }
 
+
     // done
+
     await setPluginTaskStatus(pg, pluginTask.id, "done", null);
+
+    await finishScanTask(pg, zadanieId, {
+      status: "ok",
+      blad_opis: null,
+      snapshot_mongo_id: snapshotIdStr,
+    });
 
     logger?.info?.("plugin_price_done", {
       pluginTaskId: pluginTask.id,
@@ -468,6 +539,7 @@ router.post("/:id/price", async (req, res) => {
     });
 
     return res.json({ ok: true });
+
   } catch (err) {
     try {
       if (pluginTask?.id) {
@@ -633,7 +705,15 @@ router.post("/:id/screenshot", async (req, res) => {
         durationMs: Math.round(performance.now() - tPipe0),
       });
     } catch (err) {
-      await setPluginTaskStatus(pg, pluginTask.id, "error", `PIPELINE_ERROR: ${(err?.message || err).toString().slice(0, 300)}`);
+      const errMsg = (err?.message || err).toString().slice(0, 300);
+      await setPluginTaskStatus(pg, pluginTask.id, "error", `PIPELINE_ERROR: ${errMsg}`);
+
+      await finishScanTask(pg, zadanieId, {
+        status: "blad",
+        blad_opis: `PIPELINE_ERROR: ${errMsg}`.slice(0, 500),
+        snapshot_mongo_id: snapshotIdStr,
+      });
+
       logger?.error?.("plugin_screenshot_pipeline_error", {
         snapshotId: snapshotIdStr,
         error: String(err?.message || err),
@@ -641,8 +721,15 @@ router.post("/:id/screenshot", async (req, res) => {
       return res.status(500).json({ error: "PIPELINE_ERROR" });
     }
 
+
     // done
     await setPluginTaskStatus(pg, pluginTask.id, "done", null);
+
+    await finishScanTask(pg, zadanieId, {
+      status: "ok",
+      blad_opis: null,
+      snapshot_mongo_id: snapshotIdStr,
+    });
 
     logger?.info?.("plugin_screenshot_done", {
       pluginTaskId: pluginTask.id,
@@ -651,6 +738,7 @@ router.post("/:id/screenshot", async (req, res) => {
     });
 
     return res.json({ ok: true, snapshot_id: snapshotIdStr });
+
   } catch (err) {
     try {
       if (pluginTask?.id) {
