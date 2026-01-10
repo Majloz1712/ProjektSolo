@@ -84,6 +84,111 @@ function normalizeOcrText(s) {
   return String(s || '').replace(/\s+/g, ' ').trim();
 }
 
+function toNumberMaybe(v) {
+  if (v == null) return null;
+  let s = String(v).replace(/\u00A0/g, ' ').trim();
+  // wyciągnij pierwszą sensowną liczbę
+  const m = s.match(/-?\d[\d ]*(?:[.,]\d+)?/);
+  if (!m) return null;
+  const n = Number(m[0].replace(/ /g, '').replace(',', '.'));
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeCurrencyFromText(s) {
+  const t = String(s || '').toLowerCase();
+  if (t.includes('zł') || t.includes('pln')) return 'PLN';
+  if (t.includes('€') || t.includes('eur')) return 'EUR';
+  if (t.includes('$') || t.includes('usd')) return 'USD';
+  if (t.includes('£') || t.includes('gbp')) return 'GBP';
+  return null;
+}
+
+function parseExtractorPrice(extractedPrice) {
+  if (!extractedPrice) return null;
+
+  if (typeof extractedPrice === 'string') {
+    const value = toNumberMaybe(extractedPrice);
+    if (value == null) return null;
+    return { value, currency: normalizeCurrencyFromText(extractedPrice) };
+  }
+
+  if (typeof extractedPrice === 'object') {
+    const value = toNumberMaybe(extractedPrice.value ?? extractedPrice.amount ?? null);
+    if (value == null) return null;
+    const currency =
+      extractedPrice.currency ??
+      normalizeCurrencyFromText(extractedPrice.value ?? '') ??
+      null;
+    return { value, currency };
+  }
+
+  return null;
+}
+
+// deterministycznie: 1 cena => bierz; wiele => bierz najczęściej występującą (mode) jeśli się powtarza
+function pickMainPriceFromPluginPrices(pluginPrices) {
+  if (!Array.isArray(pluginPrices) || pluginPrices.length === 0) return null;
+
+  const parsed = pluginPrices
+    .map((p) => ({
+      value: toNumberMaybe(p?.value ?? p),
+      currency: p?.currency ?? null,
+    }))
+    .filter((x) => typeof x.value === 'number');
+
+  if (!parsed.length) return null;
+  if (parsed.length === 1) return parsed[0];
+
+  const counts = new Map();
+  for (const it of parsed) {
+    const key = `${it.currency || ''}|${it.value.toFixed(2)}`;
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+
+  let bestKey = null;
+  let bestCount = 0;
+  for (const [k, c] of counts.entries()) {
+    if (c > bestCount) {
+      bestCount = c;
+      bestKey = k;
+    }
+  }
+
+  // brak dowodu → nie zgadujemy
+  if (!bestKey || bestCount < 2) return null;
+
+  const [currencyRaw, valueRaw] = bestKey.split('|');
+  return { value: Number(valueRaw), currency: currencyRaw || null };
+}
+
+// OCR fallback tylko gdy jest JEDNA unikalna cena z walutą w tekście
+function parseUniquePriceFromText(text) {
+  const t = String(text || '');
+  const re = /(-?\d[\d\s]{0,12}(?:[.,]\d{1,2})?)\s*(zł|pln|eur|€|usd|\$|gbp|£)/gi;
+
+  const found = [];
+  let m;
+  while ((m = re.exec(t))) {
+    const value = toNumberMaybe(m[1]);
+    if (typeof value === 'number') {
+      const currency = normalizeCurrencyFromText(m[2]);
+      found.push({ value, currency });
+    }
+  }
+
+  if (!found.length) return null;
+
+  const uniq = new Map();
+  for (const it of found) {
+    const key = `${it.currency || ''}|${it.value.toFixed(2)}`;
+    uniq.set(key, it);
+  }
+
+  if (uniq.size !== 1) return null;
+  return [...uniq.values()][0];
+}
+
+
 export async function computeMachineDiff(prevSnapshot, newSnapshot, { logger } = {}) {
   if (!prevSnapshot) {
     return {
@@ -172,9 +277,19 @@ export async function computeMachineDiff(prevSnapshot, newSnapshot, { logger } =
     metrics.pluginPricesChanged = false;
   }
 
-  if (prev.price && now.price) {
-    const oldVal = prev.price.value;
-    const newVal = now.price.value;
+  const prevMainPrice =
+    parseExtractorPrice(prev?.price) ||
+    pickMainPriceFromPluginPrices(prevPluginPrices) ||
+    parseUniquePriceFromText(prevOcrText);
+
+  const nowMainPrice =
+    parseExtractorPrice(now?.price) ||
+    pickMainPriceFromPluginPrices(nowPluginPrices) ||
+    parseUniquePriceFromText(nowOcrText);
+
+  if (prevMainPrice && nowMainPrice) {
+    const oldVal = prevMainPrice.value;
+    const newVal = nowMainPrice.value;
 
     if (typeof oldVal === 'number' && typeof newVal === 'number') {
       const absChange = newVal - oldVal;
@@ -189,6 +304,7 @@ export async function computeMachineDiff(prevSnapshot, newSnapshot, { logger } =
       }
     }
   }
+
 
   if (prev.title !== now.title) {
     metrics.titleChanged = true;
