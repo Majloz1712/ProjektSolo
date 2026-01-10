@@ -10,6 +10,95 @@ const analizyCol = db.collection('analizy');
 
 const MAX_TEXT_CHARS = 8000;
 
+
+function toNumberMaybe(v) {
+  if (v == null) return null;
+  const s = String(v)
+    .replace(/\u00A0/g, ' ')
+    .replace(/[^\d.,-]/g, ' ')
+    .trim();
+
+  const m = s.match(/-?\d[\d ]*(?:[.,]\d+)?/);
+  if (!m) return null;
+
+  const n = Number(m[0].replace(/ /g, '').replace(',', '.'));
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeCurrencyFromText(s) {
+  const t = String(s || '').toLowerCase();
+  if (t.includes('zł') || t.includes('pln')) return 'PLN';
+  if (t.includes('€') || t.includes('eur')) return 'EUR';
+  if (t.includes('$') || t.includes('usd')) return 'USD';
+  if (t.includes('£') || t.includes('gbp')) return 'GBP';
+  return null;
+}
+
+function parseExtractorPrice(extractedPrice) {
+  if (!extractedPrice) return null;
+  if (typeof extractedPrice === 'string') {
+    const value = toNumberMaybe(extractedPrice);
+    if (value == null) return null;
+    return { value, currency: normalizeCurrencyFromText(extractedPrice) };
+  }
+  if (typeof extractedPrice === 'object') {
+    const value = toNumberMaybe(extractedPrice.value ?? extractedPrice.amount ?? null);
+    if (value == null) return null;
+    const currency =
+      extractedPrice.currency ??
+      normalizeCurrencyFromText(extractedPrice.value ?? '') ??
+      null;
+    return { value, currency };
+  }
+  return null;
+}
+
+// ostrożnie: bierz tylko gdy się powtarza (mode), żeby nie zgadywać “main”
+function pickMainPriceFromPluginPrices(pluginPrices) {
+  if (!Array.isArray(pluginPrices) || pluginPrices.length === 0) return null;
+
+  const parsed = pluginPrices
+    .map((p) => ({
+      value: toNumberMaybe(p?.value ?? p),
+      currency: p?.currency ?? null,
+      raw: p,
+    }))
+    .filter((x) => typeof x.value === 'number');
+
+  if (!parsed.length) return null;
+
+  const counts = new Map();
+  for (const it of parsed) {
+    const key = `${it.currency || ''}|${it.value.toFixed(2)}`;
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+
+  let bestKey = null;
+  let bestCount = 0;
+  for (const [k, c] of counts.entries()) {
+    if (c > bestCount) {
+      bestCount = c;
+      bestKey = k;
+    }
+  }
+
+  // jeśli nic się nie powtarza → brak dowodu, nie zgadujemy
+  if (!bestKey || bestCount < 2) return null;
+
+  const [currencyRaw, valueRaw] = bestKey.split('|');
+  return {
+    value: Number(valueRaw),
+    currency: currencyRaw || null,
+  };
+}
+
+
+
+
+
+
+
+
 function extractPriceHintFromText(text) {
   if (!text) return { value: null, currency: null };
 
@@ -124,6 +213,18 @@ export async function ensureSnapshotAnalysis(snapshot, { force = false, logger }
       : [];
 
   const ocrPrice = extractPriceHintFromText(ocrTextFull);
+  const extractorMain = parseExtractorPrice(extracted_v2?.price);
+const pluginMain = pickMainPriceFromPluginPrices(pluginPrices);
+
+// OCR fallback zostawiamy jako “hint”, ale też parsujemy do number
+const ocrMain =
+  ocrPrice?.value ? { value: toNumberMaybe(ocrPrice.value), currency: ocrPrice.currency ?? null } : null;
+
+const mainPrice =
+  extractorMain ||
+  pluginMain ||
+  (ocrMain && typeof ocrMain.value === 'number' ? ocrMain : null);
+
 
   let priceInfo;
 
@@ -171,11 +272,13 @@ export async function ensureSnapshotAnalysis(snapshot, { force = false, logger }
       podsumowanie: null,
       product_type: null,
       main_currency: null,
+      price: { value: null, currency: null },
       price_hint: { min: null, max: null },
       features: [],
       raw_response: null,
       error: 'NO_INPUT_DATA',
     };
+
 
     await analizyCol.insertOne(doc);
     return doc;
@@ -248,12 +351,14 @@ logger?.info('snapshot_analysis_llm_done', {
       summary: null,
       podsumowanie: null,
       product_type: null,
-      main_currency: null,
+      main_currency: mainPrice?.currency ?? null,
+      price: { value: mainPrice?.value ?? null, currency: mainPrice?.currency ?? null },
       price_hint: { min: null, max: null },
       features: [],
       raw_response: rawResponse,
       error: err?.message || String(err),
     };
+
 
     logger?.error('snapshot_analysis_llm_error', {
       snapshotId: _id.toString(),
@@ -287,13 +392,16 @@ logger?.info('snapshot_analysis_llm_done', {
     product_type: parsed.product_type ?? null,
     main_currency:
       parsed.main_currency ??
+      mainPrice?.currency ??
       extracted_v2?.price?.currency ??
       null,
+    price: { value: mainPrice?.value ?? null, currency: mainPrice?.currency ?? null },
     price_hint: parsed.price_hint ?? null,
     features: parsed.features ?? [],
     raw_response: rawResponse,
     error: null,
   };
+
 
 logger?.info('snapshot_analysis_success', {
   snapshotId: _id.toString(),

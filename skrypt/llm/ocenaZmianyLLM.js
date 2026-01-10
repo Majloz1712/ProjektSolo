@@ -536,6 +536,59 @@ export async function evaluateChangeWithLLM(
 
     return { parsed: decision, raw: null, mongoId: insertedId };
   }
+  
+    // 0.1) twarda reguła: jeśli machine-diff policzył zmianę MAIN price → istotne
+  if (
+    typeof diff?.metrics?.price?.oldVal === 'number' &&
+    typeof diff?.metrics?.price?.newVal === 'number' &&
+    typeof diff?.metrics?.price?.absChange === 'number' &&
+    diff.metrics.price.absChange !== 0
+  ) {
+    const { oldVal, newVal } = diff.metrics.price;
+
+    const decision = {
+      important: true,
+      category: 'price_change',
+      importance_reason: 'Machine diff policzył zmianę ceny głównej (main price).',
+      short_title: 'Zmiana ceny',
+      short_description: `Cena zmieniła się z ${oldVal} na ${newVal}.`,
+      old_price: oldVal,
+      new_price: newVal,
+    };
+
+    const { insertedId } = await ocenyZmienCol.insertOne({
+      createdAt: new Date(),
+      monitorId,
+      zadanieId,
+      url,
+      llm_mode: 'rule',
+      prompt_used: null,
+      prevAnalysis,
+      newAnalysis,
+      diff,
+      raw_response: null,
+      vision_ocr: {
+        prev: summarizeOcrForStorage(prevOcr),
+        next: summarizeOcrForStorage(newOcr),
+      },
+      llm_decision: decision,
+      error: null,
+      durationMs: Math.round(performance.now() - tEval0),
+    });
+
+    log.info('llm_change_eval_success', {
+      monitorId,
+      zadanieId,
+      mongoId: insertedId,
+      important: true,
+      category: decision.category,
+      usedMode: 'rule',
+      usedModel: 'rule',
+    });
+
+    return { parsed: decision, raw: null, mongoId: insertedId };
+  }
+
 
   // 0.5) twarda reguła: jeśli to tylko "drift" screenshot/OCR (bez realnych zmian treści/ceny) → nieistotne
   const m = diff?.metrics || {};

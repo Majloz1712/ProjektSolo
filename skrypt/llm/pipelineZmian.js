@@ -29,7 +29,8 @@ const snapshotsCol = db.collection("snapshots");
  
  
  
- async function setTaskAnalysisMongoId(zadanieId, analizaId, log = console) {
+async function setTaskAnalysisMongoId(zadanieId, analizaId, opts = {}) {
+  const { force = false, log = console } = opts;
   if (!zadanieId || !analizaId) return;
 
   try {
@@ -37,9 +38,14 @@ const snapshotsCol = db.collection("snapshots");
       `UPDATE zadania_skanu
          SET analiza_mongo_id = $2
        WHERE id = $1
-         AND (analiza_mongo_id IS NULL OR analiza_mongo_id = '')`,
-      [zadanieId, String(analizaId)],
+         AND (
+           $3::boolean = true
+           OR analiza_mongo_id IS NULL
+           OR analiza_mongo_id = ''
+         )`,
+      [zadanieId, String(analizaId), !!force],
     );
+
 
     log?.info?.('pg_analiza_mongo_id_updated', {
       zadanieId,
@@ -112,7 +118,7 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
   const analizaId = newAnalysis?._id;
 
   if (zadanieId) {
-    await setTaskAnalysisMongoId(zadanieId, analizaId, log);
+      await setTaskAnalysisMongoId(zadanieId, analizaId, { force: forceAnalysis, log });
   } else {
     log.warn('pg_analiza_mongo_id_skip_no_zadanieId', {
       snapshotId: snapshotIdStr,
@@ -205,19 +211,21 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
 
 
   const tLlm0 = performance.now();
-  const llmDecision = await evaluateChangeWithLLM(
-    {
-      monitorId: snapshot.monitor_id,
-      zadanieId: snapshot.zadanie_id,
-      url: snapshot.url,
-      prevAnalysis,
-      newAnalysis,
-      diff,
-      prevOcr: prevSnapshot?.vision_ocr || null,
-      newOcr: snapshot?.vision_ocr || null,
-    },
-    { logger },
-  );
+const llmDecision = await evaluateChangeWithLLM(
+  {
+    monitorId: snapshot.monitor_id,
+    zadanieId, // <- spójnie: to samo co poszło do PG (analiza_mongo_id)
+    url: snapshot.url,
+    prevAnalysis,
+    newAnalysis,
+    diff,
+    prevOcr: prevOcr || null,
+    newOcr: newOcr || null,
+  },
+  { logger },
+);
+
+
 
   log.info("pipeline_step_done", {
     step: "evaluateChangeWithLLM",
@@ -235,7 +243,9 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
 const importantByLLM = !!(llmDecision?.parsed?.important);
 
 
-  const isImportant = pluginPricesChanged || importantByLLM;
+const machinePriceChanged = !!(diff?.metrics?.price && diff.metrics.price.absChange !== 0);
+const isImportant = pluginPricesChanged || machinePriceChanged || importantByLLM;
+
 
   if (!isImportant) {
     log.info("pipeline_done", {
@@ -266,19 +276,20 @@ const importantByLLM = !!(llmDecision?.parsed?.important);
 const decisionToSave = llmDecision?.parsed || fallbackDecision;
 
   const tSave0 = performance.now();
-  const { detectionId: wykrycieId } = await saveDetectionAndNotification(
-    {
-      monitorId: snapshot.monitor_id,
-      zadanieId: snapshot.zadanie_id,
-      url: snapshot.url,
-      snapshotMongoId: snapshot._id,
-      diff,
-      prevOcr: prevSnapshot?.vision_ocr || null,
-      newOcr: snapshot?.vision_ocr || null,
-      llmDecision: decisionToSave,
-    },
-    { logger },
-  );
+const { detectionId: wykrycieId } = await saveDetectionAndNotification(
+  {
+    monitorId: snapshot.monitor_id,
+    zadanieId, // <- spójnie
+    url: snapshot.url,
+    snapshotMongoId: snapshot._id,
+    diff,
+    prevOcr: prevSnapshot?.vision_ocr || null,
+    newOcr: snapshot?.vision_ocr || null,
+    llmDecision: decisionToSave,
+  },
+  { logger },
+);
+
   log.info("pipeline_step_done", {
     step: "saveDetectionAndNotification",
     snapshotId: snapshotIdStr,
