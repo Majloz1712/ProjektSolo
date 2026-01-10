@@ -125,6 +125,22 @@ function parseExtractorPrice(extractedPrice) {
   return null;
 }
 
+function parseAnalysisPrice(analysisPrice) {
+  if (!analysisPrice) return null;
+  if (typeof analysisPrice === 'object') {
+    const value = toNumberMaybe(analysisPrice.value ?? analysisPrice.amount ?? null);
+    if (value == null) return null;
+    return {
+      value,
+      currency:
+        analysisPrice.currency ??
+        normalizeCurrencyFromText(analysisPrice.currency ?? '') ??
+        null,
+    };
+  }
+  return null;
+}
+
 // deterministycznie: 1 cena => bierz; wiele => bierz najczęściej występującą (mode) jeśli się powtarza
 function pickMainPriceFromPluginPrices(pluginPrices) {
   if (!Array.isArray(pluginPrices) || pluginPrices.length === 0) return null;
@@ -189,7 +205,11 @@ function parseUniquePriceFromText(text) {
 }
 
 
-export async function computeMachineDiff(prevSnapshot, newSnapshot, { logger } = {}) {
+export async function computeMachineDiff(
+  prevSnapshot,
+  newSnapshot,
+  { logger, prevAnalysis, newAnalysis } = {},
+) {
   if (!prevSnapshot) {
     return {
       hasAnyChange: false,
@@ -278,11 +298,13 @@ export async function computeMachineDiff(prevSnapshot, newSnapshot, { logger } =
   }
 
   const prevMainPrice =
+    parseAnalysisPrice(prevAnalysis?.price) ||
     parseExtractorPrice(prev?.price) ||
     pickMainPriceFromPluginPrices(prevPluginPrices) ||
     parseUniquePriceFromText(prevOcrText);
 
   const nowMainPrice =
+    parseAnalysisPrice(newAnalysis?.price) ||
     parseExtractorPrice(now?.price) ||
     pickMainPriceFromPluginPrices(nowPluginPrices) ||
     parseUniquePriceFromText(nowOcrText);
@@ -405,4 +427,3 @@ export async function getSnapshotAnalysis(snapshotId, { logger } = {}) {
 
   return doc;
 }
-
