@@ -89,28 +89,36 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
 
   const tPipeline0 = performance.now();
 
-  // 1) analiza nowego snapshotu
+   // 1) OCR nowego snapshotu (tesseract) – zapis do snapshotu + update obiektu w pamięci
+  const tOcrNew0 = performance.now();
+  const newOcr = await ensureSnapshotOcr(snapshot, { logger });
+  log.info("pipeline_step_done", {
+    step: "ensureSnapshotOcr_new",
+    snapshotId: snapshotIdStr,
+    monitorId: snapshot.monitor_id,
+    durationMs: Math.round(performance.now() - tOcrNew0),
+    ocrPresent: !!newOcr,
+  });
+
+  // 2) analiza nowego snapshotu (ma już snapshot.vision_ocr jako fallback)
   const tAnalysis0 = performance.now();
   const newAnalysis = await ensureSnapshotAnalysis(snapshot, {
     force: forceAnalysis,
     logger,
   });
-  // ✅ Zapisz w PG link do analizy w Mongo
-// ✅ Zapisz w PG link do analizy w Mongo
-    const zadanieId = newAnalysis?.zadanieId || snapshot?.zadanie_id || snapshot?.zadanieId;
-    const analizaId = newAnalysis?._id;
 
+  // ✅ Zapisz w PG link do analizy w Mongo (tylko jeśli mamy zadanieId)
+  const zadanieId = newAnalysis?.zadanieId || snapshot?.zadanie_id || snapshot?.zadanieId;
+  const analizaId = newAnalysis?._id;
+
+  if (zadanieId) {
     await setTaskAnalysisMongoId(zadanieId, analizaId, log);
-    
-    if (!zadanieId) {
-  log.warn('pg_analiza_mongo_id_skip_no_zadanieId', {
-    snapshotId: snapshotIdStr,
-    analizaId: analizaId ? String(analizaId) : null,
-  });
-}
-
-
-
+  } else {
+    log.warn('pg_analiza_mongo_id_skip_no_zadanieId', {
+      snapshotId: snapshotIdStr,
+      analizaId: analizaId ? String(analizaId) : null,
+    });
+  }
 
   log.info("pipeline_step_done", {
     step: "ensureSnapshotAnalysis",
@@ -118,6 +126,7 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
     monitorId: snapshot.monitor_id,
     durationMs: Math.round(performance.now() - tAnalysis0),
   });
+
 
   // 2) poprzedni snapshot
   const tPrev0 = performance.now();
@@ -132,16 +141,7 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
 
 
   // 3) OCR jako extractor (tesseract) – tylko czytanie i zapis do snapshotu
-  const tOcrNew0 = performance.now();
-  const newOcr = await ensureSnapshotOcr(snapshot, { logger });
-  log.info("pipeline_step_done", {
-    step: "ensureSnapshotOcr_new",
-    snapshotId: snapshotIdStr,
-    monitorId: snapshot.monitor_id,
-    durationMs: Math.round(performance.now() - tOcrNew0),
-    ocrPresent: !!newOcr,
-  });
-
+  // 3) OCR poprzedniego snapshotu (tesseract) – żeby diff + LLM miały prevOcr
   let prevOcr = null;
   if (prevSnapshot) {
     const tOcrPrev0 = performance.now();
@@ -154,6 +154,7 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
       ocrPresent: !!prevOcr,
     });
   }
+
   // 3) diff
   const tDiff0 = performance.now();
   const diff = await computeMachineDiff(prevSnapshot, snapshot, { logger });
@@ -184,16 +185,24 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
   }
 
   // 4) poprzednia analiza LLM (jeśli była)
+  // 4) poprzednia analiza LLM (jeśli była; jeśli nie – dobuduj, bo mamy już prevSnapshot.vision_ocr)
   let prevAnalysis = null;
   if (prevSnapshot) {
     const tPrevAnalysis0 = performance.now();
     prevAnalysis = await getSnapshotAnalysis(prevSnapshot._id, { logger });
+
+    if (!prevAnalysis) {
+      prevAnalysis = await ensureSnapshotAnalysis(prevSnapshot, { force: false, logger });
+    }
+
     log.info("pipeline_step_done", {
-      step: "getSnapshotAnalysis",
+      step: "prevAnalysis_ready",
       snapshotId: snapshotIdStr,
       durationMs: Math.round(performance.now() - tPrevAnalysis0),
+      found: !!prevAnalysis,
     });
   }
+
 
   const tLlm0 = performance.now();
   const llmDecision = await evaluateChangeWithLLM(
