@@ -164,6 +164,25 @@ function normalizeFeatures(input) {
     .filter((item) => item.length > 0);
 }
 
+function parseJsonFromResponse(rawResponse) {
+  const trimmed = String(rawResponse || '').trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch (err) {
+    // ignore and try extraction below
+  }
+  const start = trimmed.indexOf('{');
+  const end = trimmed.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) return null;
+  const candidate = trimmed.slice(start, end + 1);
+  try {
+    return JSON.parse(candidate);
+  } catch (err) {
+    return null;
+  }
+}
+
 async function safeInsertAnalysis(doc, { logger, snapshotId } = {}) {
   let insertedId = null;
   try {
@@ -326,11 +345,10 @@ const mainPrice =
       url,
       model: process.env.OLLAMA_TEXT_MODEL || 'llama3',
       prompt: null,
-      summary: null,
-      podsumowanie: null,
-      product_type: null,
-            main_currency: mainPrice?.currency ?? null,
-
+      summary: '',
+      podsumowanie: '',
+      product_type: '',
+      main_currency: null,
       price: { value: null, currency: null },
       price_hint: { min: null, max: null },
       features: [],
@@ -404,11 +422,10 @@ logger?.info('snapshot_analysis_llm_done', {
 });
 
 
-    const trimmed = String(rawResponse || '').trim();
-    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) {
+    parsed = parseJsonFromResponse(rawResponse);
+    if (!parsed) {
       throw new Error('LLM_NON_JSON_RESPONSE');
     }
-    parsed = JSON.parse(trimmed);
   } catch (err) {
     // ❌ błąd LLM – zapisujemy dokument z błędem, żeby schema się zgadzała
     const normalizedPrice = normalizePriceObject(mainPrice);
