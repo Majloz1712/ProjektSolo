@@ -204,6 +204,64 @@ function parseUniquePriceFromText(text) {
   return [...uniq.values()][0];
 }
 
+function extractNumbersWithContext(text) {
+  if (!text) return [];
+  const t = String(text);
+  const re = /(-?\d[\d\s]{0,12}(?:[.,]\d{1,2})?)(?:\s*(zł|pln|eur|€|usd|\$|gbp|£))?/gi;
+  const out = [];
+  let m;
+  while ((m = re.exec(t))) {
+    const value = toNumberMaybe(m[1]);
+    if (typeof value !== 'number') continue;
+    const currency = m[2] ? normalizeCurrencyFromText(m[2]) : null;
+    out.push({ value, currency, raw: m[0] });
+  }
+  return out;
+}
+
+function uniqueNumberSet(items) {
+  const map = new Map();
+  for (const it of items) {
+    const key = `${it.currency || ''}|${it.value.toFixed(2)}`;
+    if (!map.has(key)) {
+      map.set(key, { value: it.value, currency: it.currency });
+    }
+  }
+  return [...map.values()];
+}
+
+function pickSecondaryPrices(text, limit = 6) {
+  const items = extractNumbersWithContext(text).filter((it) => it.currency);
+  if (!items.length) return [];
+  const uniq = uniqueNumberSet(items);
+  return uniq.slice(0, limit);
+}
+
+function extractReviewSignals(text) {
+  if (!text) return { count: null, rating: null };
+  const t = String(text).toLowerCase();
+  const countMatch = t.match(/(\d+)\s*(opinii|ocen|reviews|review)\b/);
+  const count = countMatch ? Number(countMatch[1]) : null;
+  const ratingMatch = t.match(/(\d+(?:[.,]\d+)?)\s*\/\s*5/);
+  const rating = ratingMatch ? Number(ratingMatch[1].replace(',', '.')) : null;
+  return {
+    count: Number.isFinite(count) ? count : null,
+    rating: Number.isFinite(rating) ? rating : null,
+  };
+}
+
+function numericDiffScore(prevText, nowText) {
+  const prevNums = extractNumbersWithContext(prevText);
+  const nowNums = extractNumbersWithContext(nowText);
+  const prevSet = new Set(prevNums.map((it) => `${it.currency || ''}|${it.value.toFixed(2)}`));
+  const nowSet = new Set(nowNums.map((it) => `${it.currency || ''}|${it.value.toFixed(2)}`));
+  if (prevSet.size === 0 && nowSet.size === 0) return 0;
+  let intersection = 0;
+  for (const k of prevSet) if (nowSet.has(k)) intersection += 1;
+  const union = new Set([...prevSet, ...nowSet]).size;
+  return union ? 1 - intersection / union : 0;
+}
+
 
 export async function computeMachineDiff(
   prevSnapshot,
@@ -344,11 +402,48 @@ export async function computeMachineDiff(
 
   const prevText = prev.text || '';
   const nowText = now.text || '';
+  const prevCombinedText = `${prevText} ${prevOcrText}`.trim();
+  const nowCombinedText = `${nowText} ${nowOcrText}`.trim();
   const textDiffScore = simpleTextDiffScore(prevText, nowText);
   metrics.textDiffScore = textDiffScore;
 
   if (textDiffScore > 0.05) {
     reasons.push(`zmiana treści strony (score ~${textDiffScore.toFixed(3)})`);
+  }
+
+  const numericScore = numericDiffScore(prevCombinedText, nowCombinedText);
+  metrics.numericDiffScore = numericScore;
+  if (numericScore > 0.1) {
+    reasons.push(`zmiana danych liczbowych w treści (score ~${numericScore.toFixed(3)})`);
+  }
+
+  const prevReviews = extractReviewSignals(prevCombinedText);
+  const nowReviews = extractReviewSignals(nowCombinedText);
+  metrics.reviews = {
+    prevCount: prevReviews.count,
+    nowCount: nowReviews.count,
+    prevRating: prevReviews.rating,
+    nowRating: nowReviews.rating,
+  };
+  if (prevReviews.count != null && nowReviews.count != null && prevReviews.count !== nowReviews.count) {
+    reasons.push(`zmiana liczby opinii (${prevReviews.count} → ${nowReviews.count})`);
+  }
+  if (prevReviews.rating != null && nowReviews.rating != null && prevReviews.rating !== nowReviews.rating) {
+    reasons.push(`zmiana oceny (${prevReviews.rating} → ${nowReviews.rating})`);
+  }
+
+  const prevSecondaryPrices = pickSecondaryPrices(prevCombinedText);
+  const nowSecondaryPrices = pickSecondaryPrices(nowCombinedText);
+  metrics.secondaryPrices = {
+    prev: prevSecondaryPrices,
+    now: nowSecondaryPrices,
+    prevMin: prevSecondaryPrices.length ? Math.min(...prevSecondaryPrices.map((p) => p.value)) : null,
+    nowMin: nowSecondaryPrices.length ? Math.min(...nowSecondaryPrices.map((p) => p.value)) : null,
+    prevMax: prevSecondaryPrices.length ? Math.max(...prevSecondaryPrices.map((p) => p.value)) : null,
+    nowMax: nowSecondaryPrices.length ? Math.max(...nowSecondaryPrices.map((p) => p.value)) : null,
+  };
+  if (JSON.stringify(prevSecondaryPrices) !== JSON.stringify(nowSecondaryPrices)) {
+    reasons.push('zmiana cen drugorzędnych (secondary prices)');
   }
 
   const prevImages = (prev.images || []).length;
@@ -370,6 +465,25 @@ export async function computeMachineDiff(
   }
 
   if (textDiffScore > 0.15) {
+    hasSignificantMachineChange = true;
+  }
+
+  if (metrics.numericDiffScore != null && metrics.numericDiffScore > 0.2) {
+    hasSignificantMachineChange = true;
+  }
+
+  if (
+    (metrics.reviews?.prevCount != null &&
+      metrics.reviews?.nowCount != null &&
+      metrics.reviews.prevCount !== metrics.reviews.nowCount) ||
+    (metrics.reviews?.prevRating != null &&
+      metrics.reviews?.nowRating != null &&
+      metrics.reviews.prevRating !== metrics.reviews.nowRating)
+  ) {
+    hasSignificantMachineChange = true;
+  }
+
+  if (metrics.secondaryPrices && JSON.stringify(metrics.secondaryPrices.prev) !== JSON.stringify(metrics.secondaryPrices.now)) {
     hasSignificantMachineChange = true;
   }
 
