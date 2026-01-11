@@ -122,6 +122,83 @@ function extractPriceHintFromText(text) {
   return { value, currency };
 }
 
+function sanitizeNullableString(value) {
+  if (value == null) return null;
+  const s = String(value).trim();
+  return s.length ? s : null;
+}
+
+function sanitizeRequiredString(value) {
+  if (value == null) return '';
+  const s = String(value).trim();
+  return s.length ? s : '';
+}
+
+function normalizePriceObject(price) {
+  if (!price || typeof price !== 'object') {
+    return { value: null, currency: null };
+  }
+  const value = toNumberMaybe(price.value ?? price.amount ?? null);
+  return {
+    value: typeof value === 'number' ? value : null,
+    currency: sanitizeNullableString(price.currency),
+  };
+}
+
+function normalizePriceHint(input) {
+  if (!input || typeof input !== 'object') {
+    return { min: null, max: null };
+  }
+  const min = toNumberMaybe(input.min ?? null);
+  const max = toNumberMaybe(input.max ?? null);
+  return {
+    min: typeof min === 'number' ? min : null,
+    max: typeof max === 'number' ? max : null,
+  };
+}
+
+function normalizeFeatures(input) {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((item) => (item == null ? '' : String(item).trim()))
+    .filter((item) => item.length > 0);
+}
+
+function parseJsonFromResponse(rawResponse) {
+  const trimmed = String(rawResponse || '').trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch (err) {
+    // ignore and try extraction below
+  }
+  const start = trimmed.indexOf('{');
+  const end = trimmed.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) return null;
+  const candidate = trimmed.slice(start, end + 1);
+  try {
+    return JSON.parse(candidate);
+  } catch (err) {
+    return null;
+  }
+}
+
+async function safeInsertAnalysis(doc, { logger, snapshotId } = {}) {
+  let insertedId = null;
+  try {
+    const result = await analizyCol.insertOne(doc);
+    insertedId = result?.insertedId ?? null;
+  } catch (err) {
+    logger?.error?.('snapshot_analysis_insert_failed', {
+      snapshotId: snapshotId?.toString?.() || String(snapshotId || ''),
+      code: err?.code ?? null,
+      message: err?.message || String(err),
+      errInfo: err?.errInfo ?? null,
+    });
+  }
+  return { doc, insertedId };
+}
+
 export async function ensureSnapshotAnalysis(snapshot, { force = false, logger } = {}) {
 
   // jeśli już jest analiza – zwracamy ją
@@ -268,9 +345,9 @@ const mainPrice =
       url,
       model: process.env.OLLAMA_TEXT_MODEL || 'llama3',
       prompt: null,
-      summary: null,
-      podsumowanie: null,
-      product_type: null,
+      summary: '',
+      podsumowanie: '',
+      product_type: '',
       main_currency: null,
       price: { value: null, currency: null },
       price_hint: { min: null, max: null },
@@ -280,8 +357,18 @@ const mainPrice =
     };
 
 
-    await analizyCol.insertOne(doc);
-    return doc;
+    const { doc: storedDoc, insertedId } = await safeInsertAnalysis(doc, {
+      logger,
+      snapshotId: _id,
+    });
+    if (insertedId) {
+      storedDoc._id = insertedId;
+      storedDoc._inserted = true;
+    } else {
+      storedDoc._id = null;
+      storedDoc._inserted = false;
+    }
+    return storedDoc;
   }
 
 
@@ -303,6 +390,7 @@ Na podstawie danych strony wygeneruj zwięzły JSON:
 }
 
 Zawsze zwróć poprawny JSON.
+ZWRAĆAJ WYŁĄCZNIE JSON — bez żadnego tekstu, komentarzy, markdown ani bloków kodu.
 
 Tytuł: ${title}
 Opis: ${description}
@@ -320,7 +408,11 @@ ${ocrPreview ? `\nOCR ze screenshotu (preview):\n${ocrPreview}\n` : ''}
 
   try {
     const tLlm0 = performance.now();
-rawResponse = await generateTextWithOllama({ prompt, logger });
+rawResponse = await generateTextWithOllama({
+  prompt,
+  logger,
+  temperature: 0,
+});
 logger?.info('snapshot_analysis_llm_done', {
   snapshotId: _id.toString(),
   monitorId: String(monitor_id || ''),
@@ -330,12 +422,13 @@ logger?.info('snapshot_analysis_llm_done', {
 });
 
 
-    const jsonMatch = rawResponse.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('Brak JSON w odpowiedzi LLM');
-
-    parsed = JSON.parse(jsonMatch[0]);
+    parsed = parseJsonFromResponse(rawResponse);
+    if (!parsed) {
+      throw new Error('LLM_NON_JSON_RESPONSE');
+    }
   } catch (err) {
     // ❌ błąd LLM – zapisujemy dokument z błędem, żeby schema się zgadzała
+    const normalizedPrice = normalizePriceObject(mainPrice);
     const errorDoc = {
       zadanieId: String(zadanie_id),
       monitorId: String(monitor_id),
@@ -348,14 +441,14 @@ logger?.info('snapshot_analysis_llm_done', {
       model: process.env.OLLAMA_TEXT_MODEL || 'llama3',
       prompt,
 
-      summary: null,
-      podsumowanie: null,
-      product_type: null,
-      main_currency: mainPrice?.currency ?? null,
-      price: { value: mainPrice?.value ?? null, currency: mainPrice?.currency ?? null },
+      summary: '',
+      podsumowanie: '',
+      product_type: '',
+      main_currency: normalizedPrice.currency,
+      price: normalizedPrice,
       price_hint: { min: null, max: null },
       features: [],
-      raw_response: rawResponse,
+      raw_response: rawResponse != null ? String(rawResponse) : null,
       error: err?.message || String(err),
     };
 
@@ -370,11 +463,26 @@ logger?.info('snapshot_analysis_llm_done', {
       durationMs: Math.round(performance.now() - t0),
     });
 
-    await analizyCol.insertOne(errorDoc);
-    return errorDoc;
+    const { doc: storedDoc, insertedId } = await safeInsertAnalysis(errorDoc, {
+      logger,
+      snapshotId: _id,
+    });
+    if (insertedId) {
+      storedDoc._id = insertedId;
+      storedDoc._inserted = true;
+    } else {
+      storedDoc._id = null;
+      storedDoc._inserted = false;
+    }
+    return storedDoc;
   }
 
   // ✅ sukces – pełny dokument analizy
+  const normalizedPrice = normalizePriceObject(mainPrice);
+  const normalizedMainCurrency =
+    sanitizeNullableString(parsed?.main_currency) ||
+    normalizedPrice.currency ||
+    sanitizeNullableString(extracted_v2?.price?.currency);
   const doc = {
     zadanieId: String(zadanie_id),
     monitorId: String(monitor_id),
@@ -387,18 +495,14 @@ logger?.info('snapshot_analysis_llm_done', {
     model: process.env.OLLAMA_TEXT_MODEL || 'llama3',
     prompt,
 
-    summary: parsed.summary ?? null,
-    podsumowanie: parsed.summary ?? null,
-    product_type: parsed.product_type ?? null,
-    main_currency:
-      parsed.main_currency ??
-      mainPrice?.currency ??
-      extracted_v2?.price?.currency ??
-      null,
-    price: { value: mainPrice?.value ?? null, currency: mainPrice?.currency ?? null },
-    price_hint: parsed.price_hint ?? null,
-    features: parsed.features ?? [],
-    raw_response: rawResponse,
+    summary: sanitizeRequiredString(parsed?.summary),
+    podsumowanie: sanitizeRequiredString(parsed?.summary),
+    product_type: sanitizeRequiredString(parsed?.product_type),
+    main_currency: normalizedMainCurrency,
+    price: normalizedPrice,
+    price_hint: normalizePriceHint(parsed?.price_hint),
+    features: normalizeFeatures(parsed?.features),
+    raw_response: rawResponse != null ? String(rawResponse) : null,
     error: null,
   };
 
@@ -410,7 +514,16 @@ logger?.info('snapshot_analysis_success', {
   durationMs: Math.round(performance.now() - t0),
 });
 
-  await analizyCol.insertOne(doc);
-  return doc;
+  const { doc: storedDoc, insertedId } = await safeInsertAnalysis(doc, {
+    logger,
+    snapshotId: _id,
+  });
+  if (insertedId) {
+    storedDoc._id = insertedId;
+    storedDoc._inserted = true;
+  } else {
+    storedDoc._id = null;
+    storedDoc._inserted = false;
+  }
+  return storedDoc;
 }
-
