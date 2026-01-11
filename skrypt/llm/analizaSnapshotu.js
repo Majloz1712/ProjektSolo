@@ -329,7 +329,8 @@ const mainPrice =
       summary: null,
       podsumowanie: null,
       product_type: null,
-      main_currency: null,
+            main_currency: mainPrice?.currency ?? null,
+
       price: { value: null, currency: null },
       price_hint: { min: null, max: null },
       features: [],
