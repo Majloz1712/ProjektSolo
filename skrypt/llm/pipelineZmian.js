@@ -116,9 +116,10 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
   // ✅ Zapisz w PG link do analizy w Mongo (tylko jeśli mamy zadanieId)
   const zadanieId = newAnalysis?.zadanieId || snapshot?.zadanie_id || snapshot?.zadanieId;
   const analizaId = newAnalysis?._id;
+  const analizaInserted = newAnalysis?._inserted === true;
 
-  if (zadanieId) {
-      await setTaskAnalysisMongoId(zadanieId, analizaId, { force: forceAnalysis, log });
+  if (zadanieId && analizaInserted && analizaId) {
+    await setTaskAnalysisMongoId(zadanieId, analizaId, { force: forceAnalysis, log });
   } else {
     log.warn('pg_analiza_mongo_id_skip_no_zadanieId', {
       snapshotId: snapshotIdStr,
@@ -161,35 +162,6 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
     });
   }
 
-  // 3) diff
-  const tDiff0 = performance.now();
-  const diff = await computeMachineDiff(prevSnapshot, snapshot, { logger });
-  log.info("pipeline_step_done", {
-    step: "computeMachineDiff",
-    snapshotId: snapshotIdStr,
-    monitorId: snapshot.monitor_id,
-    durationMs: Math.round(performance.now() - tDiff0),
-    hasAnyChange: !!diff?.hasAnyChange,
-  });
-
-  const screenshotChanged = !!diff?.metrics?.screenshotChanged;
-
-  if (!diff?.hasAnyChange && !screenshotChanged) {
-    log.info("[pipeline] Brak zmian – kończę na warstwie 2.", {
-      snapshotId: snapshotIdStr,
-      monitorId: snapshot.monitor_id,
-    });
-
-    log.info("pipeline_done", {
-      snapshotId: snapshotIdStr,
-      monitorId: snapshot.monitor_id,
-      result: "no_change",
-      durationMs: Math.round(performance.now() - tPipeline0),
-    });
-
-    return;
-  }
-
   // 4) poprzednia analiza LLM (jeśli była)
   // 4) poprzednia analiza LLM (jeśli była; jeśli nie – dobuduj, bo mamy już prevSnapshot.vision_ocr)
   let prevAnalysis = null;
@@ -209,6 +181,42 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
     });
   }
 
+  // 3) diff
+  const tDiff0 = performance.now();
+  const diff = await computeMachineDiff(prevSnapshot, snapshot, {
+    logger,
+    prevAnalysis,
+    newAnalysis,
+  });
+  log.info("pipeline_step_done", {
+    step: "computeMachineDiff",
+    snapshotId: snapshotIdStr,
+    monitorId: snapshot.monitor_id,
+    durationMs: Math.round(performance.now() - tDiff0),
+    hasAnyChange: !!diff?.hasAnyChange,
+  });
+
+  const screenshotChanged = !!diff?.metrics?.screenshotChanged;
+  const analysisPriceChanged =
+    typeof prevAnalysis?.price?.value === "number" &&
+    typeof newAnalysis?.price?.value === "number" &&
+    prevAnalysis.price.value !== newAnalysis.price.value;
+
+  if (!diff?.hasAnyChange && !screenshotChanged && !analysisPriceChanged) {
+    log.info("[pipeline] Brak zmian – kończę na warstwie 2.", {
+      snapshotId: snapshotIdStr,
+      monitorId: snapshot.monitor_id,
+    });
+
+    log.info("pipeline_done", {
+      snapshotId: snapshotIdStr,
+      monitorId: snapshot.monitor_id,
+      result: "no_change",
+      durationMs: Math.round(performance.now() - tPipeline0),
+    });
+
+    return;
+  }
 
   const tLlm0 = performance.now();
 const llmDecision = await evaluateChangeWithLLM(

@@ -152,6 +152,13 @@ function parseRatingMaybe(v) {
   return n;
 }
 
+function pickAnalysisPriceValue(analysis) {
+  if (!analysis || typeof analysis !== 'object') return null;
+  const value = analysis?.price?.value ?? null;
+  const n = toNumberMaybe(value);
+  return typeof n === 'number' ? n : null;
+}
+
 function hasCurrencyHint(text) {
   const s = String(text || '').toLowerCase();
   return (
@@ -537,7 +544,7 @@ export async function evaluateChangeWithLLM(
     return { parsed: decision, raw: null, mongoId: insertedId };
   }
   
-    // 0.1) twarda reguła: jeśli machine-diff policzył zmianę MAIN price → istotne
+  // 0.1) twarda reguła: jeśli machine-diff policzył zmianę MAIN price → istotne
   if (
     typeof diff?.metrics?.price?.oldVal === 'number' &&
     typeof diff?.metrics?.price?.newVal === 'number' &&
@@ -589,6 +596,57 @@ export async function evaluateChangeWithLLM(
     return { parsed: decision, raw: null, mongoId: insertedId };
   }
 
+  // 0.15) twarda reguła: zmiana ceny z analizy snapshotu (LLM #1)
+  const prevAnalysisPrice = pickAnalysisPriceValue(prevAnalysis);
+  const newAnalysisPrice = pickAnalysisPriceValue(newAnalysis);
+  if (
+    typeof prevAnalysisPrice === 'number' &&
+    typeof newAnalysisPrice === 'number' &&
+    prevAnalysisPrice !== newAnalysisPrice
+  ) {
+    const decision = {
+      important: true,
+      category: 'price_change',
+      importance_reason: 'Analiza snapshotów wykryła zmianę głównej ceny.',
+      short_title: 'Zmiana ceny',
+      short_description: `Cena zmieniła się z ${prevAnalysisPrice} na ${newAnalysisPrice}.`,
+      old_price: prevAnalysisPrice,
+      new_price: newAnalysisPrice,
+    };
+
+    const { insertedId } = await ocenyZmienCol.insertOne({
+      createdAt: new Date(),
+      monitorId,
+      zadanieId,
+      url,
+      llm_mode: 'rule',
+      prompt_used: null,
+      prevAnalysis,
+      newAnalysis,
+      diff,
+      raw_response: null,
+      vision_ocr: {
+        prev: summarizeOcrForStorage(prevOcr),
+        next: summarizeOcrForStorage(newOcr),
+      },
+      llm_decision: decision,
+      error: null,
+      durationMs: Math.round(performance.now() - tEval0),
+    });
+
+    log.info('llm_change_eval_success', {
+      monitorId,
+      zadanieId,
+      mongoId: insertedId,
+      important: true,
+      category: decision.category,
+      usedMode: 'rule',
+      usedModel: 'rule',
+    });
+
+    return { parsed: decision, raw: null, mongoId: insertedId };
+  }
+
 
   // 0.5) twarda reguła: jeśli to tylko "drift" screenshot/OCR (bez realnych zmian treści/ceny) → nieistotne
   const m = diff?.metrics || {};
@@ -603,9 +661,23 @@ export async function evaluateChangeWithLLM(
     m.descriptionChanged === true ||
     (typeof textScore === 'number' && textScore > 0.15);
 
+  const secondaryPricesChanged =
+    m.secondaryPrices && JSON.stringify(m.secondaryPrices.prev) !== JSON.stringify(m.secondaryPrices.now);
+  const reviewsChanged =
+    (m.reviews?.prevCount != null &&
+      m.reviews?.nowCount != null &&
+      m.reviews.prevCount !== m.reviews.nowCount) ||
+    (m.reviews?.prevRating != null &&
+      m.reviews?.nowRating != null &&
+      m.reviews.prevRating !== m.reviews.nowRating);
+  const numericChanged = typeof m.numericDiffScore === 'number' && m.numericDiffScore > 0.1;
+
   const onlyOcrDrift =
     !hasPriceMove &&
     !hasContentMove &&
+    !secondaryPricesChanged &&
+    !reviewsChanged &&
+    !numericChanged &&
     m.pluginPricesChanged !== true &&
     (m.screenshotChanged === true || m.ocrTextChanged === true) &&
     ocrScore > 0 &&
