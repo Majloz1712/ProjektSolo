@@ -271,7 +271,8 @@ const mainPrice =
       summary: null,
       podsumowanie: null,
       product_type: null,
-      main_currency: null,
+            main_currency: mainPrice?.currency ?? null,
+
       price: { value: null, currency: null },
       price_hint: { min: null, max: null },
       features: [],
@@ -302,7 +303,10 @@ Na podstawie danych strony wygeneruj zwięzły JSON:
   ]
 }
 
-Zawsze zwróć poprawny JSON.
+    Zawsze zwróć poprawny JSON.
+    ODPOWIEDZ WYŁĄCZNIE JSON (bez backticków, bez komentarzy, bez tekstu dookoła).
+    Jeśli nie masz danych, zwróć JSON z null / [] zgodnie ze schematem.
+
 
 Tytuł: ${title}
 Opis: ${description}
@@ -330,10 +334,43 @@ logger?.info('snapshot_analysis_llm_done', {
 });
 
 
-    const jsonMatch = rawResponse.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('Brak JSON w odpowiedzi LLM');
+    const extractFirstJsonObject = (text) => {
+      if (!text) return null;
 
-    parsed = JSON.parse(jsonMatch[0]);
+      // obsłuż ```json ... ```
+      const fence = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+      const src = (fence?.[1] ?? text).trim();
+
+      const first = src.indexOf('{');
+      if (first === -1) return null;
+
+      // znajdź pierwszy poprawny obiekt JSON metodą “balansu klamer”
+      for (let i = first; i < src.length; i++) {
+        if (src[i] !== '{') continue;
+
+        let depth = 0;
+        for (let j = i; j < src.length; j++) {
+          const ch = src[j];
+          if (ch === '{') depth++;
+          else if (ch === '}') depth--;
+
+          if (depth === 0) {
+            const candidate = src.slice(i, j + 1);
+            try {
+              return JSON.parse(candidate);
+            } catch (_) {
+              break;
+            }
+          }
+        }
+      }
+
+      return null;
+    };
+
+    parsed = extractFirstJsonObject(rawResponse);
+    if (!parsed) throw new Error('Brak JSON w odpowiedzi LLM');
+
   } catch (err) {
     // ❌ błąd LLM – zapisujemy dokument z błędem, żeby schema się zgadzała
     const errorDoc = {
@@ -353,7 +390,7 @@ logger?.info('snapshot_analysis_llm_done', {
       product_type: null,
       main_currency: mainPrice?.currency ?? null,
       price: { value: mainPrice?.value ?? null, currency: mainPrice?.currency ?? null },
-      price_hint: { min: null, max: null },
+            price_hint: { min: null, max: mainPrice?.value ?? null },
       features: [],
       raw_response: rawResponse,
       error: err?.message || String(err),
@@ -396,8 +433,15 @@ logger?.info('snapshot_analysis_llm_done', {
       extracted_v2?.price?.currency ??
       null,
     price: { value: mainPrice?.value ?? null, currency: mainPrice?.currency ?? null },
-    price_hint: parsed.price_hint ?? null,
-    features: parsed.features ?? [],
+    price_hint: (parsed.price_hint && typeof parsed.price_hint === 'object')
+      ? {
+          min: parsed.price_hint.min ?? null,
+          max: parsed.price_hint.max ?? null,
+        }
+      : { min: null, max: mainPrice?.value ?? null },
+
+    features: Array.isArray(parsed.features) ? parsed.features : [],
+
     raw_response: rawResponse,
     error: null,
   };
