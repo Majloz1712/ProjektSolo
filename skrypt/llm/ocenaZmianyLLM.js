@@ -152,6 +152,13 @@ function parseRatingMaybe(v) {
   return n;
 }
 
+function pickAnalysisPriceValue(analysis) {
+  if (!analysis || typeof analysis !== 'object') return null;
+  const value = analysis?.price?.value ?? null;
+  const n = toNumberMaybe(value);
+  return typeof n === 'number' ? n : null;
+}
+
 function hasCurrencyHint(text) {
   const s = String(text || '').toLowerCase();
   return (
@@ -537,7 +544,7 @@ export async function evaluateChangeWithLLM(
     return { parsed: decision, raw: null, mongoId: insertedId };
   }
   
-    // 0.1) twarda reguła: jeśli machine-diff policzył zmianę MAIN price → istotne
+  // 0.1) twarda reguła: jeśli machine-diff policzył zmianę MAIN price → istotne
   if (
     typeof diff?.metrics?.price?.oldVal === 'number' &&
     typeof diff?.metrics?.price?.newVal === 'number' &&
@@ -554,6 +561,57 @@ export async function evaluateChangeWithLLM(
       short_description: `Cena zmieniła się z ${oldVal} na ${newVal}.`,
       old_price: oldVal,
       new_price: newVal,
+    };
+
+    const { insertedId } = await ocenyZmienCol.insertOne({
+      createdAt: new Date(),
+      monitorId,
+      zadanieId,
+      url,
+      llm_mode: 'rule',
+      prompt_used: null,
+      prevAnalysis,
+      newAnalysis,
+      diff,
+      raw_response: null,
+      vision_ocr: {
+        prev: summarizeOcrForStorage(prevOcr),
+        next: summarizeOcrForStorage(newOcr),
+      },
+      llm_decision: decision,
+      error: null,
+      durationMs: Math.round(performance.now() - tEval0),
+    });
+
+    log.info('llm_change_eval_success', {
+      monitorId,
+      zadanieId,
+      mongoId: insertedId,
+      important: true,
+      category: decision.category,
+      usedMode: 'rule',
+      usedModel: 'rule',
+    });
+
+    return { parsed: decision, raw: null, mongoId: insertedId };
+  }
+
+  // 0.15) twarda reguła: zmiana ceny z analizy snapshotu (LLM #1)
+  const prevAnalysisPrice = pickAnalysisPriceValue(prevAnalysis);
+  const newAnalysisPrice = pickAnalysisPriceValue(newAnalysis);
+  if (
+    typeof prevAnalysisPrice === 'number' &&
+    typeof newAnalysisPrice === 'number' &&
+    prevAnalysisPrice !== newAnalysisPrice
+  ) {
+    const decision = {
+      important: true,
+      category: 'price_change',
+      importance_reason: 'Analiza snapshotów wykryła zmianę głównej ceny.',
+      short_title: 'Zmiana ceny',
+      short_description: `Cena zmieniła się z ${prevAnalysisPrice} na ${newAnalysisPrice}.`,
+      old_price: prevAnalysisPrice,
+      new_price: newAnalysisPrice,
     };
 
     const { insertedId } = await ocenyZmienCol.insertOne({

@@ -1,4 +1,5 @@
 import { normalizeWhitespace, normalizePriceCandidate, sanitizeArray, inferContentType } from '../utils/normalize.js';
+import { detectMainPriceFromDom } from './priceUtils.js';
 
 function parseJson(text) {
   try {
@@ -103,6 +104,7 @@ export const jsonldExtractor = {
     const description = normalizeWhitespace(entry.description || entry.abstract || '');
     const text = extractText(entry);
     const offers = Array.isArray(entry.offers) ? entry.offers : entry.offers ? [entry.offers] : [];
+    const domPrice = detectMainPriceFromDom(doc);
     let price = null;
     for (const offer of offers) {
       if (!offer) continue;
@@ -112,6 +114,7 @@ export const jsonldExtractor = {
     if (!price && entry.price) {
       price = normalizePriceCandidate(entry.priceCurrency ? `${entry.price} ${entry.priceCurrency}` : entry.price);
     }
+    const mainPrice = domPrice || price;
     const images = extractImages(entry);
     const attributes = extractAttributes(entry);
     const confidence = Math.min(1, 0.7 + (best.score || 0.2));
@@ -121,7 +124,7 @@ export const jsonldExtractor = {
       description: description || null,
       text: text || description || null,
       htmlMain: null,
-      price: price || null,
+      price: mainPrice || null,
       images,
       attributes,
       confidence,
