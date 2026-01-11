@@ -116,9 +116,10 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
   // ✅ Zapisz w PG link do analizy w Mongo (tylko jeśli mamy zadanieId)
   const zadanieId = newAnalysis?.zadanieId || snapshot?.zadanie_id || snapshot?.zadanieId;
   const analizaId = newAnalysis?._id;
+  const analizaInserted = newAnalysis?._inserted === true;
 
-  if (zadanieId) {
-      await setTaskAnalysisMongoId(zadanieId, analizaId, { force: forceAnalysis, log });
+  if (zadanieId && analizaInserted && analizaId) {
+    await setTaskAnalysisMongoId(zadanieId, analizaId, { force: forceAnalysis, log });
   } else {
     log.warn('pg_analiza_mongo_id_skip_no_zadanieId', {
       snapshotId: snapshotIdStr,

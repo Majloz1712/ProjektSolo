@@ -128,6 +128,12 @@ function sanitizeNullableString(value) {
   return s.length ? s : null;
 }
 
+function sanitizeRequiredString(value) {
+  if (value == null) return '';
+  const s = String(value).trim();
+  return s.length ? s : '';
+}
+
 function normalizePriceObject(price) {
   if (!price || typeof price !== 'object') {
     return { value: null, currency: null };
@@ -159,8 +165,10 @@ function normalizeFeatures(input) {
 }
 
 async function safeInsertAnalysis(doc, { logger, snapshotId } = {}) {
+  let insertedId = null;
   try {
-    await analizyCol.insertOne(doc);
+    const result = await analizyCol.insertOne(doc);
+    insertedId = result?.insertedId ?? null;
   } catch (err) {
     logger?.error?.('snapshot_analysis_insert_failed', {
       snapshotId: snapshotId?.toString?.() || String(snapshotId || ''),
@@ -169,7 +177,7 @@ async function safeInsertAnalysis(doc, { logger, snapshotId } = {}) {
       errInfo: err?.errInfo ?? null,
     });
   }
-  return doc;
+  return { doc, insertedId };
 }
 
 export async function ensureSnapshotAnalysis(snapshot, { force = false, logger } = {}) {
@@ -331,7 +339,18 @@ const mainPrice =
     };
 
 
-    return safeInsertAnalysis(doc, { logger, snapshotId: _id });
+    const { doc: storedDoc, insertedId } = await safeInsertAnalysis(doc, {
+      logger,
+      snapshotId: _id,
+    });
+    if (insertedId) {
+      storedDoc._id = insertedId;
+      storedDoc._inserted = true;
+    } else {
+      storedDoc._id = null;
+      storedDoc._inserted = false;
+    }
+    return storedDoc;
   }
 
 
@@ -405,9 +424,9 @@ logger?.info('snapshot_analysis_llm_done', {
       model: process.env.OLLAMA_TEXT_MODEL || 'llama3',
       prompt,
 
-      summary: null,
-      podsumowanie: null,
-      product_type: null,
+      summary: '',
+      podsumowanie: '',
+      product_type: '',
       main_currency: normalizedPrice.currency,
       price: normalizedPrice,
       price_hint: { min: null, max: null },
@@ -427,7 +446,18 @@ logger?.info('snapshot_analysis_llm_done', {
       durationMs: Math.round(performance.now() - t0),
     });
 
-    return safeInsertAnalysis(errorDoc, { logger, snapshotId: _id });
+    const { doc: storedDoc, insertedId } = await safeInsertAnalysis(errorDoc, {
+      logger,
+      snapshotId: _id,
+    });
+    if (insertedId) {
+      storedDoc._id = insertedId;
+      storedDoc._inserted = true;
+    } else {
+      storedDoc._id = null;
+      storedDoc._inserted = false;
+    }
+    return storedDoc;
   }
 
   // ✅ sukces – pełny dokument analizy
@@ -448,9 +478,9 @@ logger?.info('snapshot_analysis_llm_done', {
     model: process.env.OLLAMA_TEXT_MODEL || 'llama3',
     prompt,
 
-    summary: sanitizeNullableString(parsed?.summary),
-    podsumowanie: sanitizeNullableString(parsed?.summary),
-    product_type: sanitizeNullableString(parsed?.product_type),
+    summary: sanitizeRequiredString(parsed?.summary),
+    podsumowanie: sanitizeRequiredString(parsed?.summary),
+    product_type: sanitizeRequiredString(parsed?.product_type),
     main_currency: normalizedMainCurrency,
     price: normalizedPrice,
     price_hint: normalizePriceHint(parsed?.price_hint),
@@ -467,5 +497,16 @@ logger?.info('snapshot_analysis_success', {
   durationMs: Math.round(performance.now() - t0),
 });
 
-  return safeInsertAnalysis(doc, { logger, snapshotId: _id });
+  const { doc: storedDoc, insertedId } = await safeInsertAnalysis(doc, {
+    logger,
+    snapshotId: _id,
+  });
+  if (insertedId) {
+    storedDoc._id = insertedId;
+    storedDoc._inserted = true;
+  } else {
+    storedDoc._id = null;
+    storedDoc._inserted = false;
+  }
+  return storedDoc;
 }
