@@ -1,4 +1,5 @@
 import { clampTextLength, normalizeWhitespace, normalizePriceCandidate, inferContentType } from '../utils/normalize.js';
+import { detectMainPriceFromDom } from './priceUtils.js';
 
 
 function detectPrice(text) {
@@ -66,7 +67,8 @@ export const readabilityExtractor = {
     const htmlMain = clampTextLength(clone.innerHTML || '');
     const title = normalizeWhitespace(doc.querySelector('h1')?.textContent || doc.querySelector('title')?.textContent || '');
     const description = normalizeWhitespace(doc.querySelector('meta[name="description"]')?.getAttribute('content') || '');
-    const price = detectPrice(text);
+    const domPrice = detectMainPriceFromDom(doc);
+    const price = domPrice || detectPrice(text);
 
     return {
       url,
