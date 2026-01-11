@@ -661,23 +661,9 @@ export async function evaluateChangeWithLLM(
     m.descriptionChanged === true ||
     (typeof textScore === 'number' && textScore > 0.15);
 
-  const secondaryPricesChanged =
-    m.secondaryPrices && JSON.stringify(m.secondaryPrices.prev) !== JSON.stringify(m.secondaryPrices.now);
-  const reviewsChanged =
-    (m.reviews?.prevCount != null &&
-      m.reviews?.nowCount != null &&
-      m.reviews.prevCount !== m.reviews.nowCount) ||
-    (m.reviews?.prevRating != null &&
-      m.reviews?.nowRating != null &&
-      m.reviews.prevRating !== m.reviews.nowRating);
-  const numericChanged = typeof m.numericDiffScore === 'number' && m.numericDiffScore > 0.1;
-
   const onlyOcrDrift =
     !hasPriceMove &&
     !hasContentMove &&
-    !secondaryPricesChanged &&
-    !reviewsChanged &&
-    !numericChanged &&
     m.pluginPricesChanged !== true &&
     (m.screenshotChanged === true || m.ocrTextChanged === true) &&
     ocrScore > 0 &&
