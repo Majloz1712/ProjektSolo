@@ -530,6 +530,8 @@ function buildDecisionFromMetrics(metrics) {
 
   const secondaryChanged =
     metrics.secondaryPrices &&
+    metrics.secondaryPrices.prev?.length > 0 &&
+    metrics.secondaryPrices.now?.length > 0 &&
     JSON.stringify(metrics.secondaryPrices.prev) !== JSON.stringify(metrics.secondaryPrices.now);
 
   if (secondaryChanged) {
@@ -790,7 +792,10 @@ export async function evaluateChangeWithLLM(
     (typeof textScore === 'number' && textScore > 0.15);
 
   const secondaryPricesChanged =
-    m.secondaryPrices && JSON.stringify(m.secondaryPrices.prev) !== JSON.stringify(m.secondaryPrices.now);
+    m.secondaryPrices &&
+    m.secondaryPrices.prev?.length > 0 &&
+    m.secondaryPrices.now?.length > 0 &&
+    JSON.stringify(m.secondaryPrices.prev) !== JSON.stringify(m.secondaryPrices.now);
   const reviewsChanged =
     (m.reviews?.prevCount != null &&
       m.reviews?.nowCount != null &&
