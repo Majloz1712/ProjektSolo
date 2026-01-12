@@ -411,27 +411,14 @@ ${text}
 ${ocrPreview ? `\nOCR ze screenshotu (preview):\n${ocrPreview}\n` : ''}
 `;
 
-  const prompt = userPrompt
+  const userPromptSection = userPrompt
     ? `
+Instrukcje użytkownika:
 ${userPrompt}
-
-Zwróć WYŁĄCZNIE JSON w formacie:
-{
-  "summary": "krótki opis (1-3 zdania) co to za strona",
-  "product_type": "np. 'obuwie męskie', 'kurtki damskie', 'lista ogłoszeń', 'strona produktu' itp.",
-  "main_currency": "np. 'PLN' lub null",
-  "price_hint": {
-    "min": number lub null,
-    "max": number lub null
-  },
-  "features": [
-    "krótka lista cech typu: 'lista ofert', 'ma filtry rozmiaru', 'zawiera promocje' itd."
-  ]
-}
-
-${dataBlock}
 `
-    : `
+    : '';
+
+  const prompt = `
 Jesteś asystentem analizującym strony e-commerce.
 Na podstawie danych strony wygeneruj zwięzły JSON:
 
@@ -451,6 +438,7 @@ Na podstawie danych strony wygeneruj zwięzły JSON:
 Zawsze zwróć poprawny JSON.
 ZWRAĆAJ WYŁĄCZNIE JSON — bez żadnego tekstu, komentarzy, markdown ani bloków kodu.
 
+${userPromptSection}
 ${dataBlock}
 `;
 
