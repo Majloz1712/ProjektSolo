@@ -608,7 +608,7 @@ export async function evaluateChangeWithLLM(
   log.info('llm_change_eval_start', { monitorId, zadanieId, url });
 
   // 0) twarda reguła: zmiana ceny z plugin_prices zawsze istotna
-  if (!normalizedUserPrompt && diff?.metrics?.pluginPricesChanged === true) {
+  if (diff?.metrics?.pluginPricesChanged === true) {
     const decision = {
       important: true,
       category: 'price_change',
@@ -649,7 +649,6 @@ export async function evaluateChangeWithLLM(
   
   // 0.1) twarda reguła: jeśli machine-diff policzył zmianę MAIN price → istotne
   if (
-    !normalizedUserPrompt &&
     typeof diff?.metrics?.price?.oldVal === 'number' &&
     typeof diff?.metrics?.price?.newVal === 'number' &&
     typeof diff?.metrics?.price?.absChange === 'number' &&
@@ -704,7 +703,6 @@ export async function evaluateChangeWithLLM(
   const prevAnalysisPrice = pickAnalysisPriceValue(prevAnalysis);
   const newAnalysisPrice = pickAnalysisPriceValue(newAnalysis);
   if (
-    !normalizedUserPrompt &&
     typeof prevAnalysisPrice === 'number' &&
     typeof newAnalysisPrice === 'number' &&
     prevAnalysisPrice !== newAnalysisPrice
@@ -753,7 +751,7 @@ export async function evaluateChangeWithLLM(
   }
 
   // 0.2) twarda reguła: zmiany treści/opinii/cen drugorzędnych/numerów
-  const ruleDecision = normalizedUserPrompt ? null : buildDecisionFromMetrics(diff?.metrics);
+  const ruleDecision = buildDecisionFromMetrics(diff?.metrics);
   if (ruleDecision) {
     const { insertedId } = await ocenyZmienCol.insertOne({
       createdAt: new Date(),
@@ -827,7 +825,7 @@ export async function evaluateChangeWithLLM(
     ocrScore > 0 &&
     ocrScore < 0.20;
 
-  if (!normalizedUserPrompt && onlyOcrDrift) {
+  if (onlyOcrDrift) {
     const decision = {
       important: false,
       category: 'minor_change',
@@ -876,18 +874,14 @@ export async function evaluateChangeWithLLM(
   const prevOcrText = ocrPreview(prevOcr, 2000);
   const newOcrText = ocrPreview(newOcr, 2000);
 
-  const usedPrompt = (normalizedUserPrompt ? `
+  const userCriteriaSection = normalizedUserPrompt
+    ? `
+Najważniejsze kryterium oceny:
 ${normalizedUserPrompt}
+`
+    : '';
 
-Odpowiedz WYŁĄCZNIE JSON:
-{
-  "important": boolean,
-  "category": string,
-  "importance_reason": string,
-  "short_title": string,
-  "short_description": string
-}
-` : `
+  const usedPrompt = `
 Masz dane JSON: prevAnalysis, newAnalysis, diff.
 Dodatkowo masz OCR ze screenshotu (prevOcr/newOcr) – to TYLKO tekst odczytany z obrazka.
 
@@ -902,8 +896,8 @@ Zwróć WYŁĄCZNIE JSON:
   "short_title": string,
   "short_description": string
 }
-`)
-
+${userCriteriaSection}
+`
   + `
 prevAnalysis:
 ${JSON.stringify(prevAnalysis ?? null)}
@@ -935,7 +929,7 @@ ${newOcrText || null}
     if (parsed && typeof parsed.important === 'boolean') {
       llmDecision = parsed;
     } else {
-      const fallbackDecision = normalizedUserPrompt ? null : buildDecisionFromMetrics(diff?.metrics);
+      const fallbackDecision = buildDecisionFromMetrics(diff?.metrics);
       llmDecision = fallbackDecision || {
         important: false,
         category: 'minor_change',
@@ -946,7 +940,7 @@ ${newOcrText || null}
       llmDecision.llm_fallback_used = true;
     }
   } catch (err) {
-    const fallbackDecision = normalizedUserPrompt ? null : buildDecisionFromMetrics(diff?.metrics);
+    const fallbackDecision = buildDecisionFromMetrics(diff?.metrics);
     llmDecision = fallbackDecision || {
       important: false,
       category: 'minor_change',
