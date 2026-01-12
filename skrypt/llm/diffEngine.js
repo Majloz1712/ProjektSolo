@@ -237,6 +237,16 @@ function pickSecondaryPrices(text, limit = 6) {
   return uniq.slice(0, limit);
 }
 
+function filterSecondaryPricesByMainPrice(prices, mainPriceValue) {
+  if (!Array.isArray(prices) || prices.length === 0) return [];
+  if (typeof mainPriceValue !== 'number' || !Number.isFinite(mainPriceValue) || mainPriceValue <= 0) {
+    return prices;
+  }
+  const minAllowed = mainPriceValue * 0.25;
+  const maxAllowed = mainPriceValue * 4;
+  return prices.filter((price) => price.value >= minAllowed && price.value <= maxAllowed);
+}
+
 function extractReviewSignals(text) {
   if (!text) return { count: null, rating: null };
   const t = String(text).toLowerCase();
@@ -432,8 +442,15 @@ export async function computeMachineDiff(
     reasons.push(`zmiana oceny (${prevReviews.rating} → ${nowReviews.rating})`);
   }
 
-  const prevSecondaryPrices = pickSecondaryPrices(prevCombinedText);
-  const nowSecondaryPrices = pickSecondaryPrices(nowCombinedText);
+  const mainPriceReference = prevMainPrice?.value ?? nowMainPrice?.value ?? null;
+  const prevSecondaryPrices = filterSecondaryPricesByMainPrice(
+    pickSecondaryPrices(prevCombinedText),
+    mainPriceReference,
+  );
+  const nowSecondaryPrices = filterSecondaryPricesByMainPrice(
+    pickSecondaryPrices(nowCombinedText),
+    mainPriceReference,
+  );
   metrics.secondaryPrices = {
     prev: prevSecondaryPrices,
     now: nowSecondaryPrices,
@@ -442,7 +459,11 @@ export async function computeMachineDiff(
     prevMax: prevSecondaryPrices.length ? Math.max(...prevSecondaryPrices.map((p) => p.value)) : null,
     nowMax: nowSecondaryPrices.length ? Math.max(...nowSecondaryPrices.map((p) => p.value)) : null,
   };
-  if (JSON.stringify(prevSecondaryPrices) !== JSON.stringify(nowSecondaryPrices)) {
+  if (
+    prevSecondaryPrices.length > 0 &&
+    nowSecondaryPrices.length > 0 &&
+    JSON.stringify(prevSecondaryPrices) !== JSON.stringify(nowSecondaryPrices)
+  ) {
     reasons.push('zmiana cen drugorzędnych (secondary prices)');
   }
 
@@ -483,7 +504,12 @@ export async function computeMachineDiff(
     hasSignificantMachineChange = true;
   }
 
-  if (metrics.secondaryPrices && JSON.stringify(metrics.secondaryPrices.prev) !== JSON.stringify(metrics.secondaryPrices.now)) {
+  if (
+    metrics.secondaryPrices &&
+    metrics.secondaryPrices.prev?.length > 0 &&
+    metrics.secondaryPrices.now?.length > 0 &&
+    JSON.stringify(metrics.secondaryPrices.prev) !== JSON.stringify(metrics.secondaryPrices.now)
+  ) {
     hasSignificantMachineChange = true;
   }
 

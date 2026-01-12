@@ -65,8 +65,15 @@ async function setTaskAnalysisMongoId(zadanieId, analizaId, opts = {}) {
  
  
  
+function normalizeUserPrompt(rawPrompt) {
+  const normalized = (rawPrompt || '').toString().trim();
+  if (!normalized) return null;
+  if (normalized.toLowerCase() === 'cena') return null;
+  return normalized;
+}
+
 export async function handleNewSnapshot(snapshotRef, options = {}) {
-  const { forceAnalysis = false, logger } = options;
+  const { forceAnalysis = false, logger, userPrompt } = options;
   const log = logger || console;
 
   let snapshot;
@@ -94,6 +101,7 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
   });
 
   const tPipeline0 = performance.now();
+  const normalizedUserPrompt = normalizeUserPrompt(userPrompt || snapshot?.llm_prompt);
 
    // 1) OCR nowego snapshotu (tesseract) – zapis do snapshotu + update obiektu w pamięci
   const tOcrNew0 = performance.now();
@@ -111,6 +119,7 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
   const newAnalysis = await ensureSnapshotAnalysis(snapshot, {
     force: forceAnalysis,
     logger,
+    userPrompt: normalizedUserPrompt,
   });
 
   // ✅ Zapisz w PG link do analizy w Mongo (tylko jeśli mamy zadanieId)
@@ -170,7 +179,11 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
     prevAnalysis = await getSnapshotAnalysis(prevSnapshot._id, { logger });
 
     if (!prevAnalysis) {
-      prevAnalysis = await ensureSnapshotAnalysis(prevSnapshot, { force: false, logger });
+      prevAnalysis = await ensureSnapshotAnalysis(prevSnapshot, {
+        force: false,
+        logger,
+        userPrompt: normalizedUserPrompt,
+      });
     }
 
     log.info("pipeline_step_done", {
@@ -203,6 +216,12 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
     prevAnalysis.price.value !== newAnalysis.price.value;
 
   if (!diff?.hasAnyChange && !screenshotChanged && !analysisPriceChanged) {
+    if (normalizedUserPrompt) {
+      log.info("pipeline_no_change_overridden_by_user_prompt", {
+        snapshotId: snapshotIdStr,
+        monitorId: snapshot.monitor_id,
+      });
+    } else {
     log.info("[pipeline] Brak zmian – kończę na warstwie 2.", {
       snapshotId: snapshotIdStr,
       monitorId: snapshot.monitor_id,
@@ -216,6 +235,7 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
     });
 
     return;
+    }
   }
 
   const tLlm0 = performance.now();
@@ -229,6 +249,7 @@ const llmDecision = await evaluateChangeWithLLM(
     diff,
     prevOcr: prevOcr || null,
     newOcr: newOcr || null,
+    userPrompt: normalizedUserPrompt,
   },
   { logger },
 );

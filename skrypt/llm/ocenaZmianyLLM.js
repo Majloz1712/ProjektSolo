@@ -530,6 +530,8 @@ function buildDecisionFromMetrics(metrics) {
 
   const secondaryChanged =
     metrics.secondaryPrices &&
+    metrics.secondaryPrices.prev?.length > 0 &&
+    metrics.secondaryPrices.now?.length > 0 &&
     JSON.stringify(metrics.secondaryPrices.prev) !== JSON.stringify(metrics.secondaryPrices.now);
 
   if (secondaryChanged) {
@@ -564,6 +566,13 @@ function buildDecisionFromMetrics(metrics) {
   return null;
 }
 
+function normalizeUserPrompt(rawPrompt) {
+  const normalized = (rawPrompt || '').toString().trim();
+  if (!normalized) return null;
+  if (normalized.toLowerCase() === 'cena') return null;
+  return normalized;
+}
+
 function shouldUseVisionCompare({ diff, prevAnalysis, newAnalysis }) {
   if (diff?.metrics?.pluginPricesChanged === true) return false;
   if (prevAnalysis?.error || newAnalysis?.error) return true;
@@ -588,16 +597,18 @@ export async function evaluateChangeWithLLM(
     diff,
     prevOcr,
     newOcr,
+    userPrompt,
   },
   { logger } = {},
 ) {
   const log = logger || console;
   const tEval0 = performance.now();
+  const normalizedUserPrompt = normalizeUserPrompt(userPrompt);
 
   log.info('llm_change_eval_start', { monitorId, zadanieId, url });
 
   // 0) twarda reguła: zmiana ceny z plugin_prices zawsze istotna
-  if (diff?.metrics?.pluginPricesChanged === true) {
+  if (!normalizedUserPrompt && diff?.metrics?.pluginPricesChanged === true) {
     const decision = {
       important: true,
       category: 'price_change',
@@ -638,6 +649,7 @@ export async function evaluateChangeWithLLM(
   
   // 0.1) twarda reguła: jeśli machine-diff policzył zmianę MAIN price → istotne
   if (
+    !normalizedUserPrompt &&
     typeof diff?.metrics?.price?.oldVal === 'number' &&
     typeof diff?.metrics?.price?.newVal === 'number' &&
     typeof diff?.metrics?.price?.absChange === 'number' &&
@@ -692,6 +704,7 @@ export async function evaluateChangeWithLLM(
   const prevAnalysisPrice = pickAnalysisPriceValue(prevAnalysis);
   const newAnalysisPrice = pickAnalysisPriceValue(newAnalysis);
   if (
+    !normalizedUserPrompt &&
     typeof prevAnalysisPrice === 'number' &&
     typeof newAnalysisPrice === 'number' &&
     prevAnalysisPrice !== newAnalysisPrice
@@ -740,7 +753,7 @@ export async function evaluateChangeWithLLM(
   }
 
   // 0.2) twarda reguła: zmiany treści/opinii/cen drugorzędnych/numerów
-  const ruleDecision = buildDecisionFromMetrics(diff?.metrics);
+  const ruleDecision = normalizedUserPrompt ? null : buildDecisionFromMetrics(diff?.metrics);
   if (ruleDecision) {
     const { insertedId } = await ocenyZmienCol.insertOne({
       createdAt: new Date(),
@@ -790,7 +803,10 @@ export async function evaluateChangeWithLLM(
     (typeof textScore === 'number' && textScore > 0.15);
 
   const secondaryPricesChanged =
-    m.secondaryPrices && JSON.stringify(m.secondaryPrices.prev) !== JSON.stringify(m.secondaryPrices.now);
+    m.secondaryPrices &&
+    m.secondaryPrices.prev?.length > 0 &&
+    m.secondaryPrices.now?.length > 0 &&
+    JSON.stringify(m.secondaryPrices.prev) !== JSON.stringify(m.secondaryPrices.now);
   const reviewsChanged =
     (m.reviews?.prevCount != null &&
       m.reviews?.nowCount != null &&
@@ -811,7 +827,7 @@ export async function evaluateChangeWithLLM(
     ocrScore > 0 &&
     ocrScore < 0.20;
 
-  if (onlyOcrDrift) {
+  if (!normalizedUserPrompt && onlyOcrDrift) {
     const decision = {
       important: false,
       category: 'minor_change',
@@ -854,13 +870,24 @@ export async function evaluateChangeWithLLM(
     return { parsed: decision, raw: null, mongoId: insertedId };
   }
 
-  const usedMode = 'text';
+  const usedMode = normalizedUserPrompt ? 'text_user' : 'text';
   const usedModel = process.env.OLLAMA_TEXT_MODEL || process.env.LLM_MODEL || 'llama3';
 
   const prevOcrText = ocrPreview(prevOcr, 2000);
   const newOcrText = ocrPreview(newOcr, 2000);
 
-  const usedPrompt = `
+  const usedPrompt = (normalizedUserPrompt ? `
+${normalizedUserPrompt}
+
+Odpowiedz WYŁĄCZNIE JSON:
+{
+  "important": boolean,
+  "category": string,
+  "importance_reason": string,
+  "short_title": string,
+  "short_description": string
+}
+` : `
 Masz dane JSON: prevAnalysis, newAnalysis, diff.
 Dodatkowo masz OCR ze screenshotu (prevOcr/newOcr) – to TYLKO tekst odczytany z obrazka.
 
@@ -875,7 +902,9 @@ Zwróć WYŁĄCZNIE JSON:
   "short_title": string,
   "short_description": string
 }
+`)
 
+  + `
 prevAnalysis:
 ${JSON.stringify(prevAnalysis ?? null)}
 
@@ -906,7 +935,7 @@ ${newOcrText || null}
     if (parsed && typeof parsed.important === 'boolean') {
       llmDecision = parsed;
     } else {
-      const fallbackDecision = buildDecisionFromMetrics(diff?.metrics);
+      const fallbackDecision = normalizedUserPrompt ? null : buildDecisionFromMetrics(diff?.metrics);
       llmDecision = fallbackDecision || {
         important: false,
         category: 'minor_change',
@@ -917,7 +946,7 @@ ${newOcrText || null}
       llmDecision.llm_fallback_used = true;
     }
   } catch (err) {
-    const fallbackDecision = buildDecisionFromMetrics(diff?.metrics);
+    const fallbackDecision = normalizedUserPrompt ? null : buildDecisionFromMetrics(diff?.metrics);
     llmDecision = fallbackDecision || {
       important: false,
       category: 'minor_change',
