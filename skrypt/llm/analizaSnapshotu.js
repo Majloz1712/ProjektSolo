@@ -1,7 +1,10 @@
 // skrypt/analizaSnapshotu.js
 import { mongoClient } from '../polaczenieMDB.js';
 import { generateTextWithOllama } from './ollamaClient.js';
-import { sanitizeNullableString, sanitizeRequiredString } from './analysisUtils.js';
+import {
+  sanitizeNullableString as sanitizeNullableStringUtil,
+  sanitizeRequiredString as sanitizeRequiredStringUtil,
+} from './analysisUtils.js';
 import { Double } from 'mongodb';
 import { performance } from 'node:perf_hooks';
 
@@ -166,84 +169,7 @@ function normalizePriceObject(price) {
   const value = toNumberMaybe(price.value ?? price.amount ?? null);
   return {
     value: typeof value === 'number' ? value : null,
-    currency: sanitizeNullableString(price.currency),
-  };
-}
-
-function normalizePriceHint(input) {
-  if (!input || typeof input !== 'object') {
-    return { min: null, max: null };
-  }
-  const min = toNumberMaybe(input.min ?? null);
-  const max = toNumberMaybe(input.max ?? null);
-  return {
-    min: typeof min === 'number' ? min : null,
-    max: typeof max === 'number' ? max : null,
-  };
-}
-
-function normalizeFeatures(input) {
-  if (!Array.isArray(input)) return [];
-  return input
-    .map((item) => (item == null ? '' : String(item).trim()))
-    .filter((item) => item.length > 0);
-}
-
-function parseJsonFromResponse(rawResponse) {
-  const trimmed = String(rawResponse || '').trim();
-  if (!trimmed) return null;
-  try {
-    return JSON.parse(trimmed);
-  } catch (err) {
-    // ignore and try extraction below
-  }
-  const start = trimmed.indexOf('{');
-  const end = trimmed.lastIndexOf('}');
-  if (start === -1 || end === -1 || end <= start) return null;
-  const candidate = trimmed.slice(start, end + 1);
-  try {
-    return JSON.parse(candidate);
-  } catch (err) {
-    return null;
-  }
-}
-
-async function safeInsertAnalysis(doc, { logger, snapshotId } = {}) {
-  let insertedId = null;
-  try {
-    const result = await analizyCol.insertOne(doc);
-    insertedId = result?.insertedId ?? null;
-  } catch (err) {
-    logger?.error?.('snapshot_analysis_insert_failed', {
-      snapshotId: snapshotId?.toString?.() || String(snapshotId || ''),
-      code: err?.code ?? null,
-      message: err?.message || String(err),
-      errInfo: err?.errInfo ?? null,
-    });
-  }
-  return { doc, insertedId };
-}
-
-function sanitizeNullableString(value) {
-  if (value == null) return null;
-  const s = String(value).trim();
-  return s.length ? s : null;
-}
-
-function sanitizeRequiredString(value) {
-  if (value == null) return '';
-  const s = String(value).trim();
-  return s.length ? s : '';
-}
-
-function normalizePriceObject(price) {
-  if (!price || typeof price !== 'object') {
-    return { value: null, currency: null };
-  }
-  const value = toNumberMaybe(price.value ?? price.amount ?? null);
-  return {
-    value: typeof value === 'number' ? value : null,
-    currency: sanitizeNullableString(price.currency),
+    currency: sanitizeNullableStringUtil(price.currency),
   };
 }
 
@@ -582,9 +508,9 @@ logger?.info('snapshot_analysis_llm_done', {
   // ✅ sukces – pełny dokument analizy
   const normalizedPrice = normalizePriceObject(mainPrice);
   const normalizedMainCurrency =
-    sanitizeNullableString(parsed?.main_currency) ||
+    sanitizeNullableStringUtil(parsed?.main_currency) ||
     normalizedPrice.currency ||
-    sanitizeNullableString(extracted_v2?.price?.currency);
+    sanitizeNullableStringUtil(extracted_v2?.price?.currency);
   const doc = {
     zadanieId: String(zadanie_id),
     monitorId: String(monitor_id),
@@ -597,9 +523,9 @@ logger?.info('snapshot_analysis_llm_done', {
     model: process.env.OLLAMA_TEXT_MODEL || 'llama3',
     prompt,
 
-    summary: sanitizeRequiredString(parsed?.summary),
-    podsumowanie: sanitizeRequiredString(parsed?.summary),
-    product_type: sanitizeRequiredString(parsed?.product_type),
+    summary: sanitizeRequiredStringUtil(parsed?.summary),
+    podsumowanie: sanitizeRequiredStringUtil(parsed?.summary),
+    product_type: sanitizeRequiredStringUtil(parsed?.product_type),
     main_currency: normalizedMainCurrency,
     price: normalizedPrice,
     price_hint: normalizePriceHint(parsed?.price_hint),
