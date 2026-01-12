@@ -56,6 +56,17 @@ function sha1(str) {
   return crypto.createHash("sha1").update(str).digest("hex");
 }
 
+async function loadMonitorPrompt(client, monitorId) {
+  if (!monitorId) return null;
+  const { rows } = await client.query(
+    `SELECT llm_prompt
+       FROM monitory
+      WHERE id = $1`,
+    [monitorId],
+  );
+  return rows[0]?.llm_prompt || null;
+}
+
 // Bezpieczne: działa niezależnie czy w URL jest plugin_tasks.id czy zadanie_id
 async function resolvePluginTaskByAnyId(client, anyId) {
   const { rows } = await client.query(
@@ -197,6 +208,16 @@ router.post("/:id/result", async (req, res) => {
       return res.status(404).json({ error: "PLUGIN_TASK_NOT_FOUND" });
     }
 
+    let monitorPrompt = null;
+    try {
+      monitorPrompt = await loadMonitorPrompt(pg, monitorId);
+    } catch (err) {
+      logger?.warn?.("plugin_result_monitor_prompt_failed", {
+        monitorId,
+        error: String(err?.message || err),
+      });
+    }
+
     // zostawiamy in_progress (już jest), ale jakby ktoś strzelił "z palca" endpoint:
     if (pluginTask.status === "pending") {
       await setPluginTaskStatus(pg, pluginTask.id, "in_progress", null);
@@ -216,6 +237,15 @@ router.post("/:id/result", async (req, res) => {
   try {
     const db = await ensureMongoDb();
     const snapshots = db.collection("snapshots");
+    let monitorPrompt = null;
+    try {
+      monitorPrompt = await loadMonitorPrompt(pg, monitorId);
+    } catch (err) {
+      logger?.warn?.("plugin_screenshot_monitor_prompt_failed", {
+        monitorId,
+        error: String(err?.message || err),
+      });
+    }
     const now = new Date();
 
     // 1) Extractory, jeśli dostaliśmy DOM
@@ -273,6 +303,9 @@ router.post("/:id/result", async (req, res) => {
         final_url: url || existing.final_url || null,
         plugin_result_at: now,
       };
+      if (monitorPrompt) {
+        $set.llm_prompt = monitorPrompt;
+      }
 
       if (hasDom) {
         $set.plugin_dom_text = text || null;
@@ -312,6 +345,7 @@ router.post("/:id/result", async (req, res) => {
         ts: now,
         mode: "plugin",
         final_url: url || pluginTask.url || null,
+        llm_prompt: monitorPrompt || null,
         blocked: false,
         block_reason: null,
 
@@ -343,7 +377,7 @@ router.post("/:id/result", async (req, res) => {
     // 4) Pipeline
     try {
       const tPipe0 = performance.now();
-      await handleNewSnapshot(snapshotIdStr, { logger });
+      await handleNewSnapshot(snapshotIdStr, { logger, userPrompt: monitorPrompt });
       logger?.info?.("plugin_result_pipeline_done", {
         snapshotId: snapshotIdStr,
         durationMs: Math.round(performance.now() - tPipe0),
@@ -460,6 +494,15 @@ router.post("/:id/price", async (req, res) => {
   try {
     const db = await ensureMongoDb();
     const snapshots = db.collection("snapshots");
+    let monitorPrompt = null;
+    try {
+      monitorPrompt = await loadMonitorPrompt(pg, monitorId);
+    } catch (err) {
+      logger?.warn?.("plugin_price_monitor_prompt_failed", {
+        monitorId,
+        error: String(err?.message || err),
+      });
+    }
 
     // znajdź NAJNOWSZY snapshot agenta (monitor_id + zadanie_id)
     const tFind0 = performance.now();
@@ -487,9 +530,13 @@ router.post("/:id/price", async (req, res) => {
 
     // dopisz ceny
     const tUpd0 = performance.now();
+    const $set = { plugin_prices: prices, plugin_price_enriched_at: new Date() };
+    if (monitorPrompt) {
+      $set.llm_prompt = monitorPrompt;
+    }
     await snapshots.updateOne(
       { _id: snapshot._id },
-      { $set: { plugin_prices: prices, plugin_price_enriched_at: new Date() } },
+      { $set },
     );
 
     logger?.info?.("plugin_price_mongo_update_done", {
@@ -500,7 +547,7 @@ router.post("/:id/price", async (req, res) => {
     // pipeline
     try {
       const tPipe0 = performance.now();
-      await handleNewSnapshot(snapshotIdStr, { logger });
+      await handleNewSnapshot(snapshotIdStr, { logger, userPrompt: monitorPrompt });
       logger?.info?.("plugin_price_pipeline_done", {
         snapshotId: snapshotIdStr,
         durationMs: Math.round(performance.now() - tPipe0),
@@ -635,26 +682,28 @@ router.post("/:id/screenshot", async (req, res) => {
 
     if (snapshot) {
       const tUpd0 = performance.now();
+      const $set = {
+        // to jest wynik pluginu, nie blokada
+        mode: "plugin_screenshot",
+        blocked: false,
+        block_reason: null,
+
+        screenshot_b64: normShot,
+        screenshot_b64_len: screenshotLen,
+        screenshot_sha1: screenshotSha1,
+
+        plugin_screenshot_at: now,
+        plugin_screenshot_source: "chrome_extension",
+        plugin_screenshot_fullpage: true,
+
+        final_url: url || snapshot.final_url || null,
+      };
+      if (monitorPrompt) {
+        $set.llm_prompt = monitorPrompt;
+      }
       await snapshots.updateOne(
         { _id: snapshot._id },
-        {
-          $set: {
-            // to jest wynik pluginu, nie blokada
-            mode: "plugin_screenshot",
-            blocked: false,
-            block_reason: null,
-
-            screenshot_b64: normShot,
-            screenshot_b64_len: screenshotLen,
-            screenshot_sha1: screenshotSha1,
-
-            plugin_screenshot_at: now,
-            plugin_screenshot_source: "chrome_extension",
-            plugin_screenshot_fullpage: true,
-
-            final_url: url || snapshot.final_url || null,
-          },
-        },
+        { $set },
       );
       snapshotIdStr = snapshot._id.toString();
 
@@ -672,6 +721,7 @@ router.post("/:id/screenshot", async (req, res) => {
 
         mode: "plugin_screenshot",
         final_url: url || pluginTask.url || null,
+        llm_prompt: monitorPrompt || null,
         blocked: false,
         block_reason: null,
 
@@ -699,7 +749,7 @@ router.post("/:id/screenshot", async (req, res) => {
     // pipeline
     try {
       const tPipe0 = performance.now();
-      await handleNewSnapshot(snapshotIdStr, { logger });
+      await handleNewSnapshot(snapshotIdStr, { logger, userPrompt: monitorPrompt });
       logger?.info?.("plugin_screenshot_pipeline_done", {
         snapshotId: snapshotIdStr,
         durationMs: Math.round(performance.now() - tPipe0),
@@ -761,4 +811,3 @@ router.post("/:id/screenshot", async (req, res) => {
 });
 
 export default router;
-

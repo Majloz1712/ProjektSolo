@@ -1203,6 +1203,7 @@ if (FORCE_PLUGIN_SCREENSHOT || forcePluginScreenshotForMonitor) {
       ts: now,
       mode: 'plugin_stub',
       final_url: targetUrl,
+      llm_prompt: monitor.llm_prompt || null,
       blocked: true,
       block_reason: 'FORCED_PLUGIN',
       html: null,
@@ -1416,6 +1417,7 @@ if (FORCE_PLUGIN_SCREENSHOT || forcePluginScreenshotForMonitor) {
       ts: new Date(),
       mode,
       final_url: finalUrl,
+      llm_prompt: monitor.llm_prompt || null,
       blocked,
       block_reason: blocked ? 'BOT_PROTECTION' : null,
       screenshot_b64: screenshotB64,
@@ -1509,7 +1511,7 @@ if (FORCE_PLUGIN_SCREENSHOT || forcePluginScreenshotForMonitor) {
     // Jeśli NIE tworzymy price_only i mamy snapshot → odpal pipeline LLM
     if (!shouldCreatePriceOnlyTask && snapshot) {
       try {
-        await handleNewSnapshot(snapshot, { logger: log });
+        await handleNewSnapshot(snapshot, { logger: log, userPrompt: monitor.llm_prompt || null });
       } catch (err) {
         log.error('pipeline_error', {
           monitorId,
@@ -1796,4 +1798,3 @@ main().catch((err) => {
   console.error('FATAL:', err);
   process.exit(1);
 });
-
