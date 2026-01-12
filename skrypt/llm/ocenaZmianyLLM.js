@@ -472,6 +472,98 @@ function buildDecisionFromOcrBundle(ocrBundle) {
   };
 }
 
+function buildDecisionFromMetrics(metrics) {
+  if (!metrics || typeof metrics !== 'object') return null;
+
+  const textScore = typeof metrics.textDiffScore === 'number' ? metrics.textDiffScore : 0;
+  const numericScore = typeof metrics.numericDiffScore === 'number' ? metrics.numericDiffScore : 0;
+
+  const hasContentChange =
+    metrics.titleChanged === true ||
+    metrics.descriptionChanged === true ||
+    textScore > 0.15;
+
+  if (hasContentChange) {
+    const reasons = [];
+    if (metrics.titleChanged === true) reasons.push('zmiana tytułu');
+    if (metrics.descriptionChanged === true) reasons.push('zmiana opisu');
+    if (textScore > 0.15) reasons.push(`textDiffScore=${textScore.toFixed(3)}`);
+
+    return {
+      important: true,
+      category: 'content_change',
+      importance_reason: reasons.length
+        ? `Wykryto istotną zmianę treści (${reasons.join(', ')}).`
+        : 'Wykryto istotną zmianę treści.',
+      short_title: 'Zmiana treści',
+      short_description: 'Treść strony uległa istotnej zmianie.',
+    };
+  }
+
+  const reviewsChanged =
+    (metrics.reviews?.prevCount != null &&
+      metrics.reviews?.nowCount != null &&
+      metrics.reviews.prevCount !== metrics.reviews.nowCount) ||
+    (metrics.reviews?.prevRating != null &&
+      metrics.reviews?.nowRating != null &&
+      metrics.reviews.prevRating !== metrics.reviews.nowRating);
+
+  if (reviewsChanged) {
+    const parts = [];
+    if (metrics.reviews?.prevCount != null && metrics.reviews?.nowCount != null) {
+      parts.push(`opinie ${metrics.reviews.prevCount} → ${metrics.reviews.nowCount}`);
+    }
+    if (metrics.reviews?.prevRating != null && metrics.reviews?.nowRating != null) {
+      parts.push(`ocena ${metrics.reviews.prevRating} → ${metrics.reviews.nowRating}`);
+    }
+
+    return {
+      important: true,
+      category: 'review_change',
+      importance_reason: parts.length
+        ? `Zmiana opinii/oceny: ${parts.join(', ')}.`
+        : 'Zmiana opinii lub oceny produktu.',
+      short_title: 'Zmiana opinii',
+      short_description: 'Zmieniono liczbę opinii lub średnią ocenę.',
+    };
+  }
+
+  const secondaryChanged =
+    metrics.secondaryPrices &&
+    JSON.stringify(metrics.secondaryPrices.prev) !== JSON.stringify(metrics.secondaryPrices.now);
+
+  if (secondaryChanged) {
+    const prevMin = metrics.secondaryPrices?.prevMin;
+    const nowMin = metrics.secondaryPrices?.nowMin;
+    const reasonParts = [];
+    if (prevMin != null || nowMin != null) {
+      reasonParts.push(`min ${prevMin ?? '—'} → ${nowMin ?? '—'}`);
+    }
+
+    return {
+      important: true,
+      category: 'secondary_price_change',
+      importance_reason: reasonParts.length
+        ? `Zmiana cen drugorzędnych (${reasonParts.join(', ')}).`
+        : 'Zmiana cen drugorzędnych.',
+      short_title: 'Zmiana cen (drugorzędne)',
+      short_description: 'Wykryto zmianę cen drugorzędnych na stronie.',
+    };
+  }
+
+  if (numericScore > 0.1) {
+    return {
+      important: true,
+      category: 'numeric_change',
+      importance_reason: `Zmiana danych liczbowych w treści (numericDiffScore=${numericScore.toFixed(3)}).`,
+      short_title: 'Zmiana danych liczbowych',
+      short_description: 'Wykryto istotną zmianę danych liczbowych na stronie.',
+    };
+  }
+
+  return null;
+}
+
 function shouldUseVisionCompare({ diff, prevAnalysis, newAnalysis }) {
   if (diff?.metrics?.pluginPricesChanged === true) return false;
   if (prevAnalysis?.error || newAnalysis?.error) return true;
@@ -647,6 +739,42 @@ export async function evaluateChangeWithLLM(
     return { parsed: decision, raw: null, mongoId: insertedId };
   }
 
+  // 0.2) twarda reguła: zmiany treści/opinii/cen drugorzędnych/numerów
+  const ruleDecision = buildDecisionFromMetrics(diff?.metrics);
+  if (ruleDecision) {
+    const { insertedId } = await ocenyZmienCol.insertOne({
+      createdAt: new Date(),
+      monitorId,
+      zadanieId,
+      url,
+      llm_mode: 'rule',
+      prompt_used: null,
+      prevAnalysis,
+      newAnalysis,
+      diff,
+      raw_response: null,
+      vision_ocr: {
+        prev: summarizeOcrForStorage(prevOcr),
+        next: summarizeOcrForStorage(newOcr),
+      },
+      llm_decision: ruleDecision,
+      error: null,
+      durationMs: Math.round(performance.now() - tEval0),
+    });
+
+    log.info('llm_change_eval_success', {
+      monitorId,
+      zadanieId,
+      mongoId: insertedId,
+      important: true,
+      category: ruleDecision.category,
+      usedMode: 'rule',
+      usedModel: 'rule',
+    });
+
+    return { parsed: ruleDecision, raw: null, mongoId: insertedId };
+  }
+
 
   // 0.5) twarda reguła: jeśli to tylko "drift" screenshot/OCR (bez realnych zmian treści/ceny) → nieistotne
   const m = diff?.metrics || {};
@@ -775,24 +903,29 @@ ${newOcrText || null}
     });
 
     const parsed = safeParseJsonFromLLM(raw);
-    llmDecision =
-      parsed && typeof parsed.important === 'boolean'
-        ? parsed
-        : {
-            important: false,
-            category: 'minor_change',
-            importance_reason: 'Brak poprawnego JSON z LLM lub brak twardych dowodów w danych.',
-            short_title: 'Brak istotnej zmiany',
-            short_description: 'Nie udało się potwierdzić istotnej zmiany na podstawie dostarczonych danych.',
-          };
+    if (parsed && typeof parsed.important === 'boolean') {
+      llmDecision = parsed;
+    } else {
+      const fallbackDecision = buildDecisionFromMetrics(diff?.metrics);
+      llmDecision = fallbackDecision || {
+        important: false,
+        category: 'minor_change',
+        importance_reason: 'Brak poprawnego JSON z LLM lub brak twardych dowodów w danych.',
+        short_title: 'Brak istotnej zmiany',
+        short_description: 'Nie udało się potwierdzić istotnej zmiany na podstawie dostarczonych danych.',
+      };
+      llmDecision.llm_fallback_used = true;
+    }
   } catch (err) {
-    llmDecision = {
+    const fallbackDecision = buildDecisionFromMetrics(diff?.metrics);
+    llmDecision = fallbackDecision || {
       important: false,
       category: 'minor_change',
       importance_reason: `Błąd text LLM: ${err?.message || String(err)}`,
       short_title: 'Brak istotnej zmiany',
       short_description: 'Nie udało się wykonać oceny tekstowej.',
     };
+    llmDecision.llm_fallback_used = true;
   }
 
   // Zapis do Mongo ZAWSZE
@@ -820,6 +953,7 @@ ${newOcrText || null}
     mongoId: insertedId,
     important: !!llmDecision?.important,
     category: llmDecision?.category || null,
+    llmFallbackUsed: llmDecision?.llm_fallback_used === true,
     usedMode,
     usedModel,
   });
