@@ -12,7 +12,10 @@
 
 import { BACKEND_BASE_URL, POLL_INTERVAL_SECONDS, AUTH_TOKEN } from './config.js';
 
-let currentTask = null;
+const MAX_CONCURRENT_TASKS = 2;
+const taskQueue = [];
+let inFlightCount = 0;
+let isPolling = false;
 
 async function apiFetch(path, options = {}) {
   const url = `${BACKEND_BASE_URL}${path}`;
@@ -791,14 +794,10 @@ function waitForLoadAndSendScreenshot(windowId, tabId, task) {
   });
 }
 
-async function processOneTask() {
-  if (currentTask) return;
-
-  const task = await fetchNextPluginTask();
-  if (!task) return;
-
-  currentTask = task;
+async function processTask(task) {
   console.log('[plugin] got task', task);
+  const startTime = performance.now();
+  console.log('[plugin] task_started', { task_id: task.task_id, started_at: new Date().toISOString() });
 
   try {
     const { windowId, tabId } = await openWindowForTask(task);
@@ -814,9 +813,48 @@ async function processOneTask() {
       console.log('[plugin] fallback task done ok=', ok);
     }
   } catch (err) {
-    console.error('[plugin] processOneTask error', err);
+    console.error('[plugin] processTask error', err);
   } finally {
-    currentTask = null;
+    const durationMs = Math.round(performance.now() - startTime);
+    console.log('[plugin] task_finished', {
+      task_id: task.task_id,
+      duration_ms: durationMs,
+      finished_at: new Date().toISOString(),
+    });
+  }
+}
+
+function drainQueue() {
+  while (inFlightCount < MAX_CONCURRENT_TASKS && taskQueue.length > 0) {
+    const nextTask = taskQueue.shift();
+    if (!nextTask) continue;
+    inFlightCount += 1;
+    processTask(nextTask)
+      .catch((err) => console.error('[plugin] task error', err))
+      .finally(() => {
+        inFlightCount = Math.max(0, inFlightCount - 1);
+        drainQueue();
+        pollForTasks().catch((err) => console.error('[plugin] pollForTasks error', err));
+      });
+  }
+}
+
+async function pollForTasks() {
+  if (isPolling) return;
+  if (inFlightCount >= MAX_CONCURRENT_TASKS && taskQueue.length === 0) return;
+  isPolling = true;
+
+  try {
+    while (inFlightCount + taskQueue.length < MAX_CONCURRENT_TASKS) {
+      const task = await fetchNextPluginTask();
+      if (!task) break;
+      taskQueue.push(task);
+    }
+  } catch (err) {
+    console.error('[plugin] pollForTasks error', err);
+  } finally {
+    isPolling = false;
+    drainQueue();
   }
 }
 
@@ -829,12 +867,11 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'pollPluginTasks') {
-    processOneTask().catch((err) => console.error('[plugin] processOneTask alarm error', err));
+    pollForTasks().catch((err) => console.error('[plugin] pollForTasks alarm error', err));
   }
 });
 
 // klik w ikonę – ręczne odpalenie (debug)
 chrome.action.onClicked.addListener(() => {
-  processOneTask().catch((err) => console.error('[plugin] processOneTask click error', err));
+  pollForTasks().catch((err) => console.error('[plugin] pollForTasks click error', err));
 });
-
