@@ -224,6 +224,83 @@ async function safeInsertAnalysis(doc, { logger, snapshotId } = {}) {
   return { doc, insertedId };
 }
 
+function sanitizeNullableString(value) {
+  if (value == null) return null;
+  const s = String(value).trim();
+  return s.length ? s : null;
+}
+
+function sanitizeRequiredString(value) {
+  if (value == null) return '';
+  const s = String(value).trim();
+  return s.length ? s : '';
+}
+
+function normalizePriceObject(price) {
+  if (!price || typeof price !== 'object') {
+    return { value: null, currency: null };
+  }
+  const value = toNumberMaybe(price.value ?? price.amount ?? null);
+  return {
+    value: typeof value === 'number' ? value : null,
+    currency: sanitizeNullableString(price.currency),
+  };
+}
+
+function normalizePriceHint(input) {
+  if (!input || typeof input !== 'object') {
+    return { min: null, max: null };
+  }
+  const min = toNumberMaybe(input.min ?? null);
+  const max = toNumberMaybe(input.max ?? null);
+  return {
+    min: typeof min === 'number' ? min : null,
+    max: typeof max === 'number' ? max : null,
+  };
+}
+
+function normalizeFeatures(input) {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((item) => (item == null ? '' : String(item).trim()))
+    .filter((item) => item.length > 0);
+}
+
+function parseJsonFromResponse(rawResponse) {
+  const trimmed = String(rawResponse || '').trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch (err) {
+    // ignore and try extraction below
+  }
+  const start = trimmed.indexOf('{');
+  const end = trimmed.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) return null;
+  const candidate = trimmed.slice(start, end + 1);
+  try {
+    return JSON.parse(candidate);
+  } catch (err) {
+    return null;
+  }
+}
+
+async function safeInsertAnalysis(doc, { logger, snapshotId } = {}) {
+  let insertedId = null;
+  try {
+    const result = await analizyCol.insertOne(doc);
+    insertedId = result?.insertedId ?? null;
+  } catch (err) {
+    logger?.error?.('snapshot_analysis_insert_failed', {
+      snapshotId: snapshotId?.toString?.() || String(snapshotId || ''),
+      code: err?.code ?? null,
+      message: err?.message || String(err),
+      errInfo: err?.errInfo ?? null,
+    });
+  }
+  return { doc, insertedId };
+}
+
 export async function ensureSnapshotAnalysis(snapshot, { force = false, logger } = {}) {
 
   // jeśli już jest analiza – zwracamy ją
