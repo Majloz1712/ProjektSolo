@@ -4,6 +4,7 @@ import {
   normalizePriceCandidate,
   inferContentType,
 } from '../utils/normalize.js';
+import { detectMainPriceFromDom } from './priceUtils.js';
 
 function collectVisibleText(doc) {
   const NodeFilterImpl = doc.defaultView?.NodeFilter || globalThis.NodeFilter;
@@ -119,13 +120,14 @@ export const visibleTextExtractor = {
 
     const htmlMain = clampTextLength(findHeuristicContainer(doc) || '');
 
+    const domPrice = detectMainPriceFromDom(doc);
     return {
       url,
       title: title || null,
       description: description || null,
       text: text || null,
       //htmlMain: htmlMain || null,
-      price: detectPrice(text),
+      price: domPrice || detectPrice(text),
       images: [],
       attributes: {},
       confidence: Math.min(0.5, text.length / 4000 + 0.2),
@@ -134,4 +136,3 @@ export const visibleTextExtractor = {
     };
   },
 };
-
