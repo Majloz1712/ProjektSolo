@@ -1,4 +1,5 @@
 import { normalizeWhitespace, normalizePriceCandidate, sanitizeArray, inferContentType } from '../utils/normalize.js';
+import { detectMainPriceFromDom } from './priceUtils.js';
 
 function pickMeta(doc, selector) {
   const el = doc.querySelector(selector);
@@ -45,7 +46,8 @@ export const metaOgExtractor = {
       || pickMeta(doc, 'meta[name="description"]')
       || ''
     );
-    const price = detectPrice(doc);
+    const domPrice = detectMainPriceFromDom(doc);
+    const price = domPrice || detectPrice(doc);
     const images = collectImages(doc);
     const bodyText = normalizeWhitespace(doc.querySelector('body')?.textContent || '');
     const confidence = title ? 0.6 : 0.45;
