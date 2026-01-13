@@ -84,6 +84,62 @@ function normalizeOcrText(s) {
   return String(s || '').replace(/\s+/g, ' ').trim();
 }
 
+function normalizeLine(line) {
+  return String(line || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function isJunkLine(line) {
+  const s = normalizeLine(line);
+  if (!s) return true;
+  const junkHints = [
+    'cookie',
+    'cookies',
+    'polityka prywatności',
+    'regulamin',
+    'newsletter',
+    'subscribe',
+    'zgadzam się',
+    'akceptuję',
+  ];
+  return junkHints.some((hint) => s.includes(hint));
+}
+
+function splitTextLines(text) {
+  return String(text || '')
+    .split(/\n+|[.!?]+/)
+    .map((line) => line.trim())
+    .filter((line) => line.length >= 4 && line.length <= 200)
+    .filter((line) => !isJunkLine(line));
+}
+
+function buildTextEvidence(prevText, nowText, { maxItems = 5 } = {}) {
+  const prevLines = splitTextLines(prevText);
+  const nowLines = splitTextLines(nowText);
+
+  if (!prevLines.length && !nowLines.length) return { added: [], removed: [] };
+
+  const prevMap = new Map(prevLines.map((line) => [normalizeLine(line), line]));
+  const nowMap = new Map(nowLines.map((line) => [normalizeLine(line), line]));
+
+  const added = [];
+  for (const [key, line] of nowMap.entries()) {
+    if (!prevMap.has(key)) {
+      added.push(line);
+      if (added.length >= maxItems) break;
+    }
+  }
+
+  const removed = [];
+  for (const [key, line] of prevMap.entries()) {
+    if (!nowMap.has(key)) {
+      removed.push(line);
+      if (removed.length >= maxItems) break;
+    }
+  }
+
+  return { added, removed };
+}
+
 function isKnownExtraValue(value) {
   return value != null && value !== 'unknown';
 }
@@ -288,6 +344,7 @@ export async function computeMachineDiff(
       hasSignificantMachineChange: false,
       reasons: ['brak poprzedniego snapshotu'],
       metrics: {},
+      textEvidence: { added: [], removed: [] },
       prevSnapshotId: null,
       newSnapshotId: newSnapshot?._id ?? null,
     };
@@ -403,6 +460,28 @@ export async function computeMachineDiff(
 
   if (metrics.ocrTextChanged) {
     reasons.push(`zmiana tekstu OCR (score ~${ocrTextDiffScore.toFixed(3)})`);
+  }
+
+  const prevExtractedText = normalizeOcrText(prev.text || '');
+  const nowExtractedText = normalizeOcrText(now.text || '');
+  const textEvidenceSource = prevOcrText || nowOcrText ? 'ocr' : prevExtractedText || nowExtractedText ? 'extracted' : null;
+  const textEvidence =
+    textEvidenceSource === 'ocr'
+      ? buildTextEvidence(prevOcrText, nowOcrText)
+      : textEvidenceSource === 'extracted'
+        ? buildTextEvidence(prevExtractedText, nowExtractedText)
+        : { added: [], removed: [] };
+
+  metrics.textEvidenceSource = textEvidenceSource;
+  metrics.textEvidenceGenerated = Boolean(textEvidenceSource);
+
+  if (metrics.textEvidenceGenerated) {
+    reasons.push(`text_evidence_generated:${textEvidenceSource}`);
+    log.info('generated_textEvidence', {
+      source: textEvidenceSource,
+      addedCount: textEvidence.added.length,
+      removedCount: textEvidence.removed.length,
+    });
   }
 
 
@@ -600,6 +679,7 @@ export async function computeMachineDiff(
     hasSignificantMachineChange,
     reasons: reasonsToUse,
     metrics,
+    textEvidence,
     prevSnapshotId: prevSnapshot._id,
     newSnapshotId: newSnapshot._id,
   };
