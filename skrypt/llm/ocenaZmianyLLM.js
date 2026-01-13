@@ -569,7 +569,6 @@ function buildDecisionFromMetrics(metrics) {
 function normalizeUserPrompt(rawPrompt) {
   const normalized = (rawPrompt || '').toString().trim();
   if (!normalized) return null;
-  if (normalized.toLowerCase() === 'cena') return null;
   return normalized;
 }
 
@@ -607,357 +606,232 @@ export async function evaluateChangeWithLLM(
 
   log.info('llm_change_eval_start', { monitorId, zadanieId, url });
 
-  // 0) twarda reguła: zmiana ceny z plugin_prices zawsze istotna
-  if (diff?.metrics?.pluginPricesChanged === true) {
-    const decision = {
-      important: true,
-      category: 'price_change',
-      importance_reason: 'wykryto zmianę cen (plugin_prices)',
-      short_title: 'Cena zmieniona',
-      short_description: 'Wykryto zmianę cen przez plugin (JS na stronie).',
-    };
+  const trackedFields = Array.isArray(newAnalysis?.intent?.trackedFields)
+    ? newAnalysis.intent.trackedFields
+    : Array.isArray(prevAnalysis?.intent?.trackedFields)
+      ? prevAnalysis.intent.trackedFields
+      : [];
+  const trackedExtrasChanges = diff?.metrics?.trackedExtrasChanges || {};
 
-    const { insertedId } = await ocenyZmienCol.insertOne({
-      createdAt: new Date(),
-      monitorId,
-      zadanieId,
-      url,
-      llm_mode: 'rule_plugin_prices',
-      model: null,
-      prompt_used: null,
-      raw_response: null,
-      // OCR nie podejmuje decyzji — zapisujemy tylko meta dla debug
-      vision_ocr: {
-        prev: summarizeOcrForStorage(prevOcr),
-        next: summarizeOcrForStorage(newOcr),
-      },
-      llm_decision: decision,
-      error: null,
-      durationMs: Math.round(performance.now() - tEval0),
-    });
+  const formatEvidence = (items) =>
+    Array.isArray(items) && items.length ? items.map((item) => `"${item}"`).join(', ') : 'brak';
 
-    log.info('llm_change_eval_success', {
-      monitorId,
-      zadanieId,
-      mongoId: insertedId,
-      important: true,
-      category: decision.category,
-    });
+  let decision = null;
 
-    return { parsed: decision, raw: null, mongoId: insertedId };
-  }
-  
-  // 0.1) twarda reguła: jeśli machine-diff policzył zmianę MAIN price → istotne
-  if (
-    typeof diff?.metrics?.price?.oldVal === 'number' &&
-    typeof diff?.metrics?.price?.newVal === 'number' &&
-    typeof diff?.metrics?.price?.absChange === 'number' &&
-    diff.metrics.price.absChange !== 0
-  ) {
-    const { oldVal, newVal } = diff.metrics.price;
+  if (trackedFields.length > 0) {
+    if (trackedFields.includes('main_price') && trackedExtrasChanges.main_price) {
+      const change = trackedExtrasChanges.main_price;
+      decision = {
+        important: true,
+        category: 'price_change',
+        importance_reason: `Zmiana ceny (extras.main_price): ${change.before} → ${change.after}. Dowody: prev=[${formatEvidence(change.beforeEvidence)}], now=[${formatEvidence(change.afterEvidence)}].`,
+        short_title: 'Zmiana ceny',
+        short_description: `Cena zmieniła się z ${change.before} na ${change.after}.`,
+        old_price: change.before,
+        new_price: change.after,
+      };
+    } else if (trackedFields.includes('review_count') && trackedExtrasChanges.review_count) {
+      const change = trackedExtrasChanges.review_count;
+      decision = {
+        important: true,
+        category: 'reviews_change',
+        importance_reason: `Zmiana liczby opinii (extras.review_count): ${change.before} → ${change.after}. Dowody: prev=[${formatEvidence(change.beforeEvidence)}], now=[${formatEvidence(change.afterEvidence)}].`,
+        short_title: 'Zmiana liczby opinii',
+        short_description: `Liczba opinii zmieniła się z ${change.before} na ${change.after}.`,
+      };
+    } else if (trackedFields.includes('rating') && trackedExtrasChanges.rating) {
+      const change = trackedExtrasChanges.rating;
+      decision = {
+        important: true,
+        category: 'rating_change',
+        importance_reason: `Zmiana oceny (extras.rating): ${change.before} → ${change.after}. Dowody: prev=[${formatEvidence(change.beforeEvidence)}], now=[${formatEvidence(change.afterEvidence)}].`,
+        short_title: 'Zmiana oceny',
+        short_description: `Ocena zmieniła się z ${change.before} na ${change.after}.`,
+      };
+    } else {
+      decision = {
+        important: false,
+        category: 'no_tracked_change',
+        importance_reason: 'Nie wykryto zmian w śledzonych polach (extras).',
+        short_title: 'Brak zmian w śledzonych polach',
+        short_description: 'Zmieniły się tylko elementy nieobjęte śledzeniem.',
+      };
+    }
+  } else {
+    if (diff?.metrics?.pluginPricesChanged === true) {
+      decision = {
+        important: true,
+        category: 'price_change',
+        importance_reason: 'wykryto zmianę cen (plugin_prices)',
+        short_title: 'Cena zmieniona',
+        short_description: 'Wykryto zmianę cen przez plugin (JS na stronie).',
+      };
+    }
 
-    const decision = {
-      important: true,
-      category: 'price_change',
-      importance_reason: 'Machine diff policzył zmianę ceny głównej (main price).',
-      short_title: 'Zmiana ceny',
-      short_description: `Cena zmieniła się z ${oldVal} na ${newVal}.`,
-      old_price: oldVal,
-      new_price: newVal,
-    };
+    if (!decision) {
+      if (
+        typeof diff?.metrics?.price?.oldVal === 'number' &&
+        typeof diff?.metrics?.price?.newVal === 'number' &&
+        typeof diff?.metrics?.price?.absChange === 'number' &&
+        diff.metrics.price.absChange !== 0
+      ) {
+        const { oldVal, newVal } = diff.metrics.price;
+        decision = {
+          important: true,
+          category: 'price_change',
+          importance_reason: 'Machine diff policzył zmianę ceny głównej (main price).',
+          short_title: 'Zmiana ceny',
+          short_description: `Cena zmieniła się z ${oldVal} na ${newVal}.`,
+          old_price: oldVal,
+          new_price: newVal,
+        };
+      }
+    }
 
-    const { insertedId } = await ocenyZmienCol.insertOne({
-      createdAt: new Date(),
-      monitorId,
-      zadanieId,
-      url,
-      llm_mode: 'rule',
-      prompt_used: null,
-      prevAnalysis,
-      newAnalysis,
-      diff,
-      raw_response: null,
-      vision_ocr: {
-        prev: summarizeOcrForStorage(prevOcr),
-        next: summarizeOcrForStorage(newOcr),
-      },
-      llm_decision: decision,
-      error: null,
-      durationMs: Math.round(performance.now() - tEval0),
-    });
+    if (!decision) {
+      const prevAnalysisPrice = pickAnalysisPriceValue(prevAnalysis);
+      const newAnalysisPrice = pickAnalysisPriceValue(newAnalysis);
+      if (
+        typeof prevAnalysisPrice === 'number' &&
+        typeof newAnalysisPrice === 'number' &&
+        prevAnalysisPrice !== newAnalysisPrice
+      ) {
+        decision = {
+          important: true,
+          category: 'price_change',
+          importance_reason: 'Analiza snapshotów wykryła zmianę głównej ceny.',
+          short_title: 'Zmiana ceny',
+          short_description: `Cena zmieniła się z ${prevAnalysisPrice} na ${newAnalysisPrice}.`,
+          old_price: prevAnalysisPrice,
+          new_price: newAnalysisPrice,
+        };
+      }
+    }
 
-    log.info('llm_change_eval_success', {
-      monitorId,
-      zadanieId,
-      mongoId: insertedId,
-      important: true,
-      category: decision.category,
-      usedMode: 'rule',
-      usedModel: 'rule',
-    });
+    if (!decision) {
+      decision = buildDecisionFromMetrics(diff?.metrics);
+    }
 
-    return { parsed: decision, raw: null, mongoId: insertedId };
-  }
+    if (!decision) {
+      const m = diff?.metrics || {};
+      const ocrScore = typeof m.ocrTextDiffScore === 'number' ? m.ocrTextDiffScore : 0;
+      const textScore = typeof m.textDiffScore === 'number' ? m.textDiffScore : 0;
 
-  // 0.15) twarda reguła: zmiana ceny z analizy snapshotu (LLM #1)
-  const prevAnalysisPrice = pickAnalysisPriceValue(prevAnalysis);
-  const newAnalysisPrice = pickAnalysisPriceValue(newAnalysis);
-  if (
-    typeof prevAnalysisPrice === 'number' &&
-    typeof newAnalysisPrice === 'number' &&
-    prevAnalysisPrice !== newAnalysisPrice
-  ) {
-    const decision = {
-      important: true,
-      category: 'price_change',
-      importance_reason: 'Analiza snapshotów wykryła zmianę głównej ceny.',
-      short_title: 'Zmiana ceny',
-      short_description: `Cena zmieniła się z ${prevAnalysisPrice} na ${newAnalysisPrice}.`,
-      old_price: prevAnalysisPrice,
-      new_price: newAnalysisPrice,
-    };
+      const priceRel = m.price?.relChange;
+      const hasPriceMove = typeof priceRel === 'number' && Math.abs(priceRel) >= 0.05;
 
-    const { insertedId } = await ocenyZmienCol.insertOne({
-      createdAt: new Date(),
-      monitorId,
-      zadanieId,
-      url,
-      llm_mode: 'rule',
-      prompt_used: null,
-      prevAnalysis,
-      newAnalysis,
-      diff,
-      raw_response: null,
-      vision_ocr: {
-        prev: summarizeOcrForStorage(prevOcr),
-        next: summarizeOcrForStorage(newOcr),
-      },
-      llm_decision: decision,
-      error: null,
-      durationMs: Math.round(performance.now() - tEval0),
-    });
+      const hasContentMove =
+        m.titleChanged === true ||
+        m.descriptionChanged === true ||
+        (typeof textScore === 'number' && textScore > 0.15);
 
-    log.info('llm_change_eval_success', {
-      monitorId,
-      zadanieId,
-      mongoId: insertedId,
-      important: true,
-      category: decision.category,
-      usedMode: 'rule',
-      usedModel: 'rule',
-    });
+      const secondaryPricesChanged =
+        m.secondaryPrices &&
+        m.secondaryPrices.prev?.length > 0 &&
+        m.secondaryPrices.now?.length > 0 &&
+        JSON.stringify(m.secondaryPrices.prev) !== JSON.stringify(m.secondaryPrices.now);
+      const reviewsChanged =
+        (m.reviews?.prevCount != null &&
+          m.reviews?.nowCount != null &&
+          m.reviews.prevCount !== m.reviews.nowCount) ||
+        (m.reviews?.prevRating != null &&
+          m.reviews?.nowRating != null &&
+          m.reviews.prevRating !== m.reviews.nowRating);
+      const numericChanged = typeof m.numericDiffScore === 'number' && m.numericDiffScore > 0.1;
 
-    return { parsed: decision, raw: null, mongoId: insertedId };
-  }
+      const onlyOcrDrift =
+        !hasPriceMove &&
+        !hasContentMove &&
+        !secondaryPricesChanged &&
+        !reviewsChanged &&
+        !numericChanged &&
+        m.pluginPricesChanged !== true &&
+        (m.screenshotChanged === true || m.ocrTextChanged === true) &&
+        ocrScore > 0 &&
+        ocrScore < 0.20;
 
-  // 0.2) twarda reguła: zmiany treści/opinii/cen drugorzędnych/numerów
-  const ruleDecision = buildDecisionFromMetrics(diff?.metrics);
-  if (ruleDecision) {
-    const { insertedId } = await ocenyZmienCol.insertOne({
-      createdAt: new Date(),
-      monitorId,
-      zadanieId,
-      url,
-      llm_mode: 'rule',
-      prompt_used: null,
-      prevAnalysis,
-      newAnalysis,
-      diff,
-      raw_response: null,
-      vision_ocr: {
-        prev: summarizeOcrForStorage(prevOcr),
-        next: summarizeOcrForStorage(newOcr),
-      },
-      llm_decision: ruleDecision,
-      error: null,
-      durationMs: Math.round(performance.now() - tEval0),
-    });
-
-    log.info('llm_change_eval_success', {
-      monitorId,
-      zadanieId,
-      mongoId: insertedId,
-      important: true,
-      category: ruleDecision.category,
-      usedMode: 'rule',
-      usedModel: 'rule',
-    });
-
-    return { parsed: ruleDecision, raw: null, mongoId: insertedId };
+      if (onlyOcrDrift) {
+        decision = {
+          important: false,
+          category: 'minor_change',
+          importance_reason: `Zmiana wygląda na drift OCR/screenshot (ocrTextDiffScore=${ocrScore.toFixed(3)}), bez dowodu na realną zmianę treści/ceny.`,
+          short_title: 'Nieistotna zmiana',
+          short_description: 'Różnice wynikają z OCR/screenshot, a nie z treści produktu/ceny.',
+        };
+      }
+    }
   }
 
-
-  // 0.5) twarda reguła: jeśli to tylko "drift" screenshot/OCR (bez realnych zmian treści/ceny) → nieistotne
-  const m = diff?.metrics || {};
-  const ocrScore = typeof m.ocrTextDiffScore === 'number' ? m.ocrTextDiffScore : 0;
-  const textScore = typeof m.textDiffScore === 'number' ? m.textDiffScore : 0;
-
-  const priceRel = m.price?.relChange;
-  const hasPriceMove = typeof priceRel === 'number' && Math.abs(priceRel) >= 0.05;
-
-  const hasContentMove =
-    m.titleChanged === true ||
-    m.descriptionChanged === true ||
-    (typeof textScore === 'number' && textScore > 0.15);
-
-  const secondaryPricesChanged =
-    m.secondaryPrices &&
-    m.secondaryPrices.prev?.length > 0 &&
-    m.secondaryPrices.now?.length > 0 &&
-    JSON.stringify(m.secondaryPrices.prev) !== JSON.stringify(m.secondaryPrices.now);
-  const reviewsChanged =
-    (m.reviews?.prevCount != null &&
-      m.reviews?.nowCount != null &&
-      m.reviews.prevCount !== m.reviews.nowCount) ||
-    (m.reviews?.prevRating != null &&
-      m.reviews?.nowRating != null &&
-      m.reviews.prevRating !== m.reviews.nowRating);
-  const numericChanged = typeof m.numericDiffScore === 'number' && m.numericDiffScore > 0.1;
-
-  const onlyOcrDrift =
-    !hasPriceMove &&
-    !hasContentMove &&
-    !secondaryPricesChanged &&
-    !reviewsChanged &&
-    !numericChanged &&
-    m.pluginPricesChanged !== true &&
-    (m.screenshotChanged === true || m.ocrTextChanged === true) &&
-    ocrScore > 0 &&
-    ocrScore < 0.20;
-
-  if (onlyOcrDrift) {
-    const decision = {
+  if (!decision) {
+    decision = {
       important: false,
       category: 'minor_change',
-      importance_reason: `Zmiana wygląda na drift OCR/screenshot (ocrTextDiffScore=${ocrScore.toFixed(3)}), bez dowodu na realną zmianę treści/ceny.`,
-      short_title: 'Nieistotna zmiana',
-      short_description: 'Różnice wynikają z OCR/screenshot, a nie z treści produktu/ceny.',
+      importance_reason: 'Brak istotnych zmian w danych.',
+      short_title: 'Brak istotnej zmiany',
+      short_description: 'Nie udało się potwierdzić istotnej zmiany na podstawie danych.',
     };
-
-    const { insertedId } = await ocenyZmienCol.insertOne({
-      createdAt: new Date(),
-      monitorId,
-      zadanieId,
-      url,
-      llm_mode: 'rule',
-      model: 'rule',
-      prompt_used: null,
-      prevAnalysis,
-      newAnalysis,
-      diff,
-      raw_response: null,
-      vision_ocr: {
-        prev: summarizeOcrForStorage(prevOcr),
-        next: summarizeOcrForStorage(newOcr),
-      },
-      llm_decision: decision,
-      error: null,
-      durationMs: Math.round(performance.now() - tEval0),
-    });
-
-    log.info('llm_change_eval_success', {
-      monitorId,
-      zadanieId,
-      mongoId: insertedId,
-      important: false,
-      category: decision.category,
-      usedMode: 'rule',
-      usedModel: 'rule',
-    });
-
-    return { parsed: decision, raw: null, mongoId: insertedId };
   }
 
-  const usedMode = normalizedUserPrompt ? 'text_user' : 'text';
-  const usedModel = process.env.OLLAMA_TEXT_MODEL || process.env.LLM_MODEL || 'llama3';
+  let usedPrompt = null;
+  let raw = null;
+  let usedModel = null;
+  let usedMode = 'rule';
 
-  const prevOcrText = ocrPreview(prevOcr, 2000);
-  const newOcrText = ocrPreview(newOcr, 2000);
+  if (decision.important === true) {
+    usedMode = 'summary_llm';
+    usedModel = process.env.OLLAMA_TEXT_MODEL || process.env.LLM_MODEL || 'llama3';
 
-  const userCriteriaSection = normalizedUserPrompt
-    ? `
-Najważniejsze kryterium oceny:
+    const userCriteriaSection = normalizedUserPrompt
+      ? `
+Instrukcje użytkownika (tylko kontekst, nie dane wejściowe):
 ${normalizedUserPrompt}
 `
-    : '';
+      : '';
 
-  const usedPrompt = `
-Masz dane JSON: prevAnalysis, newAnalysis, diff.
-Dodatkowo masz OCR ze screenshotu (prevOcr/newOcr) – to TYLKO tekst odczytany z obrazka.
-
-Twoje zadanie: oceń istotność zmiany NA PODSTAWIE DANYCH.
-NIE WOLNO zgadywać ani dopowiadać. Jeśli brak dowodu w danych -> uznaj za nieistotne.
+    usedPrompt = `
+Masz dane JSON: decision, diff.
+Twoje zadanie: przygotuj krótki tytuł i opis powiadomienia.
+NIE ZMIENIAJ ważności ani kategorii. Nie dodawaj nowych faktów.
 
 Zwróć WYŁĄCZNIE JSON:
 {
-  "important": boolean,
-  "category": string,
-  "importance_reason": string,
   "short_title": string,
   "short_description": string
 }
 ${userCriteriaSection}
-`
-  + `
-prevAnalysis:
-${JSON.stringify(prevAnalysis ?? null)}
 
-newAnalysis:
-${JSON.stringify(newAnalysis ?? null)}
+decision:
+${JSON.stringify(decision ?? null)}
 
 diff:
 ${JSON.stringify(diff ?? null)}
-
-prevOcr (clean_text preview):
-${prevOcrText || null}
-
-newOcr (clean_text preview):
-${newOcrText || null}
 `.trim();
 
-  let raw = null;
-  let llmDecision = null;
+    try {
+      raw = await generateTextWithOllama({
+        prompt: usedPrompt,
+        model: usedModel,
+        temperature: 0,
+      });
 
-  try {
-    raw = await generateTextWithOllama({
-      prompt: usedPrompt,
-      model: usedModel,
-      temperature: 0,
-    });
-
-    const parsed = safeParseJsonFromLLM(raw);
-    if (parsed && typeof parsed.important === 'boolean') {
-      llmDecision = parsed;
-    } else {
-      const fallbackDecision = buildDecisionFromMetrics(diff?.metrics);
-      llmDecision = fallbackDecision || {
-        important: false,
-        category: 'minor_change',
-        importance_reason: 'Brak poprawnego JSON z LLM lub brak twardych dowodów w danych.',
-        short_title: 'Brak istotnej zmiany',
-        short_description: 'Nie udało się potwierdzić istotnej zmiany na podstawie dostarczonych danych.',
-      };
-      llmDecision.llm_fallback_used = true;
+      const parsedSummary = safeParseJsonFromLLM(raw);
+      if (parsedSummary && typeof parsedSummary.short_title === 'string') {
+        decision.short_title = parsedSummary.short_title;
+      }
+      if (parsedSummary && typeof parsedSummary.short_description === 'string') {
+        decision.short_description = parsedSummary.short_description;
+      }
+    } catch (err) {
+      decision.llm_fallback_used = true;
     }
-  } catch (err) {
-    const fallbackDecision = buildDecisionFromMetrics(diff?.metrics);
-    llmDecision = fallbackDecision || {
-      important: false,
-      category: 'minor_change',
-      importance_reason: `Błąd text LLM: ${err?.message || String(err)}`,
-      short_title: 'Brak istotnej zmiany',
-      short_description: 'Nie udało się wykonać oceny tekstowej.',
-    };
-    llmDecision.llm_fallback_used = true;
   }
 
-  // Zapis do Mongo ZAWSZE
   const { insertedId } = await ocenyZmienCol.insertOne({
     createdAt: new Date(),
     monitorId,
     zadanieId,
     url,
-    llm_mode: usedMode, // 'text'
+    llm_mode: usedMode,
     model: usedModel,
     prompt_used: usedPrompt,
     raw_response: raw,
@@ -965,7 +839,7 @@ ${newOcrText || null}
       prev: summarizeOcrForStorage(prevOcr),
       next: summarizeOcrForStorage(newOcr),
     },
-    llm_decision: llmDecision,
+    llm_decision: decision,
     error: null,
     durationMs: Math.round(performance.now() - tEval0),
   });
@@ -974,14 +848,13 @@ ${newOcrText || null}
     monitorId,
     zadanieId,
     mongoId: insertedId,
-    important: !!llmDecision?.important,
-    category: llmDecision?.category || null,
-    llmFallbackUsed: llmDecision?.llm_fallback_used === true,
+    important: !!decision?.important,
+    category: decision?.category || null,
     usedMode,
     usedModel,
   });
 
-  return { parsed: llmDecision, raw, mongoId: insertedId };
+  return { parsed: decision, raw, mongoId: insertedId };
 }
 
 export async function saveDetectionAndNotification(
