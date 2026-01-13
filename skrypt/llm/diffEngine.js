@@ -84,6 +84,10 @@ function normalizeOcrText(s) {
   return String(s || '').replace(/\s+/g, ' ').trim();
 }
 
+function isKnownExtraValue(value) {
+  return value != null && value !== 'unknown';
+}
+
 function toNumberMaybe(v) {
   if (v == null) return null;
   let s = String(v).replace(/\u00A0/g, ' ').trim();
@@ -305,6 +309,50 @@ export async function computeMachineDiff(
     ? newSnapshot.plugin_prices
     : [];
 
+  const trackedFields = Array.isArray(newAnalysis?.intent?.trackedFields)
+    ? newAnalysis.intent.trackedFields
+    : Array.isArray(prevAnalysis?.intent?.trackedFields)
+      ? prevAnalysis.intent.trackedFields
+      : [];
+  metrics.trackedFields = trackedFields;
+  const prevTrackedFields = Array.isArray(prevAnalysis?.intent?.trackedFields)
+    ? prevAnalysis.intent.trackedFields
+    : [];
+  const trackedFieldsChanged =
+    JSON.stringify(prevTrackedFields) !== JSON.stringify(trackedFields);
+  metrics.trackedFieldsChanged = trackedFieldsChanged;
+  metrics.trackedExtrasChanged = false;
+  metrics.trackedExtrasChanges = {};
+  const extrasReasons = [];
+
+  if (trackedFieldsChanged) {
+    extrasReasons.push('tracked_fields_changed');
+  }
+
+  if (trackedFields.length > 0) {
+    for (const field of trackedFields) {
+      const prevExtra = prevAnalysis?.extras?.[field];
+      const nowExtra = newAnalysis?.extras?.[field];
+      const prevVal = prevExtra?.value;
+      const nowVal = nowExtra?.value;
+      const prevKnown = isKnownExtraValue(prevVal);
+      const nowKnown = isKnownExtraValue(nowVal);
+
+      if (prevKnown && nowKnown && prevVal !== nowVal) {
+        metrics.trackedExtrasChanged = true;
+        metrics.trackedExtrasChanges[field] = {
+          before: prevVal,
+          after: nowVal,
+          beforeEvidence: Array.isArray(prevExtra?.evidence) ? prevExtra.evidence : [],
+          afterEvidence: Array.isArray(nowExtra?.evidence) ? nowExtra.evidence : [],
+          beforeSource: prevExtra?.source ?? null,
+          afterSource: nowExtra?.source ?? null,
+        };
+        extrasReasons.push(`tracked_${field}_changed: ${prevVal} -> ${nowVal}`);
+      }
+    }
+  }
+
   // ===== Screenshot diff (OCR/vision fallback) =====
   // NIE trzymamy base64 w metrykach – tylko hash.
   const prevShot = normalizeB64(prevSnapshot.screenshot_b64);
@@ -475,7 +523,13 @@ export async function computeMachineDiff(
     reasons.push('zmieniła się liczba obrazów / ofert');
   }
 
-  const hasAnyChange = reasons.length > 0;
+  let reasonsToUse = reasons;
+  let hasAnyChange = reasons.length > 0;
+
+  if (trackedFields.length > 0) {
+    reasonsToUse = metrics.trackedExtrasChanged ? extrasReasons : [];
+    hasAnyChange = metrics.trackedExtrasChanged;
+  }
 
   let hasSignificantMachineChange = false;
 
@@ -526,6 +580,10 @@ export async function computeMachineDiff(
     hasSignificantMachineChange = true;
   }
 
+  if (trackedFields.length > 0) {
+    hasSignificantMachineChange = metrics.trackedExtrasChanged;
+  }
+
   const durationMs = Math.round(performance.now() - t0);
   if (durationMs >= 10) {
     log.info('diff_compute_done', {
@@ -540,7 +598,7 @@ export async function computeMachineDiff(
   return {
     hasAnyChange,
     hasSignificantMachineChange,
-    reasons,
+    reasons: reasonsToUse,
     metrics,
     prevSnapshotId: prevSnapshot._id,
     newSnapshotId: newSnapshot._id,
