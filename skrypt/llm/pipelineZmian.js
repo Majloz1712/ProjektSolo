@@ -284,7 +284,10 @@ const llmDecision = await evaluateChangeWithLLM(
   });
 
   const importantByLLM = !!(llmDecision?.parsed?.important);
-  const isImportant = importantByLLM;
+  const machinePriceChanged = !!(diff?.metrics?.price && diff.metrics.price.absChange !== 0);
+  const isImportant = trackedFields.length > 0
+    ? trackedExtrasChanged
+    : importantByLLM || machinePriceChanged;
 
 
   if (!isImportant) {
@@ -307,6 +310,11 @@ const llmDecision = await evaluateChangeWithLLM(
     short_description: "Zmiana uznana za istotną na podstawie twardych reguł.",
   };
 
+  const diffToSave = {
+    ...diff,
+    evidence_used: decisionToSave?.evidence_used || [],
+  };
+
   const tSave0 = performance.now();
 const { detectionId: wykrycieId } = await saveDetectionAndNotification(
   {
@@ -314,7 +322,7 @@ const { detectionId: wykrycieId } = await saveDetectionAndNotification(
     zadanieId, // <- spójnie
     url: snapshot.url,
     snapshotMongoId: snapshot._id,
-    diff,
+    diff: diffToSave,
     prevOcr: prevSnapshot?.vision_ocr || null,
     newOcr: snapshot?.vision_ocr || null,
     llmDecision: decisionToSave,
