@@ -50,31 +50,24 @@ export function resolveEffectivePrompt(userPrompt, systemPrompt) {
   return normalizeUserPrompt(userPrompt) || systemPrompt;
 }
 
-export function extractJsonFromText(rawResponse, { maxLength = 20000, maxAttempts = 3 } = {}) {
-  const text = String(rawResponse || '').slice(0, maxLength);
-  if (!text.trim()) {
-    return { ok: false, error: 'EMPTY_RESPONSE' };
-  }
+export function extractFirstJsonObject(text, maxAttempts = 3) {
+  const input = String(text || '');
+  if (!input.trim()) return null;
 
-  const candidates = [];
-  for (let i = 0; i < text.length; i += 1) {
-    const ch = text[i];
-    if (ch === '{' || ch === '[') {
-      candidates.push({ start: i, open: ch, close: ch === '{' ? '}' : ']' });
-      if (candidates.length >= maxAttempts) break;
+  const starts = [];
+  for (let i = 0; i < input.length; i += 1) {
+    if (input[i] === '{') {
+      starts.push(i);
+      if (starts.length >= maxAttempts) break;
     }
   }
 
-  let attempts = 0;
-  for (const candidate of candidates) {
-    if (attempts >= maxAttempts) break;
-    attempts += 1;
-
+  for (const start of starts) {
     let depth = 0;
     let inString = false;
     let escape = false;
-    for (let i = candidate.start; i < text.length; i += 1) {
-      const ch = text[i];
+    for (let i = start; i < input.length; i += 1) {
+      const ch = input[i];
       if (escape) {
         escape = false;
         continue;
@@ -88,17 +81,12 @@ export function extractJsonFromText(rawResponse, { maxLength = 20000, maxAttempt
         continue;
       }
       if (inString) continue;
-      if (ch === candidate.open) depth += 1;
-      if (ch === candidate.close) depth -= 1;
-      if (depth === 0 && i > candidate.start) {
-        const slice = text.slice(candidate.start, i + 1).trim();
+      if (ch === '{') depth += 1;
+      if (ch === '}') depth -= 1;
+      if (depth === 0 && i > start) {
+        const slice = input.slice(start, i + 1).trim();
         try {
-          const value = JSON.parse(slice);
-          return {
-            ok: true,
-            value,
-            extracted: candidate.start !== 0 || i + 1 !== text.length,
-          };
+          return JSON.parse(slice);
         } catch {
           break;
         }
@@ -106,5 +94,21 @@ export function extractJsonFromText(rawResponse, { maxLength = 20000, maxAttempt
     }
   }
 
-  return { ok: false, error: 'NO_JSON_FOUND' };
+  return null;
+}
+
+export function parseJsonFromLLM(rawText) {
+  const text = String(rawText || '').trim();
+  if (!text) return { ok: false, error: 'LLM_NO_JSON_FOUND' };
+
+  try {
+    return { ok: true, data: JSON.parse(text), mode: 'direct' };
+  } catch {
+    const extracted = extractFirstJsonObject(text, 3);
+    if (extracted != null) {
+      return { ok: true, data: extracted, mode: 'extracted' };
+    }
+  }
+
+  return { ok: false, error: 'LLM_NO_JSON_FOUND' };
 }

@@ -6,7 +6,7 @@ import {
   sanitizeRequiredString as sanitizeRequiredStringUtil,
   parseTrackedFields,
   hashUserPrompt,
-  extractJsonFromText,
+  parseJsonFromLLM,
 } from './analysisUtils.js';
 import { Double } from 'mongodb';
 import { performance } from 'node:perf_hooks';
@@ -524,8 +524,8 @@ ${contextPack.contextPackText || '[EMPTY]'}
 }
 
 function parseJsonFromResponse(rawResponse) {
-  const extracted = extractJsonFromText(rawResponse);
-  return extracted.ok ? extracted.value : null;
+  const parsed = parseJsonFromLLM(rawResponse);
+  return parsed.ok ? parsed.data : null;
 }
 
 async function safeInsertAnalysis(doc, { logger, snapshotId } = {}) {
@@ -791,6 +791,9 @@ ${dataBlock}
   let rawResponse = null;
   let parsed = null;
   let parsedJsonExtracted = false;
+  let parsedJsonDirect = false;
+  let fallbackUsed = false;
+  let fallbackReason = null;
 
   try {
     const tLlm0 = performance.now();
@@ -811,24 +814,54 @@ logger?.info('snapshot_analysis_llm_done', {
 });
 
 
-    const extracted = extractJsonFromText(rawResponse);
-    parsed = extracted.ok ? extracted.value : null;
-    parsedJsonExtracted = extracted.ok ? extracted.extracted === true : false;
+    const parsedResult = parseJsonFromLLM(rawResponse);
+    parsed = parsedResult.ok ? parsedResult.data : null;
+    parsedJsonDirect = parsedResult.mode === 'direct';
+    parsedJsonExtracted = parsedResult.mode === 'extracted';
     logger?.info('analysis_json_extracted', {
       snapshotId: _id.toString(),
       extracted: parsedJsonExtracted,
     });
     logger?.info('analysis_json_extract_used', {
       snapshotId: _id.toString(),
-      json_extract_used: extracted.ok && extracted.extracted === true,
+      json_extract_used: parsedJsonExtracted,
+    });
+    logger?.info('analysis_json_parse_mode', {
+      snapshotId: _id.toString(),
+      json_parse_mode: parsedResult.mode || 'none',
     });
     if (!parsed) {
-      throw new Error('LLM_NON_JSON_RESPONSE');
+      logger?.info('analysis_json_extract_error', {
+        snapshotId: _id.toString(),
+        json_extract_error: parsedResult.error || 'LLM_NO_JSON_FOUND',
+      });
+      fallbackUsed = true;
+      fallbackReason = parsedResult.error || 'LLM_NO_JSON_FOUND';
     }
   } catch (err) {
-    // ❌ błąd LLM – zapisujemy dokument z błędem, żeby schema się zgadzała
+    fallbackUsed = true;
+    fallbackReason = err?.message || String(err);
+  }
+
+  if (fallbackUsed) {
     const normalizedPrice = normalizePriceObject(mainPrice);
-    const errorDoc = {
+    const combinedLower = `${url || ''} ${ocrTextFull || ''}`.toLowerCase();
+    const productType =
+      combinedLower.includes('allegro') || combinedLower.includes('oferta')
+        ? 'strona produktu'
+        : 'strona';
+    const priceValues = pluginPrices
+      .map((p) => toNumberMaybe(p?.value ?? p))
+      .filter((v) => typeof v === 'number');
+    if (typeof normalizedPrice.value === 'number') {
+      priceValues.push(normalizedPrice.value);
+    }
+    const priceHint =
+      priceValues.length > 0
+        ? { min: Math.min(...priceValues), max: Math.max(...priceValues) }
+        : { min: null, max: null };
+
+    const fallbackDoc = {
       zadanieId: String(zadanie_id),
       monitorId: String(monitor_id),
       score: new Double(0.0),
@@ -840,32 +873,33 @@ logger?.info('snapshot_analysis_llm_done', {
       model: process.env.OLLAMA_TEXT_MODEL || 'llama3',
       prompt,
 
-      summary: '',
-      podsumowanie: '',
-      product_type: '',
+      summary: 'Strona produktu e-commerce.',
+      podsumowanie: 'Strona produktu e-commerce.',
+      product_type: productType,
       main_currency: normalizedPrice.currency,
       price: normalizedPrice,
-      price_hint: { min: null, max: null },
+      price_hint: priceHint,
       features: [],
       intent,
       extras,
       raw_response: rawResponse != null ? String(rawResponse) : null,
       parsed_json_extracted: parsedJsonExtracted,
-      error: err?.message || String(err),
+      parsed_json_direct: parsedJsonDirect,
+      fallback_used: true,
+      fallback_reason: 'NO_JSON_FROM_LLM',
+      error: 'LLM_NO_JSON_FOUND',
     };
 
-
-    logger?.error('snapshot_analysis_llm_error', {
+    logger?.warn('snapshot_analysis_llm_fallback', {
       snapshotId: _id.toString(),
       monitorId: String(monitor_id),
       zadanieId: String(zadanie_id),
       url,
-      
-      error: err?.message || String(err),
+      fallbackReason,
       durationMs: Math.round(performance.now() - t0),
     });
 
-    const { doc: storedDoc, insertedId } = await safeInsertAnalysis(errorDoc, {
+    const { doc: storedDoc, insertedId } = await safeInsertAnalysis(fallbackDoc, {
       logger,
       snapshotId: _id,
     });
@@ -908,6 +942,9 @@ logger?.info('snapshot_analysis_llm_done', {
     extras,
     raw_response: rawResponse != null ? String(rawResponse) : null,
     parsed_json_extracted: parsedJsonExtracted,
+    parsed_json_direct: parsedJsonDirect,
+    fallback_used: false,
+    fallback_reason: null,
     error: null,
   };
 

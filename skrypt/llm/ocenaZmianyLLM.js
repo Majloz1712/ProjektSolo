@@ -11,7 +11,7 @@
 
 import { generateTextWithOllama } from './ollamaClient.js';
 import {
-  extractJsonFromText,
+  parseJsonFromLLM,
   normalizeUserPrompt,
   resolveEffectivePrompt,
   SYSTEM_DEFAULT_JUDGE_PROMPT,
@@ -148,6 +148,7 @@ ${JSON.stringify(diffTextEvidence ?? { added: [], removed: [] })}
   let parsed = null;
   let fallbackUsed = false;
   let parsedJsonExtracted = false;
+  let parsedJsonDirect = false;
   let evidenceValidationFailed = false;
   let fallbackReason = null;
   let evidenceFilteredCount = 0;
@@ -162,18 +163,25 @@ ${JSON.stringify(diffTextEvidence ?? { added: [], removed: [] })}
       timeoutMs: judgeTimeoutMs,
     });
 
-    const extracted = extractJsonFromText(raw);
-    parsed = extracted.ok ? extracted.value : null;
-    parsedJsonExtracted = extracted.ok ? extracted.extracted === true : false;
+    const parsedResult = parseJsonFromLLM(raw);
+    parsed = parsedResult.ok ? parsedResult.data : null;
+    parsedJsonDirect = parsedResult.mode === 'direct';
+    parsedJsonExtracted = parsedResult.mode === 'extracted';
     logger?.info?.('judge_json_extracted', {
       extracted: parsedJsonExtracted,
     });
     logger?.info?.('judge_json_extract_used', {
-      json_extract_used: extracted.ok && extracted.extracted === true,
+      json_extract_used: parsedJsonExtracted,
+    });
+    logger?.info?.('judge_json_parse_mode', {
+      json_parse_mode: parsedResult.mode || 'none',
     });
     if (!parsed || typeof parsed.important !== 'boolean') {
+      logger?.info?.('judge_json_extract_error', {
+        json_extract_error: parsedResult.error || 'LLM_NO_JSON_FOUND',
+      });
       fallbackUsed = true;
-      fallbackReason = 'NON_JSON';
+      fallbackReason = parsedResult.error || 'LLM_NO_JSON_FOUND';
     } else {
       const normalizedEvidence = Array.isArray(parsed.evidence_used)
         ? parsed.evidence_used.map((item) => String(item))
@@ -195,7 +203,7 @@ ${JSON.stringify(diffTextEvidence ?? { added: [], removed: [] })}
     }
   } catch {
     fallbackUsed = true;
-    fallbackReason = 'NON_JSON';
+    fallbackReason = 'LLM_NO_JSON_FOUND';
   }
 
   if (fallbackUsed) {
@@ -209,14 +217,15 @@ ${JSON.stringify(diffTextEvidence ?? { added: [], removed: [] })}
         reason: 'Brak wiarygodnych dowodów w dostarczonych danych.',
         evidence_used: [],
         llm_fallback_used: true,
-        llm_fallback_reason: fallbackReason || 'INVALID_TYPES',
+        llm_fallback_reason: fallbackReason || 'LLM_NO_JSON_FOUND',
       },
       raw,
       prompt,
       parsed_json_extracted: parsedJsonExtracted,
+      parsed_json_direct: parsedJsonDirect,
       evidence_validation_failed: evidenceValidationFailed,
       evidence_filtered_count: evidenceFilteredCount,
-      llm_fallback_reason: fallbackReason || 'INVALID_TYPES',
+      llm_fallback_reason: fallbackReason || 'LLM_NO_JSON_FOUND',
       fallbackUsed: true,
     };
   }
@@ -231,6 +240,7 @@ ${JSON.stringify(diffTextEvidence ?? { added: [], removed: [] })}
     raw,
     prompt,
     parsed_json_extracted: parsedJsonExtracted,
+    parsed_json_direct: parsedJsonDirect,
     evidence_validation_failed: false,
     evidence_filtered_count: evidenceFilteredCount,
     llm_fallback_reason: null,
@@ -791,6 +801,7 @@ export async function evaluateChangeWithLLM(
   let judgePrompt = null;
   let judgeRaw = null;
   let judgeParsedJsonExtracted = false;
+  let judgeParsedJsonDirect = false;
   let judgeEvidenceValidationFailed = false;
   let judgeSkippedReason = null;
   let judgeEvidenceFilteredCount = 0;
@@ -857,6 +868,7 @@ export async function evaluateChangeWithLLM(
       judgePrompt = judge.prompt;
       judgeRaw = judge.raw;
       judgeParsedJsonExtracted = judge.parsed_json_extracted === true;
+      judgeParsedJsonDirect = judge.parsed_json_direct === true;
       judgeEvidenceValidationFailed = judge.evidence_validation_failed === true;
       judgeEvidenceFilteredCount = judge.evidence_filtered_count || 0;
       judgeFallbackReason = judge.llm_fallback_reason || null;
@@ -891,6 +903,7 @@ export async function evaluateChangeWithLLM(
     judgePrompt = judge.prompt;
     judgeRaw = judge.raw;
     judgeParsedJsonExtracted = judge.parsed_json_extracted === true;
+    judgeParsedJsonDirect = judge.parsed_json_direct === true;
     judgeEvidenceValidationFailed = judge.evidence_validation_failed === true;
     judgeEvidenceFilteredCount = judge.evidence_filtered_count || 0;
     judgeFallbackReason = judge.llm_fallback_reason || null;
@@ -984,6 +997,7 @@ ${JSON.stringify(diff ?? null)}
     prompt_used: usedPrompt,
     raw_response: raw,
     parsed_json_extracted: judgeParsedJsonExtracted,
+    parsed_json_direct: judgeParsedJsonDirect,
     judge_skipped_reason: judgeSkippedReason,
     evidence_validation_failed: judgeEvidenceValidationFailed,
     evidence_filtered_count: judgeEvidenceFilteredCount,
