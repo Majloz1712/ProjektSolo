@@ -234,9 +234,28 @@ router.post("/:id/result", async (req, res) => {
     // pg będzie zwolniony niżej (po status update done/error)
   }
 
+  // wczytaj prompt monitora (żeby nie było ReferenceError i żeby zapisać go do snapshotu)
+  let monitorPrompt = null;
+  try {
+    monitorPrompt = await loadMonitorPrompt(pg, monitorId);
+    if (typeof monitorPrompt === "string") {
+      monitorPrompt = monitorPrompt.trim();
+      if (!monitorPrompt.length) monitorPrompt = null;
+    } else {
+      monitorPrompt = null;
+    }
+  } catch (err) {
+    logger?.warn?.("plugin_screenshot_load_prompt_error", {
+      monitorId,
+      error: String(err?.message || err),
+    });
+    monitorPrompt = null;
+  }
+
   try {
     const db = await ensureMongoDb();
     const snapshots = db.collection("snapshots");
+
     let monitorPrompt = null;
     try {
       monitorPrompt = await loadMonitorPrompt(pg, monitorId);
@@ -491,9 +510,26 @@ router.post("/:id/price", async (req, res) => {
     return res.status(500).json({ error: "PG_ERROR" });
   }
 
+  // prompt monitora (może być null)
+  let monitorPrompt = null;
+  try {
+    monitorPrompt = await loadMonitorPrompt(pg, monitorId);
+    if (typeof monitorPrompt === "string") {
+      monitorPrompt = monitorPrompt.trim();
+      if (!monitorPrompt.length) monitorPrompt = null;
+    }
+  } catch (err) {
+    logger?.warn?.("plugin_screenshot_load_prompt_error", {
+      monitorId,
+      error: String(err?.message || err),
+    });
+    monitorPrompt = null;
+  }
+
   try {
     const db = await ensureMongoDb();
     const snapshots = db.collection("snapshots");
+
     let monitorPrompt = null;
     try {
       monitorPrompt = await loadMonitorPrompt(pg, monitorId);
@@ -657,8 +693,27 @@ router.post("/:id/screenshot", async (req, res) => {
     return res.status(500).json({ error: "PG_ERROR" });
   }
 
+  // ✅ DODAJ TO: prompt monitora (może być null)
+  let monitorPrompt = null;
+  try {
+    monitorPrompt = await loadMonitorPrompt(pg, monitorId);
+    if (typeof monitorPrompt === "string") {
+      monitorPrompt = monitorPrompt.trim();
+      if (!monitorPrompt.length) monitorPrompt = null;
+    } else {
+      monitorPrompt = null;
+    }
+  } catch (err) {
+    logger?.warn?.("plugin_screenshot_load_prompt_error", {
+      monitorId,
+      error: String(err?.message || err),
+    });
+    monitorPrompt = null;
+  }
+
   try {
     const db = await ensureMongoDb();
+
     const snapshots = db.collection("snapshots");
 
     // znajdź NAJNOWSZY snapshot agenta (monitor_id + zadanie_id)
@@ -698,9 +753,8 @@ router.post("/:id/screenshot", async (req, res) => {
 
         final_url: url || snapshot.final_url || null,
       };
-      if (monitorPrompt) {
-        $set.llm_prompt = monitorPrompt;
-      }
+      $set.llm_prompt = monitorPrompt ?? null;
+
       await snapshots.updateOne(
         { _id: snapshot._id },
         { $set },
@@ -721,7 +775,8 @@ router.post("/:id/screenshot", async (req, res) => {
 
         mode: "plugin_screenshot",
         final_url: url || pluginTask.url || null,
-        llm_prompt: monitorPrompt || null,
+        llm_prompt: monitorPrompt ?? null,
+
         blocked: false,
         block_reason: null,
 
