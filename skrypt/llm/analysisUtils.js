@@ -112,3 +112,51 @@ export function parseJsonFromLLM(rawText) {
 
   return { ok: false, error: 'LLM_NO_JSON_FOUND' };
 }
+
+export function parseKeyValueBlock(
+  rawText,
+  { beginMarker = 'BEGIN_TRACKLY_ANALYSIS', endMarker = 'END_TRACKLY_ANALYSIS', keys = [] } = {},
+) {
+  const text = String(rawText || '');
+  if (!text.trim()) {
+    return { ok: false, error: 'LLM_NO_BLOCK_FOUND', mode: 'none' };
+  }
+
+  const beginIndex = text.indexOf(beginMarker);
+  if (beginIndex === -1) {
+    return { ok: false, error: 'LLM_NO_BLOCK_FOUND', mode: 'none' };
+  }
+  const endIndex = text.indexOf(endMarker, beginIndex + beginMarker.length);
+  if (endIndex === -1) {
+    return { ok: false, error: 'LLM_NO_BLOCK_FOUND', mode: 'none' };
+  }
+
+  const block = text.slice(beginIndex, endIndex + endMarker.length).trim();
+  const mode = text.trim() === block ? 'direct' : 'extracted';
+  const inner = text.slice(beginIndex + beginMarker.length, endIndex).trim();
+  const allowedKeys = new Set(keys);
+  const data = {};
+
+  const lines = inner.split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const eqIndex = trimmed.indexOf('=');
+    if (eqIndex === -1) continue;
+    const key = trimmed.slice(0, eqIndex).trim();
+    const value = trimmed.slice(eqIndex + 1).trim();
+    if (allowedKeys.size > 0 && !allowedKeys.has(key)) continue;
+    if (Object.prototype.hasOwnProperty.call(data, key)) {
+      const existing = data[key];
+      if (Array.isArray(existing)) {
+        existing.push(value);
+      } else {
+        data[key] = [existing, value];
+      }
+    } else {
+      data[key] = value;
+    }
+  }
+
+  return { ok: true, data, mode };
+}

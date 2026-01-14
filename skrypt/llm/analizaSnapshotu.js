@@ -7,6 +7,7 @@ import {
   parseTrackedFields,
   hashUserPrompt,
   parseJsonFromLLM,
+  parseKeyValueBlock,
 } from './analysisUtils.js';
 import { Double } from 'mongodb';
 import { performance } from 'node:perf_hooks';
@@ -193,6 +194,15 @@ function normalizeFeatures(input) {
   return input
     .map((item) => (item == null ? '' : String(item).trim()))
     .filter((item) => item.length > 0);
+}
+
+function parseFeatures(input) {
+  if (!input) return [];
+  const items = Array.isArray(input) ? input : [input];
+  return items
+    .flatMap((item) => String(item).split(/\r?\n|\|/))
+    .map((part) => part.replace(/^-+\s*/, '').trim())
+    .filter((part) => part.length > 0);
 }
 
 function normalizeUserPromptValue(input) {
@@ -765,23 +775,18 @@ ${normalizedUserPrompt}
 
   const prompt = `
 Jesteś asystentem analizującym strony e-commerce.
-Na podstawie danych strony wygeneruj zwięzły JSON:
+Zwróć WYŁĄCZNIE blok w formacie:
 
-{
-  "summary": "krótki opis (1-3 zdania) co to za strona",
-  "product_type": "np. 'obuwie męskie', 'kurtki damskie', 'lista ogłoszeń', 'strona produktu' itp.",
-  "main_currency": "np. 'PLN' lub null",
-  "price_hint": {
-    "min": number lub null,
-    "max": number lub null
-  },
-  "features": [
-    "krótka lista cech typu: 'lista ofert', 'ma filtry rozmiaru', 'zawiera promocje' itd."
-  ]
-}
+BEGIN_TRACKLY_ANALYSIS
+SUMMARY=krótki opis (1-3 zdania) co to za strona
+PRODUCT_TYPE=np. 'obuwie męskie', 'kurtki damskie', 'lista ogłoszeń', 'strona produktu'
+MAIN_CURRENCY=PLN|null
+PRICE_MIN=number|null
+PRICE_MAX=number|null
+FEATURE=- krótka lista cech typu: 'lista ofert', 'ma filtry rozmiaru', 'zawiera promocje'
+END_TRACKLY_ANALYSIS
 
-Zawsze zwróć poprawny JSON.
-ZWRAĆAJ WYŁĄCZNIE JSON — bez żadnego tekstu, komentarzy, markdown ani bloków kodu.
+ZWRÓĆ WYŁĄCZNIE TEN BLOK — bez żadnego dodatkowego tekstu, komentarzy, markdown ani bloków kodu.
 
 ${userPromptSection}
 ${dataBlock}
@@ -790,8 +795,9 @@ ${dataBlock}
 
   let rawResponse = null;
   let parsed = null;
-  let parsedJsonExtracted = false;
-  let parsedJsonDirect = false;
+  let parsedKvMode = 'none';
+  let parsedKvDirect = false;
+  let parsedKvExtracted = false;
   let fallbackUsed = false;
   let fallbackReason = null;
 
@@ -814,29 +820,30 @@ logger?.info('snapshot_analysis_llm_done', {
 });
 
 
-    const parsedResult = parseJsonFromLLM(rawResponse);
+    const parsedResult = parseKeyValueBlock(rawResponse, {
+      beginMarker: 'BEGIN_TRACKLY_ANALYSIS',
+      endMarker: 'END_TRACKLY_ANALYSIS',
+      keys: ['SUMMARY', 'PRODUCT_TYPE', 'MAIN_CURRENCY', 'PRICE_MIN', 'PRICE_MAX', 'FEATURE'],
+    });
     parsed = parsedResult.ok ? parsedResult.data : null;
-    parsedJsonDirect = parsedResult.mode === 'direct';
-    parsedJsonExtracted = parsedResult.mode === 'extracted';
-    logger?.info('analysis_json_extracted', {
+    parsedKvMode = parsedResult.mode || 'none';
+    parsedKvDirect = parsedKvMode === 'direct';
+    parsedKvExtracted = parsedKvMode === 'extracted';
+    logger?.info('analysis_kv_parse_mode', {
       snapshotId: _id.toString(),
-      extracted: parsedJsonExtracted,
+      kv_parse_mode: parsedKvMode,
     });
-    logger?.info('analysis_json_extract_used', {
+    logger?.info('analysis_kv_extract_used', {
       snapshotId: _id.toString(),
-      json_extract_used: parsedJsonExtracted,
-    });
-    logger?.info('analysis_json_parse_mode', {
-      snapshotId: _id.toString(),
-      json_parse_mode: parsedResult.mode || 'none',
+      kv_extract_used: parsedKvExtracted,
     });
     if (!parsed) {
-      logger?.info('analysis_json_extract_error', {
+      logger?.info('analysis_kv_extract_error', {
         snapshotId: _id.toString(),
-        json_extract_error: parsedResult.error || 'LLM_NO_JSON_FOUND',
+        kv_extract_error: parsedResult.error || 'LLM_NO_BLOCK_FOUND',
       });
       fallbackUsed = true;
-      fallbackReason = parsedResult.error || 'LLM_NO_JSON_FOUND';
+      fallbackReason = parsedResult.error || 'LLM_NO_BLOCK_FOUND';
     }
   } catch (err) {
     fallbackUsed = true;
@@ -845,21 +852,6 @@ logger?.info('snapshot_analysis_llm_done', {
 
   if (fallbackUsed) {
     const normalizedPrice = normalizePriceObject(mainPrice);
-    const combinedLower = `${url || ''} ${ocrTextFull || ''}`.toLowerCase();
-    const productType =
-      combinedLower.includes('allegro') || combinedLower.includes('oferta')
-        ? 'strona produktu'
-        : 'strona';
-    const priceValues = pluginPrices
-      .map((p) => toNumberMaybe(p?.value ?? p))
-      .filter((v) => typeof v === 'number');
-    if (typeof normalizedPrice.value === 'number') {
-      priceValues.push(normalizedPrice.value);
-    }
-    const priceHint =
-      priceValues.length > 0
-        ? { min: Math.min(...priceValues), max: Math.max(...priceValues) }
-        : { min: null, max: null };
 
     const fallbackDoc = {
       zadanieId: String(zadanie_id),
@@ -873,21 +865,24 @@ logger?.info('snapshot_analysis_llm_done', {
       model: process.env.OLLAMA_TEXT_MODEL || 'llama3',
       prompt,
 
-      summary: 'Strona produktu e-commerce.',
-      podsumowanie: 'Strona produktu e-commerce.',
-      product_type: productType,
-      main_currency: normalizedPrice.currency,
+      summary: '',
+      podsumowanie: '',
+      product_type: '',
+      main_currency: null,
       price: normalizedPrice,
       price_hint: priceHint,
       features: [],
       intent,
       extras,
       raw_response: rawResponse != null ? String(rawResponse) : null,
-      parsed_json_extracted: parsedJsonExtracted,
-      parsed_json_direct: parsedJsonDirect,
+      parsed_kv_mode: parsedKvMode,
+      parsed_kv_direct: parsedKvDirect,
+      parsed_kv_extracted: parsedKvExtracted,
+      parsed_json_extracted: false,
+      parsed_json_direct: false,
       fallback_used: true,
-      fallback_reason: 'NO_JSON_FROM_LLM',
-      error: 'LLM_NO_JSON_FOUND',
+      fallback_reason: 'NO_KV_FROM_LLM',
+      error: 'LLM_NO_BLOCK_FOUND',
     };
 
     logger?.warn('snapshot_analysis_llm_fallback', {
@@ -916,9 +911,14 @@ logger?.info('snapshot_analysis_llm_done', {
   // ✅ sukces – pełny dokument analizy
   const normalizedPrice = normalizePriceObject(mainPrice);
   const normalizedMainCurrency =
-    sanitizeNullableStringUtil(parsed?.main_currency) ||
+    sanitizeNullableStringUtil(parsed?.MAIN_CURRENCY) ||
     normalizedPrice.currency ||
     sanitizeNullableStringUtil(extracted_v2?.price?.currency);
+  const priceHint = {
+    min: toNumberMaybe(parsed?.PRICE_MIN ?? null),
+    max: toNumberMaybe(parsed?.PRICE_MAX ?? null),
+  };
+  const features = parseFeatures(parsed?.FEATURE);
   const doc = {
     zadanieId: String(zadanie_id),
     monitorId: String(monitor_id),
@@ -931,18 +931,21 @@ logger?.info('snapshot_analysis_llm_done', {
     model: process.env.OLLAMA_TEXT_MODEL || 'llama3',
     prompt,
 
-    summary: sanitizeRequiredStringUtil(parsed?.summary),
-    podsumowanie: sanitizeRequiredStringUtil(parsed?.summary),
-    product_type: sanitizeRequiredStringUtil(parsed?.product_type),
+    summary: sanitizeRequiredStringUtil(parsed?.SUMMARY),
+    podsumowanie: sanitizeRequiredStringUtil(parsed?.SUMMARY),
+    product_type: sanitizeRequiredStringUtil(parsed?.PRODUCT_TYPE),
     main_currency: normalizedMainCurrency,
     price: normalizedPrice,
-    price_hint: normalizePriceHint(parsed?.price_hint),
-    features: normalizeFeatures(parsed?.features),
+    price_hint: normalizePriceHint(priceHint),
+    features: normalizeFeatures(features),
     intent,
     extras,
     raw_response: rawResponse != null ? String(rawResponse) : null,
-    parsed_json_extracted: parsedJsonExtracted,
-    parsed_json_direct: parsedJsonDirect,
+    parsed_kv_mode: parsedKvMode,
+    parsed_kv_direct: parsedKvDirect,
+    parsed_kv_extracted: parsedKvExtracted,
+    parsed_json_extracted: false,
+    parsed_json_direct: false,
     fallback_used: false,
     fallback_reason: null,
     error: null,
