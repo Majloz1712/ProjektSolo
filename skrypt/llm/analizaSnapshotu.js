@@ -8,6 +8,8 @@ import {
   hashUserPrompt,
   parseJsonFromLLM,
   parseKeyValueBlock,
+  normalizePriceHint,
+  resolveEffectivePrompt,
 } from './analysisUtils.js';
 import { Double } from 'mongodb';
 import { performance } from 'node:perf_hooks';
@@ -17,6 +19,8 @@ const db = mongoClient.db('inzynierka');
 const analizyCol = db.collection('analizy');
 
 const MAX_TEXT_CHARS = 8000;
+const SYSTEM_DEFAULT_SNAPSHOT_PROMPT =
+  'Opisz krótko stronę produktu, typ produktu, walutę oraz cechy dostępne na stronie.';
 
 
 function toNumberMaybe(v) {
@@ -174,18 +178,6 @@ function normalizePriceObject(price) {
   return {
     value: typeof value === 'number' ? value : null,
     currency: sanitizeNullableStringUtil(price.currency),
-  };
-}
-
-function normalizePriceHint(input) {
-  if (!input || typeof input !== 'object') {
-    return { min: null, max: null };
-  }
-  const min = toNumberMaybe(input.min ?? null);
-  const max = toNumberMaybe(input.max ?? null);
-  return {
-    min: typeof min === 'number' ? min : null,
-    max: typeof max === 'number' ? max : null,
   };
 }
 
@@ -645,6 +637,10 @@ export async function ensureSnapshotAnalysis(snapshot, { force = false, logger, 
       : [];
 
   const normalizedUserPrompt = normalizeUserPromptValue(userPrompt);
+  const effectiveUserPrompt = resolveEffectivePrompt(
+    normalizedUserPrompt,
+    SYSTEM_DEFAULT_SNAPSHOT_PROMPT,
+  );
   const { trackedFields, strict } = parseTrackedFields(normalizedUserPrompt);
   const intent = {
     userPrompt: normalizedUserPrompt,
@@ -766,12 +762,10 @@ ${text}
 ${ocrPreview ? `\nOCR ze screenshotu (preview):\n${ocrPreview}\n` : ''}
 `;
 
-  const userPromptSection = normalizedUserPrompt
-    ? `
+  const userPromptSection = `
 Instrukcje użytkownika:
-${normalizedUserPrompt}
-`
-    : '';
+${effectiveUserPrompt}
+`;
 
   const prompt = `
 Jesteś asystentem analizującym strony e-commerce.
@@ -786,6 +780,7 @@ PRICE_MAX=number|null
 FEATURE=- krótka lista cech typu: 'lista ofert', 'ma filtry rozmiaru', 'zawiera promocje'
 END_TRACKLY_ANALYSIS
 
+Jeśli nie da się czegoś ustalić, wpisz null. FEATURE może wystąpić wielokrotnie (po jednej cesze na linię).
 ZWRÓĆ WYŁĄCZNIE TEN BLOK — bez żadnego dodatkowego tekstu, komentarzy, markdown ani bloków kodu.
 
 ${userPromptSection}
@@ -820,13 +815,9 @@ logger?.info('snapshot_analysis_llm_done', {
 });
 
 
-    const parsedResult = parseKeyValueBlock(rawResponse, {
-      beginMarker: 'BEGIN_TRACKLY_ANALYSIS',
-      endMarker: 'END_TRACKLY_ANALYSIS',
-      keys: ['SUMMARY', 'PRODUCT_TYPE', 'MAIN_CURRENCY', 'PRICE_MIN', 'PRICE_MAX', 'FEATURE'],
-    });
-    parsed = parsedResult.ok ? parsedResult.data : null;
-    parsedKvMode = parsedResult.mode || 'none';
+    const parsedResult = parseKeyValueBlock(rawResponse);
+    parsed = parsedResult.parsed;
+    parsedKvMode = parsedResult.parseMode || 'none';
     parsedKvDirect = parsedKvMode === 'direct';
     parsedKvExtracted = parsedKvMode === 'extracted';
     logger?.info('analysis_kv_parse_mode', {
@@ -835,13 +826,15 @@ logger?.info('snapshot_analysis_llm_done', {
     });
     logger?.info('analysis_kv_extract_used', {
       snapshotId: _id.toString(),
-      kv_extract_used: parsedKvExtracted,
+      kv_extract_used: parsedResult.extracted,
     });
-    if (!parsed) {
+    if (parsedResult.error) {
       logger?.info('analysis_kv_extract_error', {
         snapshotId: _id.toString(),
-        kv_extract_error: parsedResult.error || 'LLM_NO_BLOCK_FOUND',
+        kv_extract_error: parsedResult.error,
       });
+    }
+    if (!parsed) {
       fallbackUsed = true;
       fallbackReason = parsedResult.error || 'LLM_NO_BLOCK_FOUND';
     }
@@ -852,6 +845,9 @@ logger?.info('snapshot_analysis_llm_done', {
 
   if (fallbackUsed) {
     const normalizedPrice = normalizePriceObject(mainPrice);
+    const fallbackCurrency =
+      ocrPrice?.currency ?? normalizeCurrencyFromText(ocrTextFull) ?? null;
+    const price_hint = normalizePriceHint(null);
 
     const fallbackDoc = {
       zadanieId: String(zadanie_id),
@@ -867,10 +863,10 @@ logger?.info('snapshot_analysis_llm_done', {
 
       summary: '',
       podsumowanie: '',
-      product_type: '',
-      main_currency: null,
+      product_type: null,
+      main_currency: fallbackCurrency,
       price: normalizedPrice,
-      price_hint: priceHint,
+      price_hint,
       features: [],
       intent,
       extras,
@@ -881,7 +877,7 @@ logger?.info('snapshot_analysis_llm_done', {
       parsed_json_extracted: false,
       parsed_json_direct: false,
       fallback_used: true,
-      fallback_reason: 'NO_KV_FROM_LLM',
+      fallback_reason: 'NO_BLOCK_FROM_LLM',
       error: 'LLM_NO_BLOCK_FOUND',
     };
 
@@ -911,14 +907,14 @@ logger?.info('snapshot_analysis_llm_done', {
   // ✅ sukces – pełny dokument analizy
   const normalizedPrice = normalizePriceObject(mainPrice);
   const normalizedMainCurrency =
-    sanitizeNullableStringUtil(parsed?.MAIN_CURRENCY) ||
+    sanitizeNullableStringUtil(parsed?.main_currency) ||
     normalizedPrice.currency ||
     sanitizeNullableStringUtil(extracted_v2?.price?.currency);
-  const priceHint = {
-    min: toNumberMaybe(parsed?.PRICE_MIN ?? null),
-    max: toNumberMaybe(parsed?.PRICE_MAX ?? null),
-  };
-  const features = parseFeatures(parsed?.FEATURE);
+  let price_hint = normalizePriceHint(parsed?.price_hint);
+  if (!price_hint || typeof price_hint !== 'object') {
+    price_hint = { min: null, max: null };
+  }
+  const features = parseFeatures(parsed?.features);
   const doc = {
     zadanieId: String(zadanie_id),
     monitorId: String(monitor_id),
@@ -931,12 +927,12 @@ logger?.info('snapshot_analysis_llm_done', {
     model: process.env.OLLAMA_TEXT_MODEL || 'llama3',
     prompt,
 
-    summary: sanitizeRequiredStringUtil(parsed?.SUMMARY),
-    podsumowanie: sanitizeRequiredStringUtil(parsed?.SUMMARY),
-    product_type: sanitizeRequiredStringUtil(parsed?.PRODUCT_TYPE),
+    summary: sanitizeRequiredStringUtil(parsed?.summary),
+    podsumowanie: sanitizeRequiredStringUtil(parsed?.summary),
+    product_type: sanitizeRequiredStringUtil(parsed?.product_type),
     main_currency: normalizedMainCurrency,
     price: normalizedPrice,
-    price_hint: normalizePriceHint(priceHint),
+    price_hint,
     features: normalizeFeatures(features),
     intent,
     extras,
