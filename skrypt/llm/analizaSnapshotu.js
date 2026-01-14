@@ -4,6 +4,9 @@ import { generateTextWithOllama } from './ollamaClient.js';
 import {
   sanitizeNullableString as sanitizeNullableStringUtil,
   sanitizeRequiredString as sanitizeRequiredStringUtil,
+  parseTrackedFields,
+  hashUserPrompt,
+  extractJsonFromText,
 } from './analysisUtils.js';
 import { Double } from 'mongodb';
 import { performance } from 'node:perf_hooks';
@@ -192,23 +195,337 @@ function normalizeFeatures(input) {
     .filter((item) => item.length > 0);
 }
 
+function normalizeUserPromptValue(input) {
+  const trimmed = (input ?? '').toString().trim();
+  return trimmed.length ? trimmed : null;
+}
+
+function buildUnknownExtra(source) {
+  return {
+    value: 'unknown',
+    confidence: 0,
+    evidence: [],
+    source: source || 'ocr',
+  };
+}
+
+function normalizeEvidenceArray(input) {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((item) => (item == null ? '' : String(item).trim()))
+    .filter((item) => item.length > 0);
+}
+
+function buildContextPack({ title, description, text, ocrText, pluginPrices }) {
+  const extractedText = [title, description, text]
+    .map((item) => (item == null ? '' : String(item).trim()))
+    .filter((item) => item.length > 0)
+    .join('\n');
+
+  const ocr = String(ocrText || '');
+  const plugin = pluginPrices && pluginPrices.length ? JSON.stringify(pluginPrices) : '';
+
+  const combined = [extractedText, plugin, ocr].filter((item) => item.length > 0).join('\n');
+
+  return {
+    extractedText,
+    ocrText: ocr,
+    pluginText: plugin,
+    contextPackText: combined,
+  };
+}
+
+function pickEvidenceSource(evidence, contextPack) {
+  if (!evidence) return null;
+  if (contextPack.ocrText.includes(evidence)) return 'ocr';
+  if (contextPack.extractedText.includes(evidence)) return 'extracted';
+  if (contextPack.pluginText.includes(evidence)) return 'plugin';
+  return null;
+}
+
+function sanitizeExtrasFromLLM({ trackedFields, rawExtras, contextPack }) {
+  const extras = {};
+  const allowedSources = new Set(['ocr', 'extracted', 'plugin']);
+
+  for (const field of trackedFields) {
+    const candidate = rawExtras && typeof rawExtras === 'object' ? rawExtras[field] : null;
+    if (!candidate || typeof candidate !== 'object') {
+      extras[field] = buildUnknownExtra('ocr');
+      continue;
+    }
+
+    const evidence = normalizeEvidenceArray(candidate.evidence);
+    const source = allowedSources.has(candidate.source) ? candidate.source : 'ocr';
+    const contextText =
+      source === 'ocr'
+        ? contextPack.ocrText
+        : source === 'extracted'
+          ? contextPack.extractedText
+          : source === 'plugin'
+            ? contextPack.pluginText
+            : '';
+    const packText = contextPack.contextPackText || '';
+
+    if (!evidence.length || !packText) {
+      extras[field] = buildUnknownExtra(source);
+      continue;
+    }
+
+    const evidenceOk = evidence.every((snippet) => contextText.includes(snippet));
+    const evidenceOkInPack = evidence.every((snippet) => packText.includes(snippet));
+    if (!evidenceOk || !evidenceOkInPack) {
+      extras[field] = buildUnknownExtra(source);
+      continue;
+    }
+
+    let value = candidate.value;
+    if (field === 'main_price' || field === 'review_count' || field === 'rating') {
+      value = toNumberMaybe(value);
+    }
+
+    if (value == null) {
+      extras[field] = buildUnknownExtra(source);
+      continue;
+    }
+
+    const confidence =
+      typeof candidate.confidence === 'number' && Number.isFinite(candidate.confidence)
+        ? Math.max(0, Math.min(1, candidate.confidence))
+        : 0;
+
+    extras[field] = {
+      value,
+      confidence,
+      evidence,
+      source,
+    };
+  }
+
+  return extras;
+}
+
+function extractReviewCountFromText(text) {
+  const s = String(text || '');
+  const re = /(\d+)\s*(opinii|opinie|reviews|review)/i;
+  const match = s.match(re);
+  if (!match) return null;
+  const value = toNumberMaybe(match[1]);
+  if (value == null) return null;
+  return { value, evidence: match[0] };
+}
+
+function extractRatingFromText(text) {
+  const s = String(text || '');
+  const slashMatch = s.match(/(\d+(?:[.,]\d+)?)\s*\/\s*5/i);
+  if (slashMatch) {
+    const value = toNumberMaybe(slashMatch[1]);
+    if (value != null) return { value, evidence: slashMatch[0] };
+  }
+  const ratingMatch = s.match(/rating\s*(\d+(?:[.,]\d+)?)/i);
+  if (!ratingMatch) return null;
+  const value = toNumberMaybe(ratingMatch[1]);
+  if (value == null) return null;
+  return { value, evidence: ratingMatch[0] };
+}
+
+function extractPriceEvidenceFromText(text) {
+  const s = String(text || '');
+  const priceWithCurrRe = /(\d[\d\s.,]*\d?)\s*(zł|pln|eur|€|usd|\$|£)/gi;
+  const match = priceWithCurrRe.exec(s);
+  if (!match) return null;
+  const value = toNumberMaybe(match[1]);
+  if (value == null) return null;
+  const currency = normalizeCurrencyFromText(match[2]);
+  return { value, currency, evidence: match[0] };
+}
+
+function findPriceEvidenceForValue(text, targetValue) {
+  if (targetValue == null) return null;
+  const s = String(text || '');
+  const priceWithCurrRe = /(\d[\d\s.,]*\d?)\s*(zł|pln|eur|€|usd|\$|£)/gi;
+  let match;
+  while ((match = priceWithCurrRe.exec(s))) {
+    const value = toNumberMaybe(match[1]);
+    if (value == null) continue;
+    if (Number(value) === Number(targetValue)) {
+      const currency = normalizeCurrencyFromText(match[2]);
+      return { value, currency, evidence: match[0] };
+    }
+  }
+  return null;
+}
+
+async function extractExtrasForTrackedFields({
+  trackedFields,
+  contextPack,
+  extracted_v2,
+  pluginPrices,
+  mainPrice,
+  logger,
+}) {
+  if (!trackedFields.length) return {};
+
+  const basePrompt = `
+Jesteś ekstraktorem pól z danych wejściowych.
+Zwróć WYŁĄCZNIE JSON w formacie:
+{
+  "extras": {
+    "<field>": {
+      "value": number lub "unknown",
+      "confidence": number (0..1),
+      "evidence": ["dokładne cytaty z danych wejściowych"],
+      "source": "ocr" | "extracted" | "plugin"
+    }
+  }
+}
+
+Zwracaj WYŁĄCZNIE pola: ${trackedFields.join(', ')}.
+Nie zgaduj. Jeśli nie potrafisz poprzeć wartości cytatem z danych wejściowych -> ustaw value="unknown", confidence=0, evidence=[].
+Nie używaj liczb z instrukcji użytkownika jako źródła prawdy.
+
+INPUT DATA (OCR/DOM/PLUGIN):
+${contextPack.contextPackText || '[EMPTY]'}
+`.trim();
+
+  let rawResponse = null;
+  let rawExtras = null;
+
+  try {
+    rawResponse = await generateTextWithOllama({
+      prompt: basePrompt,
+      logger,
+      temperature: 0,
+    });
+
+    const parsed = parseJsonFromResponse(rawResponse);
+    if (parsed && typeof parsed === 'object') {
+      rawExtras = parsed.extras || parsed;
+    }
+  } catch (err) {
+    logger?.warn?.('snapshot_extras_llm_error', {
+      error: err?.message || String(err),
+    });
+  }
+
+  if (rawExtras && typeof rawExtras === 'object') {
+    return sanitizeExtrasFromLLM({
+      trackedFields,
+      rawExtras,
+      contextPack,
+    });
+  }
+
+  const fallbackRawExtras = {};
+  const combinedText = contextPack.contextPackText;
+
+  if (trackedFields.includes('main_price')) {
+    const fallbackValue = typeof mainPrice?.value === 'number' ? mainPrice.value : null;
+
+    if (fallbackValue != null) {
+      const extractedPriceRaw = extracted_v2?.price
+        ? typeof extracted_v2.price === 'string'
+          ? extracted_v2.price
+          : `${extracted_v2.price?.value ?? ''} ${extracted_v2.price?.currency ?? ''}`.trim()
+        : '';
+      const extractedParsed = extracted_v2?.price ? parseExtractorPrice(extracted_v2.price) : null;
+      const pluginMain = pluginPrices.length ? pickMainPriceFromPluginPrices(pluginPrices) : null;
+
+      if (extracted_v2?.price) {
+        if (extractedParsed && typeof extractedParsed.value === 'number' && extractedParsed.value === fallbackValue) {
+          const evidence = extractedPriceRaw && combinedText.includes(extractedPriceRaw) ? extractedPriceRaw : null;
+          if (evidence) {
+            fallbackRawExtras.main_price = {
+              value: extractedParsed.value,
+              confidence: 0.6,
+              evidence: [evidence],
+              source: 'extracted',
+            };
+          }
+        }
+      }
+
+      if (!fallbackRawExtras.main_price && pluginPrices.length) {
+        if (pluginMain && typeof pluginMain.value === 'number' && pluginMain.value === fallbackValue) {
+          const matching = pluginPrices.find((p) => toNumberMaybe(p?.value ?? p) === pluginMain.value);
+          const evidence = matching ? JSON.stringify(matching) : null;
+          if (evidence && combinedText.includes(evidence)) {
+            fallbackRawExtras.main_price = {
+              value: pluginMain.value,
+              confidence: 0.5,
+              evidence: [evidence],
+              source: 'plugin',
+            };
+          }
+        }
+      }
+
+      if (!fallbackRawExtras.main_price) {
+        const evidence =
+          findPriceEvidenceForValue(combinedText, fallbackValue) ||
+          extractPriceEvidenceFromText(combinedText);
+        if (evidence && typeof evidence.value === 'number' && evidence.value === fallbackValue) {
+          fallbackRawExtras.main_price = {
+            value: evidence.value,
+            confidence: 0.5,
+            evidence: [evidence.evidence],
+            source: 'ocr',
+          };
+        }
+      }
+
+      if (!fallbackRawExtras.main_price) {
+        const inferredSource =
+          pluginMain && pluginMain.value === fallbackValue
+            ? 'plugin'
+            : extractedParsed && extractedParsed.value === fallbackValue
+              ? 'extracted'
+              : 'ocr';
+        fallbackRawExtras.main_price = {
+          value: fallbackValue,
+          confidence: 0,
+          evidence: [],
+          source: inferredSource,
+        };
+      }
+    }
+  }
+
+  if (trackedFields.includes('review_count')) {
+    const reviewMatch = extractReviewCountFromText(combinedText);
+    if (reviewMatch) {
+      const source = pickEvidenceSource(reviewMatch.evidence, contextPack);
+      fallbackRawExtras.review_count = {
+        value: reviewMatch.value,
+        confidence: 0.5,
+        evidence: [reviewMatch.evidence],
+        source: source || 'ocr',
+      };
+    }
+  }
+
+  if (trackedFields.includes('rating')) {
+    const ratingMatch = extractRatingFromText(combinedText);
+    if (ratingMatch) {
+      const source = pickEvidenceSource(ratingMatch.evidence, contextPack);
+      fallbackRawExtras.rating = {
+        value: ratingMatch.value,
+        confidence: 0.5,
+        evidence: [ratingMatch.evidence],
+        source: source || 'ocr',
+      };
+    }
+  }
+
+  return sanitizeExtrasFromLLM({
+    trackedFields,
+    rawExtras: fallbackRawExtras,
+    contextPack,
+  });
+}
+
 function parseJsonFromResponse(rawResponse) {
-  const trimmed = String(rawResponse || '').trim();
-  if (!trimmed) return null;
-  try {
-    return JSON.parse(trimmed);
-  } catch (err) {
-    // ignore and try extraction below
-  }
-  const start = trimmed.indexOf('{');
-  const end = trimmed.lastIndexOf('}');
-  if (start === -1 || end === -1 || end <= start) return null;
-  const candidate = trimmed.slice(start, end + 1);
-  try {
-    return JSON.parse(candidate);
-  } catch (err) {
-    return null;
-  }
+  const extracted = extractJsonFromText(rawResponse);
+  return extracted.ok ? extracted.value : null;
 }
 
 async function safeInsertAnalysis(doc, { logger, snapshotId } = {}) {
@@ -317,6 +634,16 @@ export async function ensureSnapshotAnalysis(snapshot, { force = false, logger, 
       ? snapshot.plugin_prices
       : [];
 
+  const normalizedUserPrompt = normalizeUserPromptValue(userPrompt);
+  const { trackedFields, strict } = parseTrackedFields(normalizedUserPrompt);
+  const intent = {
+    userPrompt: normalizedUserPrompt,
+    userPromptHash: hashUserPrompt(normalizedUserPrompt),
+    schemaVersion: 'extras_v1',
+    trackedFields,
+    strict,
+  };
+
   const ocrPrice = extractPriceHintFromText(ocrTextFull);
   const extractorMain = parseExtractorPrice(extracted_v2?.price);
 const pluginMain = pickMainPriceFromPluginPrices(pluginPrices);
@@ -332,6 +659,22 @@ const mainPrice =
 
 
   let priceInfo;
+  const contextPack = buildContextPack({
+    title,
+    description,
+    text,
+    ocrText: ocrTextFull,
+    pluginPrices,
+  });
+
+  const extras = await extractExtrasForTrackedFields({
+    trackedFields,
+    contextPack,
+    extracted_v2,
+    pluginPrices,
+    mainPrice,
+    logger,
+  });
 
   // extractor: obsłuż i "object", i "string"
   if (extracted_v2?.price) {
@@ -380,6 +723,8 @@ const mainPrice =
       price: { value: null, currency: null },
       price_hint: { min: null, max: null },
       features: [],
+      intent,
+      extras,
       raw_response: null,
       error: 'NO_INPUT_DATA',
     };
@@ -411,27 +756,14 @@ ${text}
 ${ocrPreview ? `\nOCR ze screenshotu (preview):\n${ocrPreview}\n` : ''}
 `;
 
-  const prompt = userPrompt
+  const userPromptSection = normalizedUserPrompt
     ? `
-${userPrompt}
-
-Zwróć WYŁĄCZNIE JSON w formacie:
-{
-  "summary": "krótki opis (1-3 zdania) co to za strona",
-  "product_type": "np. 'obuwie męskie', 'kurtki damskie', 'lista ogłoszeń', 'strona produktu' itp.",
-  "main_currency": "np. 'PLN' lub null",
-  "price_hint": {
-    "min": number lub null,
-    "max": number lub null
-  },
-  "features": [
-    "krótka lista cech typu: 'lista ofert', 'ma filtry rozmiaru', 'zawiera promocje' itd."
-  ]
-}
-
-${dataBlock}
+Instrukcje użytkownika:
+${normalizedUserPrompt}
 `
-    : `
+    : '';
+
+  const prompt = `
 Jesteś asystentem analizującym strony e-commerce.
 Na podstawie danych strony wygeneruj zwięzły JSON:
 
@@ -451,19 +783,24 @@ Na podstawie danych strony wygeneruj zwięzły JSON:
 Zawsze zwróć poprawny JSON.
 ZWRAĆAJ WYŁĄCZNIE JSON — bez żadnego tekstu, komentarzy, markdown ani bloków kodu.
 
+${userPromptSection}
 ${dataBlock}
 `;
 
 
   let rawResponse = null;
   let parsed = null;
+  let parsedJsonExtracted = false;
 
   try {
     const tLlm0 = performance.now();
+const analysisTimeoutMsRaw = Number(process.env.OLLAMA_TIMEOUT_MS_ANALYSIS);
+const analysisTimeoutMs = Number.isFinite(analysisTimeoutMsRaw) ? analysisTimeoutMsRaw : undefined;
 rawResponse = await generateTextWithOllama({
   prompt,
   logger,
-  temperature: 0,
+  options: { temperature: 0 },
+  timeoutMs: analysisTimeoutMs,
 });
 logger?.info('snapshot_analysis_llm_done', {
   snapshotId: _id.toString(),
@@ -474,7 +811,17 @@ logger?.info('snapshot_analysis_llm_done', {
 });
 
 
-    parsed = parseJsonFromResponse(rawResponse);
+    const extracted = extractJsonFromText(rawResponse);
+    parsed = extracted.ok ? extracted.value : null;
+    parsedJsonExtracted = extracted.ok ? extracted.extracted === true : false;
+    logger?.info('analysis_json_extracted', {
+      snapshotId: _id.toString(),
+      extracted: parsedJsonExtracted,
+    });
+    logger?.info('analysis_json_extract_used', {
+      snapshotId: _id.toString(),
+      json_extract_used: extracted.ok && extracted.extracted === true,
+    });
     if (!parsed) {
       throw new Error('LLM_NON_JSON_RESPONSE');
     }
@@ -500,7 +847,10 @@ logger?.info('snapshot_analysis_llm_done', {
       price: normalizedPrice,
       price_hint: { min: null, max: null },
       features: [],
+      intent,
+      extras,
       raw_response: rawResponse != null ? String(rawResponse) : null,
+      parsed_json_extracted: parsedJsonExtracted,
       error: err?.message || String(err),
     };
 
@@ -554,7 +904,10 @@ logger?.info('snapshot_analysis_llm_done', {
     price: normalizedPrice,
     price_hint: normalizePriceHint(parsed?.price_hint),
     features: normalizeFeatures(parsed?.features),
+    intent,
+    extras,
     raw_response: rawResponse != null ? String(rawResponse) : null,
+    parsed_json_extracted: parsedJsonExtracted,
     error: null,
   };
 
