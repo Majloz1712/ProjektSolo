@@ -11,6 +11,11 @@ import {
   getSnapshotAnalysis,
 } from "./diffEngine.js";
 import {
+  normalizeUserPrompt as normalizeUserPromptUtil,
+  resolveEffectivePrompt,
+  SYSTEM_DEFAULT_JUDGE_PROMPT,
+} from "./analysisUtils.js";
+import {
   evaluateChangeWithLLM,
   saveDetectionAndNotification,
 } from "./ocenaZmianyLLM.js";
@@ -65,13 +70,6 @@ async function setTaskAnalysisMongoId(zadanieId, analizaId, opts = {}) {
  
  
  
-function normalizeUserPrompt(rawPrompt) {
-  const normalized = (rawPrompt || '').toString().trim();
-  if (!normalized) return null;
-  if (normalized.toLowerCase() === 'cena') return null;
-  return normalized;
-}
-
 export async function handleNewSnapshot(snapshotRef, options = {}) {
   const { forceAnalysis = false, logger, userPrompt } = options;
   const log = logger || console;
@@ -101,7 +99,8 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
   });
 
   const tPipeline0 = performance.now();
-  const normalizedUserPrompt = normalizeUserPrompt(userPrompt || snapshot?.llm_prompt);
+  const normalizedUserPrompt = normalizeUserPromptUtil(userPrompt || snapshot?.llm_prompt);
+  const effectivePrompt = resolveEffectivePrompt(normalizedUserPrompt, SYSTEM_DEFAULT_JUDGE_PROMPT);
 
    // 1) OCR nowego snapshotu (tesseract) – zapis do snapshotu + update obiektu w pamięci
   const tOcrNew0 = performance.now();
@@ -209,19 +208,41 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
     hasAnyChange: !!diff?.hasAnyChange,
   });
 
+  const trackedFields = Array.isArray(newAnalysis?.intent?.trackedFields)
+    ? newAnalysis.intent.trackedFields
+    : Array.isArray(prevAnalysis?.intent?.trackedFields)
+      ? prevAnalysis.intent.trackedFields
+      : [];
+  const trackedExtrasChanged = diff?.metrics?.trackedExtrasChanged === true;
+
   const screenshotChanged = !!diff?.metrics?.screenshotChanged;
   const analysisPriceChanged =
     typeof prevAnalysis?.price?.value === "number" &&
     typeof newAnalysis?.price?.value === "number" &&
     prevAnalysis.price.value !== newAnalysis.price.value;
 
-  if (!diff?.hasAnyChange && !screenshotChanged && !analysisPriceChanged) {
-    if (normalizedUserPrompt) {
-      log.info("pipeline_no_change_overridden_by_user_prompt", {
+  if (trackedFields.length > 0) {
+    const pluginPricesChanged = diff?.metrics?.pluginPricesChanged === true;
+    const shouldKeepForTracked =
+      trackedFields.includes('main_price') && pluginPricesChanged;
+
+    if (!trackedExtrasChanged && !shouldKeepForTracked) {
+      log.info("pipeline_no_tracked_field_change", {
         snapshotId: snapshotIdStr,
         monitorId: snapshot.monitor_id,
+        trackedFields,
       });
-    } else {
+
+      log.info("pipeline_done", {
+        snapshotId: snapshotIdStr,
+        monitorId: snapshot.monitor_id,
+        result: "no_tracked_change",
+        durationMs: Math.round(performance.now() - tPipeline0),
+      });
+
+      return;
+    }
+  } else if (!diff?.hasAnyChange && !screenshotChanged && !analysisPriceChanged) {
     log.info("[pipeline] Brak zmian – kończę na warstwie 2.", {
       snapshotId: snapshotIdStr,
       monitorId: snapshot.monitor_id,
@@ -235,7 +256,6 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
     });
 
     return;
-    }
   }
 
   const tLlm0 = performance.now();
@@ -249,7 +269,7 @@ const llmDecision = await evaluateChangeWithLLM(
     diff,
     prevOcr: prevOcr || null,
     newOcr: newOcr || null,
-    userPrompt: normalizedUserPrompt,
+    userPrompt: effectivePrompt,
   },
   { logger },
 );
@@ -263,17 +283,11 @@ const llmDecision = await evaluateChangeWithLLM(
     importantByLLM: !!llmDecision?.parsed?.important,
   });
 
-  const pluginPricesChanged = !!(
-    diff &&
-    diff.metrics &&
-    diff.metrics.pluginPricesChanged
-  );
-
-const importantByLLM = !!(llmDecision?.parsed?.important);
-
-
-const machinePriceChanged = !!(diff?.metrics?.price && diff.metrics.price.absChange !== 0);
-const isImportant = pluginPricesChanged || machinePriceChanged || importantByLLM;
+  const importantByLLM = !!(llmDecision?.parsed?.important);
+  const machinePriceChanged = !!(diff?.metrics?.price && diff.metrics.price.absChange !== 0);
+  const isImportant = trackedFields.length > 0
+    ? trackedExtrasChanged
+    : importantByLLM || machinePriceChanged;
 
 
   if (!isImportant) {
@@ -288,21 +302,18 @@ const isImportant = pluginPricesChanged || machinePriceChanged || importantByLLM
   }
 
   // Jeśli dotarliśmy tutaj, to albo LLM, albo twarde reguły mówią "ważne"
-  const fallbackDecision = {
+  const decisionToSave = llmDecision?.parsed || {
     important: true,
-    category: pluginPricesChanged ? "price_change" : "llm_error",
-    importance_reason: pluginPricesChanged
-      ? "Wymuszona istotność na podstawie diff.metrics.pluginPricesChanged == true."
-      : "Brak decyzji LLM; zapis wymuszony regułą.",
-    short_title: pluginPricesChanged
-      ? "Zmiana cen na monitorowanej stronie"
-      : "Zmiana uznana za istotną przez reguły",
-    short_description: pluginPricesChanged
-      ? "Wykryto zmianę cen (plugin_prices) na monitorowanej stronie."
-      : "Zmiana uznana za istotną na podstawie twardych reguł.",
+    category: "llm_error",
+    importance_reason: "Brak decyzji oceny; zapis wymuszony regułą.",
+    short_title: "Zmiana uznana za istotną przez reguły",
+    short_description: "Zmiana uznana za istotną na podstawie twardych reguł.",
   };
 
-const decisionToSave = llmDecision?.parsed || fallbackDecision;
+  const diffToSave = {
+    ...diff,
+    evidence_used: decisionToSave?.evidence_used || [],
+  };
 
   const tSave0 = performance.now();
 const { detectionId: wykrycieId } = await saveDetectionAndNotification(
@@ -311,7 +322,7 @@ const { detectionId: wykrycieId } = await saveDetectionAndNotification(
     zadanieId, // <- spójnie
     url: snapshot.url,
     snapshotMongoId: snapshot._id,
-    diff,
+    diff: diffToSave,
     prevOcr: prevSnapshot?.vision_ocr || null,
     newOcr: snapshot?.vision_ocr || null,
     llmDecision: decisionToSave,
