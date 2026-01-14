@@ -870,7 +870,7 @@ logger?.info('snapshot_analysis_llm_done', {
       product_type: '',
       main_currency: null,
       price: normalizedPrice,
-      price_hint: { min: null, max: null },
+      price_hint: priceHint,
       features: [],
       intent,
       extras,
