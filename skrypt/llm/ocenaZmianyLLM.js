@@ -10,6 +10,12 @@
 //   i podobieństwo jest naprawdę niskie (żeby nie spamować).
 
 import { generateTextWithOllama } from './ollamaClient.js';
+import {
+  extractJsonFromText,
+  normalizeUserPrompt,
+  resolveEffectivePrompt,
+  SYSTEM_DEFAULT_JUDGE_PROMPT,
+} from './analysisUtils.js';
 
 import { pool } from '../polaczeniePG.js';
 import { mongoClient } from '../polaczenieMDB.js';
@@ -67,16 +73,25 @@ function safeParseJsonFromLLM(raw) {
   }
 }
 
-function validateEvidenceUsed(evidenceUsed, diffReasons, diffTextEvidence) {
-  if (!Array.isArray(evidenceUsed)) return false;
-  const reasonsStr = JSON.stringify(diffReasons ?? []);
-  const evidenceStr = JSON.stringify(diffTextEvidence ?? {});
+function normalizeEvidenceText(input) {
+  return String(input || '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
-  return evidenceUsed.every((item) => {
-    const snippet = String(item || '').trim();
+function filterEvidenceUsed(evidenceUsed, diffReasons, diffTextEvidence) {
+  if (!Array.isArray(evidenceUsed)) return { filtered: [], dropped: 0 };
+  const reasonsStr = normalizeEvidenceText(JSON.stringify(diffReasons ?? []));
+  const evidenceStr = normalizeEvidenceText(JSON.stringify(diffTextEvidence ?? {}));
+
+  const filtered = evidenceUsed.filter((item) => {
+    const snippet = normalizeEvidenceText(item);
     if (!snippet) return false;
     return reasonsStr.includes(snippet) || evidenceStr.includes(snippet);
   });
+
+  return { filtered, dropped: evidenceUsed.length - filtered.length };
 }
 
 async function judgeImportanceWithLLM(
@@ -92,16 +107,18 @@ Masz DOKŁADNIE te dane wejściowe:
 - diffTextEvidence
 - userPrompt
 
-Twoje zadanie: oceń istotność zmiany zgodnie z userPrompt.
-NIE WOLNO używać wiedzy spoza podanych danych. Nie masz dostępu do OCR/HTML/screenshotów.
-Jeśli w danych nie ma dowodu spełniającego kryteria użytkownika -> important=false.
+  Twoje zadanie: oceń istotność zmiany zgodnie z userPrompt.
+  NIE WOLNO używać wiedzy spoza podanych danych. Nie masz dostępu do OCR/HTML/screenshotów.
+  Jeśli w danych nie ma dowodu spełniającego kryteria użytkownika -> important=false.
+  evidence_used musi zawierać wyłącznie dokładne stringi skopiowane z diffReasons lub diffTextEvidence (bez parafraz).
+  Nie wolno dodawać nowych tekstów do evidence_used.
 
 Zwróć WYŁĄCZNIE JSON:
 {
   "important": boolean,
   "category": string,
   "reason": string,
-  "evidence_used": ["krótkie cytaty z diffTextEvidence lub diffReasons"]
+  "evidence_used": ["dokładne cytaty skopiowane z diffTextEvidence lub diffReasons"]
 }
 
 userPrompt:
@@ -130,27 +147,60 @@ ${JSON.stringify(diffTextEvidence ?? { added: [], removed: [] })}
   let raw = null;
   let parsed = null;
   let fallbackUsed = false;
+  let parsedJsonExtracted = false;
+  let evidenceValidationFailed = false;
+  let fallbackReason = null;
+  let evidenceFilteredCount = 0;
 
   try {
+    const judgeTimeoutMsRaw = Number(process.env.OLLAMA_TIMEOUT_MS_JUDGE);
+    const judgeTimeoutMs = Number.isFinite(judgeTimeoutMsRaw) ? judgeTimeoutMsRaw : undefined;
     raw = await generateTextWithOllama({
       prompt,
       model: process.env.OLLAMA_TEXT_MODEL || process.env.LLM_MODEL || 'llama3',
-      temperature: 0,
+      options: { temperature: 0 },
+      timeoutMs: judgeTimeoutMs,
     });
 
-    parsed = safeParseJsonFromLLM(raw);
+    const extracted = extractJsonFromText(raw);
+    parsed = extracted.ok ? extracted.value : null;
+    parsedJsonExtracted = extracted.ok ? extracted.extracted === true : false;
+    logger?.info?.('judge_json_extracted', {
+      extracted: parsedJsonExtracted,
+    });
+    logger?.info?.('judge_json_extract_used', {
+      json_extract_used: extracted.ok && extracted.extracted === true,
+    });
     if (!parsed || typeof parsed.important !== 'boolean') {
       fallbackUsed = true;
-    } else if (!validateEvidenceUsed(parsed.evidence_used, diffReasons, diffTextEvidence)) {
-      fallbackUsed = true;
+      fallbackReason = 'NON_JSON';
+    } else {
+      const normalizedEvidence = Array.isArray(parsed.evidence_used)
+        ? parsed.evidence_used.map((item) => String(item))
+        : [];
+      const filtered = filterEvidenceUsed(normalizedEvidence, diffReasons, diffTextEvidence);
+      evidenceFilteredCount = filtered.dropped;
+      parsed.evidence_used = filtered.filtered;
+      logger?.info?.('judge_evidence_filtered_count', {
+        dropped: filtered.dropped,
+      });
+      if (parsed.important === true && parsed.evidence_used.length === 0) {
+        evidenceValidationFailed = true;
+        fallbackUsed = true;
+        fallbackReason = 'NO_EVIDENCE';
+        logger?.info?.('judge_evidence_validation_failed', {
+          important: parsed.important,
+        });
+      }
     }
   } catch {
     fallbackUsed = true;
+    fallbackReason = 'NON_JSON';
   }
 
   if (fallbackUsed) {
     logger?.info?.('judge_llm_fallback', {
-      reason: 'invalid_or_missing_json_or_evidence',
+      reason: fallbackReason || 'INVALID_TYPES',
     });
     return {
       result: {
@@ -159,9 +209,14 @@ ${JSON.stringify(diffTextEvidence ?? { added: [], removed: [] })}
         reason: 'Brak wiarygodnych dowodów w dostarczonych danych.',
         evidence_used: [],
         llm_fallback_used: true,
+        llm_fallback_reason: fallbackReason || 'INVALID_TYPES',
       },
       raw,
       prompt,
+      parsed_json_extracted: parsedJsonExtracted,
+      evidence_validation_failed: evidenceValidationFailed,
+      evidence_filtered_count: evidenceFilteredCount,
+      llm_fallback_reason: fallbackReason || 'INVALID_TYPES',
       fallbackUsed: true,
     };
   }
@@ -175,6 +230,10 @@ ${JSON.stringify(diffTextEvidence ?? { added: [], removed: [] })}
     },
     raw,
     prompt,
+    parsed_json_extracted: parsedJsonExtracted,
+    evidence_validation_failed: false,
+    evidence_filtered_count: evidenceFilteredCount,
+    llm_fallback_reason: null,
     fallbackUsed: false,
   };
 }
@@ -678,12 +737,6 @@ function buildDecisionFromMetrics(metrics) {
   return null;
 }
 
-function normalizeUserPrompt(rawPrompt) {
-  const normalized = (rawPrompt || '').toString().trim();
-  if (!normalized) return null;
-  return normalized;
-}
-
 function shouldUseVisionCompare({ diff, prevAnalysis, newAnalysis }) {
   if (diff?.metrics?.pluginPricesChanged === true) return false;
   if (prevAnalysis?.error || newAnalysis?.error) return true;
@@ -715,6 +768,7 @@ export async function evaluateChangeWithLLM(
   const log = logger || console;
   const tEval0 = performance.now();
   const normalizedUserPrompt = normalizeUserPrompt(userPrompt);
+  const effectivePrompt = resolveEffectivePrompt(userPrompt, SYSTEM_DEFAULT_JUDGE_PROMPT);
 
   log.info('llm_change_eval_start', { monitorId, zadanieId, url });
 
@@ -736,6 +790,11 @@ export async function evaluateChangeWithLLM(
   let decision = null;
   let judgePrompt = null;
   let judgeRaw = null;
+  let judgeParsedJsonExtracted = false;
+  let judgeEvidenceValidationFailed = false;
+  let judgeSkippedReason = null;
+  let judgeEvidenceFilteredCount = 0;
+  let judgeFallbackReason = null;
   let usedMode = 'rule';
   let usedModel = null;
 
@@ -785,7 +844,7 @@ export async function evaluateChangeWithLLM(
     if (trackedExtrasChanged && decision.important === true) {
       const judge = await judgeImportanceWithLLM(
         {
-          userPrompt: normalizedUserPrompt,
+          userPrompt: effectivePrompt,
           prevSummary,
           newSummary,
           diffMetrics: diff?.metrics,
@@ -797,6 +856,10 @@ export async function evaluateChangeWithLLM(
 
       judgePrompt = judge.prompt;
       judgeRaw = judge.raw;
+      judgeParsedJsonExtracted = judge.parsed_json_extracted === true;
+      judgeEvidenceValidationFailed = judge.evidence_validation_failed === true;
+      judgeEvidenceFilteredCount = judge.evidence_filtered_count || 0;
+      judgeFallbackReason = judge.llm_fallback_reason || null;
       usedMode = 'judge';
       usedModel = process.env.OLLAMA_TEXT_MODEL || process.env.LLM_MODEL || 'llama3';
 
@@ -807,12 +870,15 @@ export async function evaluateChangeWithLLM(
         if (Array.isArray(judge.result?.evidence_used)) {
           decision.evidence_used = judge.result.evidence_used;
         }
+      } else {
+        decision.llm_fallback_used = true;
+        decision.llm_fallback_reason = judge.llm_fallback_reason || null;
       }
     }
   } else {
     const judge = await judgeImportanceWithLLM(
       {
-        userPrompt: normalizedUserPrompt,
+        userPrompt: effectivePrompt,
         prevSummary,
         newSummary,
         diffMetrics: diff?.metrics,
@@ -824,6 +890,10 @@ export async function evaluateChangeWithLLM(
 
     judgePrompt = judge.prompt;
     judgeRaw = judge.raw;
+    judgeParsedJsonExtracted = judge.parsed_json_extracted === true;
+    judgeEvidenceValidationFailed = judge.evidence_validation_failed === true;
+    judgeEvidenceFilteredCount = judge.evidence_filtered_count || 0;
+    judgeFallbackReason = judge.llm_fallback_reason || null;
     usedMode = 'judge';
     usedModel = process.env.OLLAMA_TEXT_MODEL || process.env.LLM_MODEL || 'llama3';
 
@@ -835,6 +905,7 @@ export async function evaluateChangeWithLLM(
       short_title: judge.result?.important ? 'Zmiana na monitorowanej stronie' : 'Brak istotnej zmiany',
       short_description: judge.result?.reason || 'Brak istotnych zmian w danych.',
       llm_fallback_used: judge.result?.llm_fallback_used === true,
+      llm_fallback_reason: judge.result?.llm_fallback_reason || judgeFallbackReason,
     };
   }
 
@@ -855,10 +926,10 @@ export async function evaluateChangeWithLLM(
     const summaryMode = usedMode === 'judge' ? 'judge' : 'summary_llm';
     const summaryModel = process.env.OLLAMA_TEXT_MODEL || process.env.LLM_MODEL || 'llama3';
 
-    const userCriteriaSection = normalizedUserPrompt
+    const userCriteriaSection = effectivePrompt
       ? `
 Instrukcje użytkownika (tylko kontekst, nie dane wejściowe):
-${normalizedUserPrompt}
+${effectivePrompt}
 `
       : '';
 
@@ -912,6 +983,11 @@ ${JSON.stringify(diff ?? null)}
     model: usedModel,
     prompt_used: usedPrompt,
     raw_response: raw,
+    parsed_json_extracted: judgeParsedJsonExtracted,
+    judge_skipped_reason: judgeSkippedReason,
+    evidence_validation_failed: judgeEvidenceValidationFailed,
+    evidence_filtered_count: judgeEvidenceFilteredCount,
+    llm_fallback_reason: judgeFallbackReason,
     vision_ocr: {
       prev: summarizeOcrForStorage(prevOcr),
       next: summarizeOcrForStorage(newOcr),

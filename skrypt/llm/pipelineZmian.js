@@ -11,6 +11,11 @@ import {
   getSnapshotAnalysis,
 } from "./diffEngine.js";
 import {
+  normalizeUserPrompt as normalizeUserPromptUtil,
+  resolveEffectivePrompt,
+  SYSTEM_DEFAULT_JUDGE_PROMPT,
+} from "./analysisUtils.js";
+import {
   evaluateChangeWithLLM,
   saveDetectionAndNotification,
 } from "./ocenaZmianyLLM.js";
@@ -65,12 +70,6 @@ async function setTaskAnalysisMongoId(zadanieId, analizaId, opts = {}) {
  
  
  
-function normalizeUserPrompt(rawPrompt) {
-  const normalized = (rawPrompt || '').toString().trim();
-  if (!normalized) return null;
-  return normalized;
-}
-
 export async function handleNewSnapshot(snapshotRef, options = {}) {
   const { forceAnalysis = false, logger, userPrompt } = options;
   const log = logger || console;
@@ -100,7 +99,8 @@ export async function handleNewSnapshot(snapshotRef, options = {}) {
   });
 
   const tPipeline0 = performance.now();
-  const normalizedUserPrompt = normalizeUserPrompt(userPrompt || snapshot?.llm_prompt);
+  const normalizedUserPrompt = normalizeUserPromptUtil(userPrompt || snapshot?.llm_prompt);
+  const effectivePrompt = resolveEffectivePrompt(normalizedUserPrompt, SYSTEM_DEFAULT_JUDGE_PROMPT);
 
    // 1) OCR nowego snapshotu (tesseract) – zapis do snapshotu + update obiektu w pamięci
   const tOcrNew0 = performance.now();
@@ -269,7 +269,7 @@ const llmDecision = await evaluateChangeWithLLM(
     diff,
     prevOcr: prevOcr || null,
     newOcr: newOcr || null,
-    userPrompt: normalizedUserPrompt,
+    userPrompt: effectivePrompt,
   },
   { logger },
 );

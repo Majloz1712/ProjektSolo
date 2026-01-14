@@ -32,14 +32,19 @@ function normalizeB64(input) {
  * Niskopoziomowe wywołanie /api/generate (Ollama).
  * Zwraca `data.response` (string).
  */
-async function ollamaGenerate({ model, prompt, images, options }, logger, label) {
+async function ollamaGenerate({ model, prompt, images, options, timeoutMs }, logger, label) {
   const log = logger || console;
 
   return withOllamaSemaphore(
     async () => {
       const controller = new AbortController();
-      const timeoutMs = Number(process.env.OLLAMA_TIMEOUT_MS || 300000);
-      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      const baseTimeoutMs = Number(process.env.OLLAMA_TIMEOUT_MS || 300000);
+      const hasCustomTimeout = typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0;
+      const modelTimeoutMs = String(model || '').toLowerCase().includes('bielik')
+        ? Math.max(baseTimeoutMs, 180000)
+        : baseTimeoutMs;
+      const resolvedTimeoutMs = hasCustomTimeout ? timeoutMs : modelTimeoutMs;
+      const timeout = setTimeout(() => controller.abort(), resolvedTimeoutMs);
 
       const t0 = performance.now();
       let ok = false;
@@ -75,6 +80,11 @@ async function ollamaGenerate({ model, prompt, images, options }, logger, label)
         return data.response;
       } catch (err) {
         aborted = err?.name === 'AbortError';
+        if (aborted) {
+          const timeoutError = new Error('OLLAMA_TIMEOUT');
+          timeoutError.code = 'OLLAMA_TIMEOUT';
+          throw timeoutError;
+        }
         throw err;
       } finally {
         clearTimeout(timeout);
@@ -83,6 +93,7 @@ async function ollamaGenerate({ model, prompt, images, options }, logger, label)
           ok,
           httpStatus,
           aborted,
+          timeoutMs: resolvedTimeoutMs,
           promptChars: typeof prompt === 'string' ? prompt.length : null,
           imagesCount: Array.isArray(images) ? images.length : 0,
           durationMs: Math.round(performance.now() - t0),
@@ -98,8 +109,9 @@ export async function generateTextWithOllama({
   model = TEXT_MODEL,
   logger,
   options,
+  timeoutMs,
 }) {
-  return ollamaGenerate({ model, prompt, options }, logger, 'generate');
+  return ollamaGenerate({ model, prompt, options, timeoutMs }, logger, 'generate');
 }
 
 export async function analyzeImageWithOllama({
@@ -155,4 +167,3 @@ export async function ocrImageWithOllama({
     'vision_ocr',
   );
 }
-
