@@ -10,6 +10,12 @@
 //   i podobieństwo jest naprawdę niskie (żeby nie spamować).
 
 import { generateTextWithOllama } from './ollamaClient.js';
+import {
+  extractJsonFromText,
+  normalizeUserPrompt,
+  resolveEffectivePrompt,
+  SYSTEM_DEFAULT_JUDGE_PROMPT,
+} from './analysisUtils.js';
 
 import { pool } from '../polaczeniePG.js';
 import { mongoClient } from '../polaczenieMDB.js';
@@ -65,6 +71,171 @@ function safeParseJsonFromLLM(raw) {
       return null;
     }
   }
+}
+
+function normalizeEvidenceText(input) {
+  return String(input || '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function filterEvidenceUsed(evidenceUsed, diffReasons, diffTextEvidence) {
+  if (!Array.isArray(evidenceUsed)) return { filtered: [], dropped: 0 };
+  const reasonsStr = normalizeEvidenceText(JSON.stringify(diffReasons ?? []));
+  const evidenceStr = normalizeEvidenceText(JSON.stringify(diffTextEvidence ?? {}));
+
+  const filtered = evidenceUsed.filter((item) => {
+    const snippet = normalizeEvidenceText(item);
+    if (!snippet) return false;
+    return reasonsStr.includes(snippet) || evidenceStr.includes(snippet);
+  });
+
+  return { filtered, dropped: evidenceUsed.length - filtered.length };
+}
+
+async function judgeImportanceWithLLM(
+  { userPrompt, prevSummary, newSummary, diffMetrics, diffReasons, diffTextEvidence },
+  { logger } = {},
+) {
+  const prompt = `
+Masz DOKŁADNIE te dane wejściowe:
+- prevSummary
+- newSummary
+- diffMetrics
+- diffReasons
+- diffTextEvidence
+- userPrompt
+
+  Twoje zadanie: oceń istotność zmiany zgodnie z userPrompt.
+  NIE WOLNO używać wiedzy spoza podanych danych. Nie masz dostępu do OCR/HTML/screenshotów.
+  Jeśli w danych nie ma dowodu spełniającego kryteria użytkownika -> important=false.
+  evidence_used musi zawierać wyłącznie dokładne stringi skopiowane z diffReasons lub diffTextEvidence (bez parafraz).
+  Nie wolno dodawać nowych tekstów do evidence_used.
+
+Zwróć WYŁĄCZNIE JSON:
+{
+  "important": boolean,
+  "category": string,
+  "reason": string,
+  "evidence_used": ["dokładne cytaty skopiowane z diffTextEvidence lub diffReasons"]
+}
+
+userPrompt:
+${userPrompt || ''}
+
+prevSummary:
+${prevSummary || ''}
+
+newSummary:
+${newSummary || ''}
+
+diffMetrics:
+${JSON.stringify(diffMetrics ?? null)}
+
+diffReasons:
+${JSON.stringify(diffReasons ?? [])}
+
+diffTextEvidence:
+${JSON.stringify(diffTextEvidence ?? { added: [], removed: [] })}
+`.trim();
+
+  logger?.info?.('judge_llm_called', {
+    hasUserPrompt: !!userPrompt,
+  });
+
+  let raw = null;
+  let parsed = null;
+  let fallbackUsed = false;
+  let parsedJsonExtracted = false;
+  let evidenceValidationFailed = false;
+  let fallbackReason = null;
+  let evidenceFilteredCount = 0;
+
+  try {
+    const judgeTimeoutMsRaw = Number(process.env.OLLAMA_TIMEOUT_MS_JUDGE);
+    const judgeTimeoutMs = Number.isFinite(judgeTimeoutMsRaw) ? judgeTimeoutMsRaw : undefined;
+    raw = await generateTextWithOllama({
+      prompt,
+      model: process.env.OLLAMA_TEXT_MODEL || process.env.LLM_MODEL || 'llama3',
+      options: { temperature: 0 },
+      timeoutMs: judgeTimeoutMs,
+    });
+
+    const extracted = extractJsonFromText(raw);
+    parsed = extracted.ok ? extracted.value : null;
+    parsedJsonExtracted = extracted.ok ? extracted.extracted === true : false;
+    logger?.info?.('judge_json_extracted', {
+      extracted: parsedJsonExtracted,
+    });
+    logger?.info?.('judge_json_extract_used', {
+      json_extract_used: extracted.ok && extracted.extracted === true,
+    });
+    if (!parsed || typeof parsed.important !== 'boolean') {
+      fallbackUsed = true;
+      fallbackReason = 'NON_JSON';
+    } else {
+      const normalizedEvidence = Array.isArray(parsed.evidence_used)
+        ? parsed.evidence_used.map((item) => String(item))
+        : [];
+      const filtered = filterEvidenceUsed(normalizedEvidence, diffReasons, diffTextEvidence);
+      evidenceFilteredCount = filtered.dropped;
+      parsed.evidence_used = filtered.filtered;
+      logger?.info?.('judge_evidence_filtered_count', {
+        dropped: filtered.dropped,
+      });
+      if (parsed.important === true && parsed.evidence_used.length === 0) {
+        evidenceValidationFailed = true;
+        fallbackUsed = true;
+        fallbackReason = 'NO_EVIDENCE';
+        logger?.info?.('judge_evidence_validation_failed', {
+          important: parsed.important,
+        });
+      }
+    }
+  } catch {
+    fallbackUsed = true;
+    fallbackReason = 'NON_JSON';
+  }
+
+  if (fallbackUsed) {
+    logger?.info?.('judge_llm_fallback', {
+      reason: fallbackReason || 'INVALID_TYPES',
+    });
+    return {
+      result: {
+        important: false,
+        category: 'minor_change',
+        reason: 'Brak wiarygodnych dowodów w dostarczonych danych.',
+        evidence_used: [],
+        llm_fallback_used: true,
+        llm_fallback_reason: fallbackReason || 'INVALID_TYPES',
+      },
+      raw,
+      prompt,
+      parsed_json_extracted: parsedJsonExtracted,
+      evidence_validation_failed: evidenceValidationFailed,
+      evidence_filtered_count: evidenceFilteredCount,
+      llm_fallback_reason: fallbackReason || 'INVALID_TYPES',
+      fallbackUsed: true,
+    };
+  }
+
+  return {
+    result: {
+      important: !!parsed.important,
+      category: String(parsed.category || 'minor_change'),
+      reason: String(parsed.reason || ''),
+      evidence_used: Array.isArray(parsed.evidence_used) ? parsed.evidence_used : [],
+    },
+    raw,
+    prompt,
+    parsed_json_extracted: parsedJsonExtracted,
+    evidence_validation_failed: false,
+    evidence_filtered_count: evidenceFilteredCount,
+    llm_fallback_reason: null,
+    fallbackUsed: false,
+  };
 }
 
 
@@ -566,13 +737,6 @@ function buildDecisionFromMetrics(metrics) {
   return null;
 }
 
-function normalizeUserPrompt(rawPrompt) {
-  const normalized = (rawPrompt || '').toString().trim();
-  if (!normalized) return null;
-  if (normalized.toLowerCase() === 'cena') return null;
-  return normalized;
-}
-
 function shouldUseVisionCompare({ diff, prevAnalysis, newAnalysis }) {
   if (diff?.metrics?.pluginPricesChanged === true) return false;
   if (prevAnalysis?.error || newAnalysis?.error) return true;
@@ -604,374 +768,231 @@ export async function evaluateChangeWithLLM(
   const log = logger || console;
   const tEval0 = performance.now();
   const normalizedUserPrompt = normalizeUserPrompt(userPrompt);
+  const effectivePrompt = resolveEffectivePrompt(userPrompt, SYSTEM_DEFAULT_JUDGE_PROMPT);
 
   log.info('llm_change_eval_start', { monitorId, zadanieId, url });
 
-  // 0) twarda reguła: zmiana ceny z plugin_prices zawsze istotna
-  if (!normalizedUserPrompt && diff?.metrics?.pluginPricesChanged === true) {
-    const decision = {
-      important: true,
-      category: 'price_change',
-      importance_reason: 'wykryto zmianę cen (plugin_prices)',
-      short_title: 'Cena zmieniona',
-      short_description: 'Wykryto zmianę cen przez plugin (JS na stronie).',
+  const trackedFields = Array.isArray(newAnalysis?.intent?.trackedFields)
+    ? newAnalysis.intent.trackedFields
+    : Array.isArray(prevAnalysis?.intent?.trackedFields)
+      ? prevAnalysis.intent.trackedFields
+      : [];
+  const trackedExtrasChanges = diff?.metrics?.trackedExtrasChanges || {};
+  const trackedExtrasChanged = diff?.metrics?.trackedExtrasChanged === true;
+  const diffReasons = diff?.reasons || [];
+  const diffTextEvidence = diff?.textEvidence || { added: [], removed: [] };
+  const prevSummary = prevAnalysis?.summary || '';
+  const newSummary = newAnalysis?.summary || '';
+
+  const formatEvidence = (items) =>
+    Array.isArray(items) && items.length ? items.map((item) => `"${item}"`).join(', ') : 'brak';
+
+  let decision = null;
+  let judgePrompt = null;
+  let judgeRaw = null;
+  let judgeParsedJsonExtracted = false;
+  let judgeEvidenceValidationFailed = false;
+  let judgeSkippedReason = null;
+  let judgeEvidenceFilteredCount = 0;
+  let judgeFallbackReason = null;
+  let usedMode = 'rule';
+  let usedModel = null;
+
+  if (trackedFields.length > 0) {
+    if (trackedFields.includes('main_price') && trackedExtrasChanges.main_price) {
+      const change = trackedExtrasChanges.main_price;
+      decision = {
+        important: true,
+        category: 'price_change',
+        importance_reason: `Zmiana ceny (extras.main_price): ${change.before} → ${change.after}. Dowody: prev=[${formatEvidence(change.beforeEvidence)}], now=[${formatEvidence(change.afterEvidence)}].`,
+        evidence_used: [...(change.beforeEvidence || []), ...(change.afterEvidence || [])],
+        short_title: 'Zmiana ceny',
+        short_description: `Cena zmieniła się z ${change.before} na ${change.after}.`,
+        old_price: change.before,
+        new_price: change.after,
+      };
+    } else if (trackedFields.includes('review_count') && trackedExtrasChanges.review_count) {
+      const change = trackedExtrasChanges.review_count;
+      decision = {
+        important: true,
+        category: 'reviews_change',
+        importance_reason: `Zmiana liczby opinii (extras.review_count): ${change.before} → ${change.after}. Dowody: prev=[${formatEvidence(change.beforeEvidence)}], now=[${formatEvidence(change.afterEvidence)}].`,
+        evidence_used: [...(change.beforeEvidence || []), ...(change.afterEvidence || [])],
+        short_title: 'Zmiana liczby opinii',
+        short_description: `Liczba opinii zmieniła się z ${change.before} na ${change.after}.`,
+      };
+    } else if (trackedFields.includes('rating') && trackedExtrasChanges.rating) {
+      const change = trackedExtrasChanges.rating;
+      decision = {
+        important: true,
+        category: 'rating_change',
+        importance_reason: `Zmiana oceny (extras.rating): ${change.before} → ${change.after}. Dowody: prev=[${formatEvidence(change.beforeEvidence)}], now=[${formatEvidence(change.afterEvidence)}].`,
+        evidence_used: [...(change.beforeEvidence || []), ...(change.afterEvidence || [])],
+        short_title: 'Zmiana oceny',
+        short_description: `Ocena zmieniła się z ${change.before} na ${change.after}.`,
+      };
+    } else {
+      decision = {
+        important: false,
+        category: 'no_tracked_change',
+        importance_reason: 'Nie wykryto zmian w śledzonych polach (extras).',
+        short_title: 'Brak zmian w śledzonych polach',
+        short_description: 'Zmieniły się tylko elementy nieobjęte śledzeniem.',
+      };
+    }
+
+    if (trackedExtrasChanged && decision.important === true) {
+      const judge = await judgeImportanceWithLLM(
+        {
+          userPrompt: effectivePrompt,
+          prevSummary,
+          newSummary,
+          diffMetrics: diff?.metrics,
+          diffReasons,
+          diffTextEvidence,
+        },
+        { logger: log },
+      );
+
+      judgePrompt = judge.prompt;
+      judgeRaw = judge.raw;
+      judgeParsedJsonExtracted = judge.parsed_json_extracted === true;
+      judgeEvidenceValidationFailed = judge.evidence_validation_failed === true;
+      judgeEvidenceFilteredCount = judge.evidence_filtered_count || 0;
+      judgeFallbackReason = judge.llm_fallback_reason || null;
+      usedMode = 'judge';
+      usedModel = process.env.OLLAMA_TEXT_MODEL || process.env.LLM_MODEL || 'llama3';
+
+      if (!judge.fallbackUsed) {
+        if (judge.result?.reason) {
+          decision.importance_reason = judge.result.reason;
+        }
+        if (Array.isArray(judge.result?.evidence_used)) {
+          decision.evidence_used = judge.result.evidence_used;
+        }
+      } else {
+        decision.llm_fallback_used = true;
+        decision.llm_fallback_reason = judge.llm_fallback_reason || null;
+      }
+    }
+  } else {
+    const judge = await judgeImportanceWithLLM(
+      {
+        userPrompt: effectivePrompt,
+        prevSummary,
+        newSummary,
+        diffMetrics: diff?.metrics,
+        diffReasons,
+        diffTextEvidence,
+      },
+      { logger: log },
+    );
+
+    judgePrompt = judge.prompt;
+    judgeRaw = judge.raw;
+    judgeParsedJsonExtracted = judge.parsed_json_extracted === true;
+    judgeEvidenceValidationFailed = judge.evidence_validation_failed === true;
+    judgeEvidenceFilteredCount = judge.evidence_filtered_count || 0;
+    judgeFallbackReason = judge.llm_fallback_reason || null;
+    usedMode = 'judge';
+    usedModel = process.env.OLLAMA_TEXT_MODEL || process.env.LLM_MODEL || 'llama3';
+
+    decision = {
+      important: !!judge.result?.important,
+      category: judge.result?.category || 'minor_change',
+      importance_reason: judge.result?.reason || 'Brak istotnych zmian w danych.',
+      evidence_used: Array.isArray(judge.result?.evidence_used) ? judge.result.evidence_used : [],
+      short_title: judge.result?.important ? 'Zmiana na monitorowanej stronie' : 'Brak istotnej zmiany',
+      short_description: judge.result?.reason || 'Brak istotnych zmian w danych.',
+      llm_fallback_used: judge.result?.llm_fallback_used === true,
+      llm_fallback_reason: judge.result?.llm_fallback_reason || judgeFallbackReason,
     };
-
-    const { insertedId } = await ocenyZmienCol.insertOne({
-      createdAt: new Date(),
-      monitorId,
-      zadanieId,
-      url,
-      llm_mode: 'rule_plugin_prices',
-      model: null,
-      prompt_used: null,
-      raw_response: null,
-      // OCR nie podejmuje decyzji — zapisujemy tylko meta dla debug
-      vision_ocr: {
-        prev: summarizeOcrForStorage(prevOcr),
-        next: summarizeOcrForStorage(newOcr),
-      },
-      llm_decision: decision,
-      error: null,
-      durationMs: Math.round(performance.now() - tEval0),
-    });
-
-    log.info('llm_change_eval_success', {
-      monitorId,
-      zadanieId,
-      mongoId: insertedId,
-      important: true,
-      category: decision.category,
-    });
-
-    return { parsed: decision, raw: null, mongoId: insertedId };
-  }
-  
-  // 0.1) twarda reguła: jeśli machine-diff policzył zmianę MAIN price → istotne
-  if (
-    !normalizedUserPrompt &&
-    typeof diff?.metrics?.price?.oldVal === 'number' &&
-    typeof diff?.metrics?.price?.newVal === 'number' &&
-    typeof diff?.metrics?.price?.absChange === 'number' &&
-    diff.metrics.price.absChange !== 0
-  ) {
-    const { oldVal, newVal } = diff.metrics.price;
-
-    const decision = {
-      important: true,
-      category: 'price_change',
-      importance_reason: 'Machine diff policzył zmianę ceny głównej (main price).',
-      short_title: 'Zmiana ceny',
-      short_description: `Cena zmieniła się z ${oldVal} na ${newVal}.`,
-      old_price: oldVal,
-      new_price: newVal,
-    };
-
-    const { insertedId } = await ocenyZmienCol.insertOne({
-      createdAt: new Date(),
-      monitorId,
-      zadanieId,
-      url,
-      llm_mode: 'rule',
-      prompt_used: null,
-      prevAnalysis,
-      newAnalysis,
-      diff,
-      raw_response: null,
-      vision_ocr: {
-        prev: summarizeOcrForStorage(prevOcr),
-        next: summarizeOcrForStorage(newOcr),
-      },
-      llm_decision: decision,
-      error: null,
-      durationMs: Math.round(performance.now() - tEval0),
-    });
-
-    log.info('llm_change_eval_success', {
-      monitorId,
-      zadanieId,
-      mongoId: insertedId,
-      important: true,
-      category: decision.category,
-      usedMode: 'rule',
-      usedModel: 'rule',
-    });
-
-    return { parsed: decision, raw: null, mongoId: insertedId };
   }
 
-  // 0.15) twarda reguła: zmiana ceny z analizy snapshotu (LLM #1)
-  const prevAnalysisPrice = pickAnalysisPriceValue(prevAnalysis);
-  const newAnalysisPrice = pickAnalysisPriceValue(newAnalysis);
-  if (
-    !normalizedUserPrompt &&
-    typeof prevAnalysisPrice === 'number' &&
-    typeof newAnalysisPrice === 'number' &&
-    prevAnalysisPrice !== newAnalysisPrice
-  ) {
-    const decision = {
-      important: true,
-      category: 'price_change',
-      importance_reason: 'Analiza snapshotów wykryła zmianę głównej ceny.',
-      short_title: 'Zmiana ceny',
-      short_description: `Cena zmieniła się z ${prevAnalysisPrice} na ${newAnalysisPrice}.`,
-      old_price: prevAnalysisPrice,
-      new_price: newAnalysisPrice,
-    };
-
-    const { insertedId } = await ocenyZmienCol.insertOne({
-      createdAt: new Date(),
-      monitorId,
-      zadanieId,
-      url,
-      llm_mode: 'rule',
-      prompt_used: null,
-      prevAnalysis,
-      newAnalysis,
-      diff,
-      raw_response: null,
-      vision_ocr: {
-        prev: summarizeOcrForStorage(prevOcr),
-        next: summarizeOcrForStorage(newOcr),
-      },
-      llm_decision: decision,
-      error: null,
-      durationMs: Math.round(performance.now() - tEval0),
-    });
-
-    log.info('llm_change_eval_success', {
-      monitorId,
-      zadanieId,
-      mongoId: insertedId,
-      important: true,
-      category: decision.category,
-      usedMode: 'rule',
-      usedModel: 'rule',
-    });
-
-    return { parsed: decision, raw: null, mongoId: insertedId };
-  }
-
-  // 0.2) twarda reguła: zmiany treści/opinii/cen drugorzędnych/numerów
-  const ruleDecision = normalizedUserPrompt ? null : buildDecisionFromMetrics(diff?.metrics);
-  if (ruleDecision) {
-    const { insertedId } = await ocenyZmienCol.insertOne({
-      createdAt: new Date(),
-      monitorId,
-      zadanieId,
-      url,
-      llm_mode: 'rule',
-      prompt_used: null,
-      prevAnalysis,
-      newAnalysis,
-      diff,
-      raw_response: null,
-      vision_ocr: {
-        prev: summarizeOcrForStorage(prevOcr),
-        next: summarizeOcrForStorage(newOcr),
-      },
-      llm_decision: ruleDecision,
-      error: null,
-      durationMs: Math.round(performance.now() - tEval0),
-    });
-
-    log.info('llm_change_eval_success', {
-      monitorId,
-      zadanieId,
-      mongoId: insertedId,
-      important: true,
-      category: ruleDecision.category,
-      usedMode: 'rule',
-      usedModel: 'rule',
-    });
-
-    return { parsed: ruleDecision, raw: null, mongoId: insertedId };
-  }
-
-
-  // 0.5) twarda reguła: jeśli to tylko "drift" screenshot/OCR (bez realnych zmian treści/ceny) → nieistotne
-  const m = diff?.metrics || {};
-  const ocrScore = typeof m.ocrTextDiffScore === 'number' ? m.ocrTextDiffScore : 0;
-  const textScore = typeof m.textDiffScore === 'number' ? m.textDiffScore : 0;
-
-  const priceRel = m.price?.relChange;
-  const hasPriceMove = typeof priceRel === 'number' && Math.abs(priceRel) >= 0.05;
-
-  const hasContentMove =
-    m.titleChanged === true ||
-    m.descriptionChanged === true ||
-    (typeof textScore === 'number' && textScore > 0.15);
-
-  const secondaryPricesChanged =
-    m.secondaryPrices &&
-    m.secondaryPrices.prev?.length > 0 &&
-    m.secondaryPrices.now?.length > 0 &&
-    JSON.stringify(m.secondaryPrices.prev) !== JSON.stringify(m.secondaryPrices.now);
-  const reviewsChanged =
-    (m.reviews?.prevCount != null &&
-      m.reviews?.nowCount != null &&
-      m.reviews.prevCount !== m.reviews.nowCount) ||
-    (m.reviews?.prevRating != null &&
-      m.reviews?.nowRating != null &&
-      m.reviews.prevRating !== m.reviews.nowRating);
-  const numericChanged = typeof m.numericDiffScore === 'number' && m.numericDiffScore > 0.1;
-
-  const onlyOcrDrift =
-    !hasPriceMove &&
-    !hasContentMove &&
-    !secondaryPricesChanged &&
-    !reviewsChanged &&
-    !numericChanged &&
-    m.pluginPricesChanged !== true &&
-    (m.screenshotChanged === true || m.ocrTextChanged === true) &&
-    ocrScore > 0 &&
-    ocrScore < 0.20;
-
-  if (!normalizedUserPrompt && onlyOcrDrift) {
-    const decision = {
+  if (!decision) {
+    decision = {
       important: false,
       category: 'minor_change',
-      importance_reason: `Zmiana wygląda na drift OCR/screenshot (ocrTextDiffScore=${ocrScore.toFixed(3)}), bez dowodu na realną zmianę treści/ceny.`,
-      short_title: 'Nieistotna zmiana',
-      short_description: 'Różnice wynikają z OCR/screenshot, a nie z treści produktu/ceny.',
+      importance_reason: 'Brak istotnych zmian w danych.',
+      short_title: 'Brak istotnej zmiany',
+      short_description: 'Nie udało się potwierdzić istotnej zmiany na podstawie danych.',
     };
-
-    const { insertedId } = await ocenyZmienCol.insertOne({
-      createdAt: new Date(),
-      monitorId,
-      zadanieId,
-      url,
-      llm_mode: 'rule',
-      model: 'rule',
-      prompt_used: null,
-      prevAnalysis,
-      newAnalysis,
-      diff,
-      raw_response: null,
-      vision_ocr: {
-        prev: summarizeOcrForStorage(prevOcr),
-        next: summarizeOcrForStorage(newOcr),
-      },
-      llm_decision: decision,
-      error: null,
-      durationMs: Math.round(performance.now() - tEval0),
-    });
-
-    log.info('llm_change_eval_success', {
-      monitorId,
-      zadanieId,
-      mongoId: insertedId,
-      important: false,
-      category: decision.category,
-      usedMode: 'rule',
-      usedModel: 'rule',
-    });
-
-    return { parsed: decision, raw: null, mongoId: insertedId };
   }
 
-  const usedMode = normalizedUserPrompt ? 'text_user' : 'text';
-  const usedModel = process.env.OLLAMA_TEXT_MODEL || process.env.LLM_MODEL || 'llama3';
+  let usedPrompt = judgePrompt;
+  let raw = judgeRaw;
 
-  const prevOcrText = ocrPreview(prevOcr, 2000);
-  const newOcrText = ocrPreview(newOcr, 2000);
+  if (decision.important === true) {
+    const summaryMode = usedMode === 'judge' ? 'judge' : 'summary_llm';
+    const summaryModel = process.env.OLLAMA_TEXT_MODEL || process.env.LLM_MODEL || 'llama3';
 
-  const usedPrompt = (normalizedUserPrompt ? `
-${normalizedUserPrompt}
+    const userCriteriaSection = effectivePrompt
+      ? `
+Instrukcje użytkownika (tylko kontekst, nie dane wejściowe):
+${effectivePrompt}
+`
+      : '';
 
-Odpowiedz WYŁĄCZNIE JSON:
-{
-  "important": boolean,
-  "category": string,
-  "importance_reason": string,
-  "short_title": string,
-  "short_description": string
-}
-` : `
-Masz dane JSON: prevAnalysis, newAnalysis, diff.
-Dodatkowo masz OCR ze screenshotu (prevOcr/newOcr) – to TYLKO tekst odczytany z obrazka.
-
-Twoje zadanie: oceń istotność zmiany NA PODSTAWIE DANYCH.
-NIE WOLNO zgadywać ani dopowiadać. Jeśli brak dowodu w danych -> uznaj za nieistotne.
+    const summaryPrompt = `
+Masz dane JSON: decision, diff.
+Twoje zadanie: przygotuj krótki tytuł i opis powiadomienia.
+NIE ZMIENIAJ ważności ani kategorii. Nie dodawaj nowych faktów.
 
 Zwróć WYŁĄCZNIE JSON:
 {
-  "important": boolean,
-  "category": string,
-  "importance_reason": string,
   "short_title": string,
   "short_description": string
 }
-`)
+${userCriteriaSection}
 
-  + `
-prevAnalysis:
-${JSON.stringify(prevAnalysis ?? null)}
-
-newAnalysis:
-${JSON.stringify(newAnalysis ?? null)}
+decision:
+${JSON.stringify(decision ?? null)}
 
 diff:
 ${JSON.stringify(diff ?? null)}
-
-prevOcr (clean_text preview):
-${prevOcrText || null}
-
-newOcr (clean_text preview):
-${newOcrText || null}
 `.trim();
 
-  let raw = null;
-  let llmDecision = null;
+    try {
+      const summaryRaw = await generateTextWithOllama({
+        prompt: summaryPrompt,
+        model: summaryModel,
+        temperature: 0,
+      });
 
-  try {
-    raw = await generateTextWithOllama({
-      prompt: usedPrompt,
-      model: usedModel,
-      temperature: 0,
-    });
-
-    const parsed = safeParseJsonFromLLM(raw);
-    if (parsed && typeof parsed.important === 'boolean') {
-      llmDecision = parsed;
-    } else {
-      const fallbackDecision = normalizedUserPrompt ? null : buildDecisionFromMetrics(diff?.metrics);
-      llmDecision = fallbackDecision || {
-        important: false,
-        category: 'minor_change',
-        importance_reason: 'Brak poprawnego JSON z LLM lub brak twardych dowodów w danych.',
-        short_title: 'Brak istotnej zmiany',
-        short_description: 'Nie udało się potwierdzić istotnej zmiany na podstawie dostarczonych danych.',
-      };
-      llmDecision.llm_fallback_used = true;
+      const parsedSummary = safeParseJsonFromLLM(summaryRaw);
+      if (parsedSummary && typeof parsedSummary.short_title === 'string') {
+        decision.short_title = parsedSummary.short_title;
+      }
+      if (parsedSummary && typeof parsedSummary.short_description === 'string') {
+        decision.short_description = parsedSummary.short_description;
+      }
+    } catch (err) {
+      decision.llm_fallback_used = true;
     }
-  } catch (err) {
-    const fallbackDecision = normalizedUserPrompt ? null : buildDecisionFromMetrics(diff?.metrics);
-    llmDecision = fallbackDecision || {
-      important: false,
-      category: 'minor_change',
-      importance_reason: `Błąd text LLM: ${err?.message || String(err)}`,
-      short_title: 'Brak istotnej zmiany',
-      short_description: 'Nie udało się wykonać oceny tekstowej.',
-    };
-    llmDecision.llm_fallback_used = true;
+
+    usedMode = summaryMode;
+    usedModel = summaryModel;
   }
 
-  // Zapis do Mongo ZAWSZE
   const { insertedId } = await ocenyZmienCol.insertOne({
     createdAt: new Date(),
     monitorId,
     zadanieId,
     url,
-    llm_mode: usedMode, // 'text'
+    llm_mode: usedMode,
     model: usedModel,
     prompt_used: usedPrompt,
     raw_response: raw,
+    parsed_json_extracted: judgeParsedJsonExtracted,
+    judge_skipped_reason: judgeSkippedReason,
+    evidence_validation_failed: judgeEvidenceValidationFailed,
+    evidence_filtered_count: judgeEvidenceFilteredCount,
+    llm_fallback_reason: judgeFallbackReason,
     vision_ocr: {
       prev: summarizeOcrForStorage(prevOcr),
       next: summarizeOcrForStorage(newOcr),
     },
-    llm_decision: llmDecision,
+    llm_decision: decision,
     error: null,
     durationMs: Math.round(performance.now() - tEval0),
   });
@@ -980,14 +1001,13 @@ ${newOcrText || null}
     monitorId,
     zadanieId,
     mongoId: insertedId,
-    important: !!llmDecision?.important,
-    category: llmDecision?.category || null,
-    llmFallbackUsed: llmDecision?.llm_fallback_used === true,
+    important: !!decision?.important,
+    category: decision?.category || null,
     usedMode,
     usedModel,
   });
 
-  return { parsed: llmDecision, raw, mongoId: insertedId };
+  return { parsed: decision, raw, mongoId: insertedId };
 }
 
 export async function saveDetectionAndNotification(
