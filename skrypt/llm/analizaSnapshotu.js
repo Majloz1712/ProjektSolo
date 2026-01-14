@@ -6,6 +6,7 @@ import {
   sanitizeRequiredString as sanitizeRequiredStringUtil,
   parseTrackedFields,
   hashUserPrompt,
+  extractJsonFromText,
 } from './analysisUtils.js';
 import { Double } from 'mongodb';
 import { performance } from 'node:perf_hooks';
@@ -523,22 +524,8 @@ ${contextPack.contextPackText || '[EMPTY]'}
 }
 
 function parseJsonFromResponse(rawResponse) {
-  const trimmed = String(rawResponse || '').trim();
-  if (!trimmed) return null;
-  try {
-    return JSON.parse(trimmed);
-  } catch (err) {
-    // ignore and try extraction below
-  }
-  const start = trimmed.indexOf('{');
-  const end = trimmed.lastIndexOf('}');
-  if (start === -1 || end === -1 || end <= start) return null;
-  const candidate = trimmed.slice(start, end + 1);
-  try {
-    return JSON.parse(candidate);
-  } catch (err) {
-    return null;
-  }
+  const extracted = extractJsonFromText(rawResponse);
+  return extracted.ok ? extracted.value : null;
 }
 
 async function safeInsertAnalysis(doc, { logger, snapshotId } = {}) {
@@ -803,13 +790,17 @@ ${dataBlock}
 
   let rawResponse = null;
   let parsed = null;
+  let parsedJsonExtracted = false;
 
   try {
     const tLlm0 = performance.now();
+const analysisTimeoutMsRaw = Number(process.env.OLLAMA_TIMEOUT_MS_ANALYSIS);
+const analysisTimeoutMs = Number.isFinite(analysisTimeoutMsRaw) ? analysisTimeoutMsRaw : undefined;
 rawResponse = await generateTextWithOllama({
   prompt,
   logger,
-  temperature: 0,
+  options: { temperature: 0 },
+  timeoutMs: analysisTimeoutMs,
 });
 logger?.info('snapshot_analysis_llm_done', {
   snapshotId: _id.toString(),
@@ -820,7 +811,17 @@ logger?.info('snapshot_analysis_llm_done', {
 });
 
 
-    parsed = parseJsonFromResponse(rawResponse);
+    const extracted = extractJsonFromText(rawResponse);
+    parsed = extracted.ok ? extracted.value : null;
+    parsedJsonExtracted = extracted.ok ? extracted.extracted === true : false;
+    logger?.info('analysis_json_extracted', {
+      snapshotId: _id.toString(),
+      extracted: parsedJsonExtracted,
+    });
+    logger?.info('analysis_json_extract_used', {
+      snapshotId: _id.toString(),
+      json_extract_used: extracted.ok && extracted.extracted === true,
+    });
     if (!parsed) {
       throw new Error('LLM_NON_JSON_RESPONSE');
     }
@@ -849,6 +850,7 @@ logger?.info('snapshot_analysis_llm_done', {
       intent,
       extras,
       raw_response: rawResponse != null ? String(rawResponse) : null,
+      parsed_json_extracted: parsedJsonExtracted,
       error: err?.message || String(err),
     };
 
@@ -905,6 +907,7 @@ logger?.info('snapshot_analysis_llm_done', {
     intent,
     extras,
     raw_response: rawResponse != null ? String(rawResponse) : null,
+    parsed_json_extracted: parsedJsonExtracted,
     error: null,
   };
 
