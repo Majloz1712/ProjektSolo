@@ -1,9 +1,6 @@
-// skrypt/ocrSnapshotu.js
-// OCR jako extractor: czyta screenshot (tesseract) i zapisuje wynik do snapshotu.
-// Nie podejmuje decyzji o "important".
-
+// skrypt/llm/ocrSnapshotu.js
 import { mongoClient } from '../polaczenieMDB.js';
-import { ocrImageWithTesseract } from './tesseractOcr.js';
+import { ocrImageWithPaddle } from './paddleOcr.js';
 import { performance } from 'node:perf_hooks';
 import crypto from 'node:crypto';
 
@@ -19,8 +16,7 @@ function normalizeB64(b64) {
     const comma = s.indexOf(',');
     if (comma !== -1) s = s.slice(comma + 1);
   }
-  s = s.trim();
-  return s.length ? s : null;
+  return s.trim().length ? s.trim() : null;
 }
 
 function sha1(str) {
@@ -28,73 +24,109 @@ function sha1(str) {
   return crypto.createHash('sha1').update(str).digest('hex');
 }
 
-function normalizeOcrText(s) {
-  return String(s || '').replace(/\s+/g, ' ').trim();
-}
-
-/**
- * Zapewnia, że snapshot ma pole `vision_ocr` odpowiadające AKTUALNEMU screenshotowi.
- * - cache: jeśli `vision_ocr.sourceHash` == hash screenshotu -> nie liczymy OCR ponownie
- * - force: wymusza przeliczenie OCR
- */
 export async function ensureSnapshotOcr(
   snapshot,
   {
     force = false,
     logger,
-    lang = 'pol+eng',
-    psm = 6,
-    timeoutMs = 20000,
-    cleanOptions = {},
+    lang = 'en', // 'en' obejmuje PL (latin-based)
+    timeoutMs = Number(process.env.OCR_PADDLE_TIMEOUT_MS || 60000),
+    cleanOptions = {
+      // detekcja/naprawa typowych artefaktów OCR
+      mergeHyphenated: true,
+      fixCommon: true,
+
+      // usuń fałszywe "ikonki" rozpoznane jako znaki CJK (np. 回/女)
+      stripCjkChars: true,
+
+      // deduplikacja dokładna linii (zostawia pierwsze wystąpienie)
+      dedupeExact: true,
+
+      // format
+      keepNewlines: true,
+      collapseSpaces: true,
+
+      // stabilizacja pod diff (uniwersalne)
+      dedupeWindow: Number(process.env.OCR_DEDUPE_WINDOW || 80),
+      boilerplateMinFreq: Number(process.env.OCR_BOILERPLATE_MIN_FREQ || 2),
+      boilerplateMaxLineLen: Number(process.env.OCR_BOILERPLATE_MAX_LINE_LEN || 90),
+      dropMostlyJunkLines: (process.env.OCR_DROP_JUNK ?? 'true') === 'true',
+    },
+    pythonBin,
+    saveStdout = false, // opcjonalnie, zwykle false (stdout potrafi być duży)
   } = {},
 ) {
   const log = logger || console;
   if (!snapshot || !snapshot._id) return null;
 
   const shot = normalizeB64(snapshot.screenshot_b64);
-  if (!shot) {
-    log.info('snapshot_ocr_skip_no_screenshot', {
-      snapshotId: snapshot._id.toString(),
-      monitorId: String(snapshot.monitor_id || ''),
-    });
-    return null;
-  }
+  if (!shot) return null;
 
   const sourceHash = sha1(shot);
-
   const existing = snapshot.vision_ocr || null;
-  const existingHash = existing?.sourceHash || null;
 
-  if (!force && existing && existingHash && existingHash === sourceHash) {
+  // Cache check: jeśli to ten sam obraz i mamy już wynik (lub błąd)
+  if (!force && existing && existing.sourceHash === sourceHash && (existing.clean_text || existing.error)) {
     return existing;
   }
 
   const t0 = performance.now();
-  log.info('snapshot_ocr_start', {
-    snapshotId: snapshot._id.toString(),
-    monitorId: String(snapshot.monitor_id || ''),
-    sourceHash,
-    force,
-  });
 
-  const ocr = await ocrImageWithTesseract({
+  const ocr = await ocrImageWithPaddle({
     base64: shot,
     lang,
-    psm,
     timeoutMs,
     clean: true,
     cleanOptions,
+    pythonBin,
   });
 
+  const rawText = (ocr.text || '').toString();
+  const cleanText = (ocr.clean_text || '').toString();
+
+  // clean_lines potrafi być duże; zabezpieczenie na Mongo 16MB
+  let cleanLines = Array.isArray(ocr.clean_lines) ? ocr.clean_lines : null;
+  let cleanLinesTruncated = false;
+  if (cleanLines) {
+    const maxLines = Number(process.env.OCR_MAX_STORED_LINES || 1200);
+    const maxChars = Number(process.env.OCR_MAX_STORED_LINES_CHARS || 600000);
+    let total = 0;
+    for (const l of cleanLines) total += String(l || '').length;
+    if (cleanLines.length > maxLines || total > maxChars) {
+      cleanLines = cleanLines.slice(0, maxLines);
+      cleanLinesTruncated = true;
+    }
+  }
+
+  // Mongo walidacja: niektóre schemy nie lubią pustych stringów/null
+  // Zostawiamy "spację" jako minimalną wartość, ale status rozpoznajesz po `ok`/`error`.
+  const finalCleanText = cleanText.trim().length ? cleanText : ' ';
+
+  const ok = !ocr.error;
+
   const doc = {
-    engine: 'tesseract',
-    meta: { lang, psm },
+    engine: 'paddleocr',
+    ok,
+    error: ocr.error || null,
+
     createdAt: new Date(),
     sourceHash,
-    confidence: ocr?.confidence ?? null,
-    // trzymamy wersję "clean" jako główne źródło
-    clean_text: normalizeOcrText(ocr?.clean_text || ocr?.text || ''),
-    clean_meta: ocr?.clean_meta ?? null,
+    confidence: ocr.confidence ?? null,
+
+    // Teksty:
+    raw_text: rawText,          // może być pusty
+    clean_text: finalCleanText, // zawsze niepusty (min 1)
+    clean_lines: cleanLines,
+    clean_meta: ocr.clean_meta || null,
+
+    meta: {
+      lang: ocr.lang,
+      python: ocr.python_used,
+      script: ocr.script_used,
+      stderr: (ocr.stderr || '').slice(0, 2000),
+      cleanLinesTruncated,
+      ...(saveStdout ? { stdout: (ocr.stdout || '').slice(0, 2000) } : {}),
+    },
   };
 
   await snapshotsCol.updateOne(
@@ -102,16 +134,17 @@ export async function ensureSnapshotOcr(
     { $set: { vision_ocr: doc } },
   );
 
-  // aktualizacja obiektu w pamięci, żeby kolejne kroki pipeline miały to od razu
   snapshot.vision_ocr = doc;
 
   log.info('snapshot_ocr_done', {
-    snapshotId: snapshot._id.toString(),
-    monitorId: String(snapshot.monitor_id || ''),
-    durationMs: Math.round(performance.now() - t0),
-    confidence: doc.confidence,
-    chars: doc.clean_text ? doc.clean_text.length : 0,
+    id: snapshot._id,
+    ms: Math.round(performance.now() - t0),
+    ok: doc.ok,
+    err: doc.error,
+    lenRaw: doc.raw_text.length,
+    lenClean: doc.clean_text.length,
   });
 
   return doc;
 }
+

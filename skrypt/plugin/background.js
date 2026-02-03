@@ -43,10 +43,36 @@ async function fetchNextPluginTask() {
       console.warn('[plugin] fetchNextPluginTask json parse error', e);
       return null;
     }
-
     if (!data || !data.url || !data.task_id) return null;
-    return data;
-  } catch (err) {
+
+    // Normalizacja pól ID (backend/wersje mogą zwracać snake_case albo camelCase)
+    const normId = (v) => {
+      const s = String(v ?? '').trim();
+      return s.length ? s : null;
+    };
+
+    const task = {
+      task_id: normId(data.task_id ?? data.taskId ?? data.id),
+      monitor_id: normId(data.monitor_id ?? data.monitorId),
+      zadanie_id: normId(data.zadanie_id ?? data.zadanieId),
+      url: data.url,
+      mode: data.mode || 'fallback',
+    };
+
+    if (!task.task_id || !task.url) return null;
+
+    // Jeżeli te pola są puste, backend i tak zwróci 400 (MISSING_FIELDS) – więc logujmy to wcześnie.
+    if (!task.monitor_id || !task.zadanie_id) {
+      console.warn('[plugin] task missing monitor_id/zadanie_id', {
+        task_id: task.task_id,
+        keys: Object.keys(data || {}),
+        monitor_id: task.monitor_id,
+        zadanie_id: task.zadanie_id,
+      });
+    }
+
+    return task;
+} catch (err) {
     console.error('[plugin] fetchNextPluginTask error', err);
     return null;
   }
@@ -153,10 +179,52 @@ function getPageMetrics() {
   };
 }
 
-function scrollToY(y) {
-  window.scrollTo(0, y);
+async function scrollToYAndWait(y) {
   const doc = document.documentElement;
   const body = document.body;
+
+  // Wymuś brak smooth scroll (często rozwiązuje "scrollTo nie rusza od razu")
+  const prevDocSB = doc?.style?.scrollBehavior;
+  const prevBodySB = body?.style?.scrollBehavior;
+  try {
+    if (doc?.style) doc.style.scrollBehavior = 'auto';
+    if (body?.style) body.style.scrollBehavior = 'auto';
+  } catch {
+    // ignore
+  }
+
+  try {
+    window.scrollTo({ top: y, left: 0, behavior: 'auto' });
+  } catch {
+    window.scrollTo(0, y);
+  }
+
+  // Poczekaj aż scroll się ustabilizuje (lub timeout). Bez tego "actualY" bywa stare.
+  let lastY = -1;
+  let stableFrames = 0;
+  const t0 = performance.now();
+
+  while (performance.now() - t0 < 1500) {
+    await new Promise((r) => requestAnimationFrame(r));
+    const curY = window.scrollY || 0;
+
+    if (curY === lastY) {
+      stableFrames += 1;
+      if (stableFrames >= 2) break;
+    } else {
+      stableFrames = 0;
+      lastY = curY;
+    }
+  }
+
+  // Przywróć style
+  try {
+    if (doc?.style) doc.style.scrollBehavior = prevDocSB ?? '';
+    if (body?.style) body.style.scrollBehavior = prevBodySB ?? '';
+  } catch {
+    // ignore
+  }
+
   const totalHeight = Math.max(
     doc?.scrollHeight || 0,
     body?.scrollHeight || 0,
@@ -171,6 +239,7 @@ function scrollToY(y) {
     maxScrollY,
   };
 }
+
 
 // Wykonuje screenshot aktywnej zakładki w danym oknie.
 function captureVisibleTabDataUrl(windowId, { format = 'jpeg', quality = 90 } = {}) {
@@ -294,16 +363,26 @@ async function captureFullPageScreenshotDataUrl(windowId, tabId, { format = 'jpe
   let lastActualY = -1;
 
   for (const requestedY of positions) {
-    const [scrollRes] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: scrollToY,
-      args: [requestedY],
-    });
+    const scrollOnce = async () => {
+      const [scrollRes] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: scrollToYAndWait,
+        args: [requestedY],
+      });
+      return scrollRes?.result?.y ?? requestedY;
+    };
 
-    const actualY = scrollRes?.result?.y ?? requestedY;
+    let actualY = await scrollOnce();
 
-    // brak postępu => jesteś na dole / scroll clamp -> kończ
-    if (actualY === lastActualY && shots.length > 0) break;
+    // Brak postępu -> często oznacza smooth scroll / throttling / brak focusu.
+    // Spróbuj raz z focusem i dopiero potem uznaj, że jesteś na dole.
+    if (actualY === lastActualY && shots.length > 0) {
+      if (requestedY > lastActualY) {
+        await focusAndActivate(windowId, tabId);
+        actualY = await scrollOnce();
+      }
+      if (actualY === lastActualY) break;
+    }
 
     // poczekaj aż strona się dorysuje po scrollu
     await chrome.scripting.executeScript({
@@ -325,7 +404,7 @@ async function captureFullPageScreenshotDataUrl(windowId, tabId, { format = 'jpe
   // 4) przywróć scroll
   await chrome.scripting.executeScript({
     target: { tabId },
-    func: scrollToY,
+    func: scrollToYAndWait,
     args: [originalY],
   });
 
@@ -797,7 +876,7 @@ function waitForLoadAndSendScreenshot(windowId, tabId, task) {
 async function processTask(task) {
   console.log('[plugin] got task', task);
   const startTime = performance.now();
-  console.log('[plugin] task_started', { task_id: task.task_id, started_at: new Date().toISOString() });
+  console.log('[plugin] task_started', { task_id: task.task_id, monitor_id: task.monitor_id, zadanie_id: task.zadanie_id, started_at: new Date().toISOString() });
 
   try {
     const { windowId, tabId } = await openWindowForTask(task);
