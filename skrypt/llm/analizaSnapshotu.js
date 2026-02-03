@@ -1,970 +1,450 @@
-// skrypt/analizaSnapshotu.js
+// skrypt/llm/analizaSnapshotu.js
+// Snapshot analysis (text-only) + optional semantic chunk template.
+//
+// IMPORTANT:
+// - LLM receives ONLY text extracted from the page (extracted_v2.text and/or OCR clean_text).
+// - Semantic chunking is handled via an "anchor template" which we try to REUSE from baseline analysis.
+
 import { mongoClient } from '../polaczenieMDB.js';
-import { generateTextWithOllama } from './ollamaClient.js';
-import {
-  sanitizeNullableString as sanitizeNullableStringUtil,
-  sanitizeRequiredString as sanitizeRequiredStringUtil,
-  parseTrackedFields,
-  hashUserPrompt,
-  parseJsonFromLLM,
-  parseKeyValueBlock,
-  normalizePriceHint,
-  resolveEffectivePrompt,
-} from './analysisUtils.js';
-import { Double } from 'mongodb';
+import { Double, ObjectId } from 'mongodb';
 import { performance } from 'node:perf_hooks';
 
+import { generateTextWithOllama } from './ollamaClient.js';
+import {
+  sanitizeNullableString,
+  sanitizeRequiredString,
+  clampText,
+  hashUserPrompt,
+} from './analysisUtils.js';
+import {
+  buildChunkTemplateLLM,
+  scoreTemplateFit,
+} from './llmChunker.js';
+import { ensureSnapshotChunks } from './chunksSnapshotu.js';
+import { extractEvidenceFromChunksLLM } from './llmEvidence.js';
 
-const db = mongoClient.db('inzynierka');
-const analizyCol = db.collection('analizy');
+const db = mongoClient.db(process.env.MONGO_DB || 'inzynierka');
+const analysesCol = db.collection('analizy');
+const snapshotsCol = db.collection('snapshots');
 
-const MAX_TEXT_CHARS = 8000;
-const SYSTEM_DEFAULT_SNAPSHOT_PROMPT =
-  'Opisz krótko stronę produktu, typ produktu, walutę oraz cechy dostępne na stronie.';
+const OLLAMA_MODEL =
+  process.env.OLLAMA_TEXT_MODEL ||
+  process.env.LLM_MODEL ||
+  'qwen2.5:3b-instruct';
 
+function normalizeUserPrompt(value) {
+  const s = String(value || '').trim();
+  return s.length ? s : null;
+}
 
-function toNumberMaybe(v) {
-  if (v == null) return null;
-  const s = String(v)
-    .replace(/\u00A0/g, ' ')
-    .replace(/[^\d.,-]/g, ' ')
-    .trim();
-
-  const m = s.match(/-?\d[\d ]*(?:[.,]\d+)?/);
-  if (!m) return null;
-
-  const n = Number(m[0].replace(/ /g, '').replace(',', '.'));
+function normalizeNumberOrNull(value) {
+  if (value == null) return null;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const s = String(value).replace(',', '.').match(/-?\d+(?:\.\d+)?/);
+  if (!s) return null;
+  const n = Number(s[0]);
   return Number.isFinite(n) ? n : null;
 }
 
-function normalizeCurrencyFromText(s) {
-  const t = String(s || '').toLowerCase();
-  if (t.includes('zł') || t.includes('pln')) return 'PLN';
-  if (t.includes('€') || t.includes('eur')) return 'EUR';
-  if (t.includes('$') || t.includes('usd')) return 'USD';
-  if (t.includes('£') || t.includes('gbp')) return 'GBP';
-  return null;
-}
-
-function parseExtractorPrice(extractedPrice) {
-  if (!extractedPrice) return null;
-  if (typeof extractedPrice === 'string') {
-    const value = toNumberMaybe(extractedPrice);
-    if (value == null) return null;
-    return { value, currency: normalizeCurrencyFromText(extractedPrice) };
-  }
-  if (typeof extractedPrice === 'object') {
-    const value = toNumberMaybe(extractedPrice.value ?? extractedPrice.amount ?? null);
-    if (value == null) return null;
-    const currency =
-      extractedPrice.currency ??
-      normalizeCurrencyFromText(extractedPrice.value ?? '') ??
-      null;
-    return { value, currency };
-  }
-  return null;
-}
-
-// ostrożnie: bierz tylko gdy się powtarza (mode), żeby nie zgadywać “main”
-function pickMainPriceFromPluginPrices(pluginPrices) {
-  if (!Array.isArray(pluginPrices) || pluginPrices.length === 0) return null;
-
-  const parsed = pluginPrices
-    .map((p) => ({
-      value: toNumberMaybe(p?.value ?? p),
-      currency: p?.currency ?? null,
-      raw: p,
-    }))
-    .filter((x) => typeof x.value === 'number');
-
-  if (!parsed.length) return null;
-
-  const counts = new Map();
-  for (const it of parsed) {
-    const key = `${it.currency || ''}|${it.value.toFixed(2)}`;
-    counts.set(key, (counts.get(key) || 0) + 1);
-  }
-
-  let bestKey = null;
-  let bestCount = 0;
-  for (const [k, c] of counts.entries()) {
-    if (c > bestCount) {
-      bestCount = c;
-      bestKey = k;
-    }
-  }
-
-  // jeśli nic się nie powtarza → brak dowodu, nie zgadujemy
-  if (!bestKey || bestCount < 2) return null;
-
-  const [currencyRaw, valueRaw] = bestKey.split('|');
-  return {
-    value: Number(valueRaw),
-    currency: currencyRaw || null,
-  };
-}
-
-
-
-
-
-
-
-
-function extractPriceHintFromText(text) {
-  if (!text) return { value: null, currency: null };
-
-  const s = String(text).replace(/\s+/g, ' ').trim();
-  if (!s) return { value: null, currency: null };
-
-  // np. "1769,00 zł", "1 699 PLN", "199 €"
-  const priceWithCurrRe = /(\d[\d\s.,]*\d?)\s*(zł|pln|eur|€|usd|\$|£)/gi;
-  const deliveryHints = [
-    'dostawa',
-    'wysyłka',
-    'shipping',
-    'delivery',
-    'przesyłka',
-    'odbiór',
-  ];
-  const mainPriceHints = ['cena', 'price', 'wartość', 'do zapłaty', 'pay'];
-
-  const candidates = [];
-  let match;
-  while ((match = priceWithCurrRe.exec(s))) {
-    const rawValue = match[1].trim().replace(/\s+/g, ' ');
-    const currRaw = match[2].trim();
-    const c = currRaw.toLowerCase();
-    let currency = null;
-    if (c.includes('zł') || c === 'pln') currency = 'PLN';
-    else if (c.includes('eur') || c === '€') currency = 'EUR';
-    else if (c.includes('usd') || c === '$') currency = 'USD';
-    else if (c.includes('£')) currency = 'GBP';
-
-    const value = toNumberMaybe(rawValue);
-    if (typeof value !== 'number') continue;
-
-    const contextStart = Math.max(0, match.index - 40);
-    const contextEnd = Math.min(s.length, match.index + match[0].length + 40);
-    const context = s.slice(contextStart, contextEnd).toLowerCase();
-    const isDelivery = deliveryHints.some((hint) => context.includes(hint));
-    const hasMainHint = mainPriceHints.some((hint) => context.includes(hint));
-
-    candidates.push({
-      value,
-      currency,
-      isDelivery,
-      hasMainHint,
+function normalizeUniversalData(value) {
+  const arr = Array.isArray(value) ? value : [];
+  const out = [];
+  for (const it of arr) {
+    if (!it || typeof it !== 'object') continue;
+    const key = String(it.key || '').trim();
+    if (!key) continue;
+    out.push({
+      key,
+      label: String(it.label || '').trim() || key,
+      value: String(it.value ?? '').trim() || 'unknown',
     });
   }
-
-  if (!candidates.length) return { value: null, currency: null };
-
-  const preferred = candidates.filter((c) => !c.isDelivery);
-  const pool = preferred.length ? preferred : candidates;
-  const withMainHint = pool.filter((c) => c.hasMainHint);
-  const ranked = withMainHint.length ? withMainHint : pool;
-  ranked.sort((a, b) => b.value - a.value);
-
-  const winner = ranked[0];
-  return { value: winner.value, currency: winner.currency };
-}
-
-function normalizePriceObject(price) {
-  if (!price || typeof price !== 'object') {
-    return { value: null, currency: null };
-  }
-  const value = toNumberMaybe(price.value ?? price.amount ?? null);
-  return {
-    value: typeof value === 'number' ? value : null,
-    currency: sanitizeNullableStringUtil(price.currency),
-  };
-}
-
-function normalizeFeatures(input) {
-  if (!Array.isArray(input)) return [];
-  return input
-    .map((item) => (item == null ? '' : String(item).trim()))
-    .filter((item) => item.length > 0);
-}
-
-function parseFeatures(input) {
-  if (!input) return [];
-  const items = Array.isArray(input) ? input : [input];
-  return items
-    .flatMap((item) => String(item).split(/\r?\n|\|/))
-    .map((part) => part.replace(/^-+\s*/, '').trim())
-    .filter((part) => part.length > 0);
-}
-
-function normalizeUserPromptValue(input) {
-  const trimmed = (input ?? '').toString().trim();
-  return trimmed.length ? trimmed : null;
-}
-
-function buildUnknownExtra(source) {
-  return {
-    value: 'unknown',
-    confidence: 0,
-    evidence: [],
-    source: source || 'ocr',
-  };
-}
-
-function normalizeEvidenceArray(input) {
-  if (!Array.isArray(input)) return [];
-  return input
-    .map((item) => (item == null ? '' : String(item).trim()))
-    .filter((item) => item.length > 0);
-}
-
-function buildContextPack({ title, description, text, ocrText, pluginPrices }) {
-  const extractedText = [title, description, text]
-    .map((item) => (item == null ? '' : String(item).trim()))
-    .filter((item) => item.length > 0)
-    .join('\n');
-
-  const ocr = String(ocrText || '');
-  const plugin = pluginPrices && pluginPrices.length ? JSON.stringify(pluginPrices) : '';
-
-  const combined = [extractedText, plugin, ocr].filter((item) => item.length > 0).join('\n');
-
-  return {
-    extractedText,
-    ocrText: ocr,
-    pluginText: plugin,
-    contextPackText: combined,
-  };
-}
-
-function pickEvidenceSource(evidence, contextPack) {
-  if (!evidence) return null;
-  if (contextPack.ocrText.includes(evidence)) return 'ocr';
-  if (contextPack.extractedText.includes(evidence)) return 'extracted';
-  if (contextPack.pluginText.includes(evidence)) return 'plugin';
-  return null;
-}
-
-function sanitizeExtrasFromLLM({ trackedFields, rawExtras, contextPack }) {
-  const extras = {};
-  const allowedSources = new Set(['ocr', 'extracted', 'plugin']);
-
-  for (const field of trackedFields) {
-    const candidate = rawExtras && typeof rawExtras === 'object' ? rawExtras[field] : null;
-    if (!candidate || typeof candidate !== 'object') {
-      extras[field] = buildUnknownExtra('ocr');
-      continue;
-    }
-
-    const evidence = normalizeEvidenceArray(candidate.evidence);
-    const source = allowedSources.has(candidate.source) ? candidate.source : 'ocr';
-    const contextText =
-      source === 'ocr'
-        ? contextPack.ocrText
-        : source === 'extracted'
-          ? contextPack.extractedText
-          : source === 'plugin'
-            ? contextPack.pluginText
-            : '';
-    const packText = contextPack.contextPackText || '';
-
-    if (!evidence.length || !packText) {
-      extras[field] = buildUnknownExtra(source);
-      continue;
-    }
-
-    const evidenceOk = evidence.every((snippet) => contextText.includes(snippet));
-    const evidenceOkInPack = evidence.every((snippet) => packText.includes(snippet));
-    if (!evidenceOk || !evidenceOkInPack) {
-      extras[field] = buildUnknownExtra(source);
-      continue;
-    }
-
-    let value = candidate.value;
-    if (field === 'main_price' || field === 'review_count' || field === 'rating') {
-      value = toNumberMaybe(value);
-    }
-
-    if (value == null) {
-      extras[field] = buildUnknownExtra(source);
-      continue;
-    }
-
-    const confidence =
-      typeof candidate.confidence === 'number' && Number.isFinite(candidate.confidence)
-        ? Math.max(0, Math.min(1, candidate.confidence))
-        : 0;
-
-    extras[field] = {
-      value,
-      confidence,
-      evidence,
-      source,
-    };
-  }
-
-  return extras;
-}
-
-function extractReviewCountFromText(text) {
-  const s = String(text || '');
-  const re = /(\d+)\s*(opinii|opinie|reviews|review)/i;
-  const match = s.match(re);
-  if (!match) return null;
-  const value = toNumberMaybe(match[1]);
-  if (value == null) return null;
-  return { value, evidence: match[0] };
-}
-
-function extractRatingFromText(text) {
-  const s = String(text || '');
-  const slashMatch = s.match(/(\d+(?:[.,]\d+)?)\s*\/\s*5/i);
-  if (slashMatch) {
-    const value = toNumberMaybe(slashMatch[1]);
-    if (value != null) return { value, evidence: slashMatch[0] };
-  }
-  const ratingMatch = s.match(/rating\s*(\d+(?:[.,]\d+)?)/i);
-  if (!ratingMatch) return null;
-  const value = toNumberMaybe(ratingMatch[1]);
-  if (value == null) return null;
-  return { value, evidence: ratingMatch[0] };
-}
-
-function extractPriceEvidenceFromText(text) {
-  const s = String(text || '');
-  const priceWithCurrRe = /(\d[\d\s.,]*\d?)\s*(zł|pln|eur|€|usd|\$|£)/gi;
-  const match = priceWithCurrRe.exec(s);
-  if (!match) return null;
-  const value = toNumberMaybe(match[1]);
-  if (value == null) return null;
-  const currency = normalizeCurrencyFromText(match[2]);
-  return { value, currency, evidence: match[0] };
-}
-
-function findPriceEvidenceForValue(text, targetValue) {
-  if (targetValue == null) return null;
-  const s = String(text || '');
-  const priceWithCurrRe = /(\d[\d\s.,]*\d?)\s*(zł|pln|eur|€|usd|\$|£)/gi;
-  let match;
-  while ((match = priceWithCurrRe.exec(s))) {
-    const value = toNumberMaybe(match[1]);
-    if (value == null) continue;
-    if (Number(value) === Number(targetValue)) {
-      const currency = normalizeCurrencyFromText(match[2]);
-      return { value, currency, evidence: match[0] };
-    }
-  }
-  return null;
-}
-
-async function extractExtrasForTrackedFields({
-  trackedFields,
-  contextPack,
-  extracted_v2,
-  pluginPrices,
-  mainPrice,
-  logger,
-}) {
-  if (!trackedFields.length) return {};
-
-  const basePrompt = `
-Jesteś ekstraktorem pól z danych wejściowych.
-Zwróć WYŁĄCZNIE JSON w formacie:
-{
-  "extras": {
-    "<field>": {
-      "value": number lub "unknown",
-      "confidence": number (0..1),
-      "evidence": ["dokładne cytaty z danych wejściowych"],
-      "source": "ocr" | "extracted" | "plugin"
-    }
-  }
-}
-
-Zwracaj WYŁĄCZNIE pola: ${trackedFields.join(', ')}.
-Nie zgaduj. Jeśli nie potrafisz poprzeć wartości cytatem z danych wejściowych -> ustaw value="unknown", confidence=0, evidence=[].
-Nie używaj liczb z instrukcji użytkownika jako źródła prawdy.
-
-INPUT DATA (OCR/DOM/PLUGIN):
-${contextPack.contextPackText || '[EMPTY]'}
-`.trim();
-
-  let rawResponse = null;
-  let rawExtras = null;
-
-  try {
-    rawResponse = await generateTextWithOllama({
-      prompt: basePrompt,
-      logger,
-      temperature: 0,
-    });
-
-    const parsed = parseJsonFromResponse(rawResponse);
-    if (parsed && typeof parsed === 'object') {
-      rawExtras = parsed.extras || parsed;
-    }
-  } catch (err) {
-    logger?.warn?.('snapshot_extras_llm_error', {
-      error: err?.message || String(err),
-    });
-  }
-
-  if (rawExtras && typeof rawExtras === 'object') {
-    return sanitizeExtrasFromLLM({
-      trackedFields,
-      rawExtras,
-      contextPack,
-    });
-  }
-
-  const fallbackRawExtras = {};
-  const combinedText = contextPack.contextPackText;
-
-  if (trackedFields.includes('main_price')) {
-    const fallbackValue = typeof mainPrice?.value === 'number' ? mainPrice.value : null;
-
-    if (fallbackValue != null) {
-      const extractedPriceRaw = extracted_v2?.price
-        ? typeof extracted_v2.price === 'string'
-          ? extracted_v2.price
-          : `${extracted_v2.price?.value ?? ''} ${extracted_v2.price?.currency ?? ''}`.trim()
-        : '';
-      const extractedParsed = extracted_v2?.price ? parseExtractorPrice(extracted_v2.price) : null;
-      const pluginMain = pluginPrices.length ? pickMainPriceFromPluginPrices(pluginPrices) : null;
-
-      if (extracted_v2?.price) {
-        if (extractedParsed && typeof extractedParsed.value === 'number' && extractedParsed.value === fallbackValue) {
-          const evidence = extractedPriceRaw && combinedText.includes(extractedPriceRaw) ? extractedPriceRaw : null;
-          if (evidence) {
-            fallbackRawExtras.main_price = {
-              value: extractedParsed.value,
-              confidence: 0.6,
-              evidence: [evidence],
-              source: 'extracted',
-            };
-          }
-        }
-      }
-
-      if (!fallbackRawExtras.main_price && pluginPrices.length) {
-        if (pluginMain && typeof pluginMain.value === 'number' && pluginMain.value === fallbackValue) {
-          const matching = pluginPrices.find((p) => toNumberMaybe(p?.value ?? p) === pluginMain.value);
-          const evidence = matching ? JSON.stringify(matching) : null;
-          if (evidence && combinedText.includes(evidence)) {
-            fallbackRawExtras.main_price = {
-              value: pluginMain.value,
-              confidence: 0.5,
-              evidence: [evidence],
-              source: 'plugin',
-            };
-          }
-        }
-      }
-
-      if (!fallbackRawExtras.main_price) {
-        const evidence =
-          findPriceEvidenceForValue(combinedText, fallbackValue) ||
-          extractPriceEvidenceFromText(combinedText);
-        if (evidence && typeof evidence.value === 'number' && evidence.value === fallbackValue) {
-          fallbackRawExtras.main_price = {
-            value: evidence.value,
-            confidence: 0.5,
-            evidence: [evidence.evidence],
-            source: 'ocr',
-          };
-        }
-      }
-
-      if (!fallbackRawExtras.main_price) {
-        const inferredSource =
-          pluginMain && pluginMain.value === fallbackValue
-            ? 'plugin'
-            : extractedParsed && extractedParsed.value === fallbackValue
-              ? 'extracted'
-              : 'ocr';
-        fallbackRawExtras.main_price = {
-          value: fallbackValue,
-          confidence: 0,
-          evidence: [],
-          source: inferredSource,
-        };
-      }
-    }
-  }
-
-  if (trackedFields.includes('review_count')) {
-    const reviewMatch = extractReviewCountFromText(combinedText);
-    if (reviewMatch) {
-      const source = pickEvidenceSource(reviewMatch.evidence, contextPack);
-      fallbackRawExtras.review_count = {
-        value: reviewMatch.value,
-        confidence: 0.5,
-        evidence: [reviewMatch.evidence],
-        source: source || 'ocr',
-      };
-    }
-  }
-
-  if (trackedFields.includes('rating')) {
-    const ratingMatch = extractRatingFromText(combinedText);
-    if (ratingMatch) {
-      const source = pickEvidenceSource(ratingMatch.evidence, contextPack);
-      fallbackRawExtras.rating = {
-        value: ratingMatch.value,
-        confidence: 0.5,
-        evidence: [ratingMatch.evidence],
-        source: source || 'ocr',
-      };
-    }
-  }
-
-  return sanitizeExtrasFromLLM({
-    trackedFields,
-    rawExtras: fallbackRawExtras,
-    contextPack,
-  });
-}
-
-function parseJsonFromResponse(rawResponse) {
-  const parsed = parseJsonFromLLM(rawResponse);
-  return parsed.ok ? parsed.data : null;
+  return out;
 }
 
 async function safeInsertAnalysis(doc, { logger, snapshotId } = {}) {
-  let insertedId = null;
+  const log = logger || console;
   try {
-    const result = await analizyCol.insertOne(doc);
-    insertedId = result?.insertedId ?? null;
+    const { insertedId } = await analysesCol.insertOne(doc);
+    return { insertedId };
   } catch (err) {
-    logger?.error?.('snapshot_analysis_insert_failed', {
-      snapshotId: snapshotId?.toString?.() || String(snapshotId || ''),
-      code: err?.code ?? null,
-      message: err?.message || String(err),
-      errInfo: err?.errInfo ?? null,
+    log?.error?.('mongo_insert_analysis_failed', {
+      snapshotId: snapshotId?.toString?.() || null,
+      error: err?.message || String(err),
     });
+    return { insertedId: null };
   }
-  return { doc, insertedId };
 }
 
-export async function ensureSnapshotAnalysis(snapshot, { force = false, logger, userPrompt } = {}) {
+async function getExistingAnalysisForSnapshot(snapshotId) {
+  if (!snapshotId) return null;
+  return analysesCol.findOne({ snapshot_id: new ObjectId(snapshotId) });
+}
 
-  // jeśli już jest analiza – zwracamy ją
-  const t0 = performance.now();
-  const existing = await analizyCol.findOne({
-    snapshot_id: snapshot._id,
-    type: 'snapshot',
-  });
-
-  // jeśli już jest analiza – zwracamy ją (chyba że force=true)
-  if (existing && !force) {
-    logger?.info('snapshot_analysis_cached', {
-      snapshotId: snapshot._id.toString(),
-      monitorId: String(snapshot.monitor_id || ''),
-      zadanieId: String(snapshot.zadanie_id || ''),
-      url: snapshot.url,
-      durationMs: Math.round(performance.now() - t0),
-    });
-    return existing;
-  }
-
-  // force=true → kasujemy starą analizę i generujemy nową
-  if (existing && force) {
-    await analizyCol.deleteOne({ _id: existing._id });
-    logger?.info('snapshot_analysis_force_regenerate', {
-      snapshotId: snapshot._id.toString(),
-      monitorId: String(snapshot.monitor_id || ''),
-      zadanieId: String(snapshot.zadanie_id || ''),
-      url: snapshot.url,
-    });
-  }
-
-
-
-  const {
-    _id,
-    monitor_id,
-    zadanie_id,
-    url,
-    extracted_v2,
-    plugin_prices,
-  } = snapshot;
-
-  if (!zadanie_id) {
-    logger?.warn('snapshot_missing_zadanie_id', {
-      snapshotId: _id.toString(),
-      monitorId: String(monitor_id || ''),
-      url,
-    });
-    return null;
-  }
-
-  logger?.info('snapshot_analysis_start', {
-    snapshotId: _id.toString(),
-    monitorId: String(monitor_id || ''),
-    zadanieId: String(zadanie_id || ''),
-    url,
-  });
-
-  const title = (extracted_v2?.title || '').toString();
-  const description = (extracted_v2?.description || '').toString();
-
-  // OCR może być jedynym sensownym źródłem treści (np. Allegro/Booking, dużo JS)
-  const ocrTextFull =
-    snapshot?.vision_ocr?.clean_text ||
-    snapshot?.vision_ocr?.clean_text_preview ||
+function chooseTextSources(snapshot) {
+  const extractedText =
+    sanitizeNullableString(snapshot?.extracted_v2?.clean_text) ||
+    sanitizeNullableString(snapshot?.extracted_v2?.text) ||
+    '';
+  const ocrText =
+    sanitizeNullableString(snapshot?.vision_ocr?.clean_text) ||
+    sanitizeNullableString(snapshot?.vision_ocr?.text) ||
     '';
 
-  let text = (extracted_v2?.text || '').toString();
+  // Prefer extracted (DOM text) when it is not empty; OCR is fallback.
+  const primary = extractedText.trim() ? { source: 'extracted', text: extractedText } : null;
+  const secondary = ocrText.trim() ? { source: 'ocr', text: ocrText } : null;
+  return { primary, secondary };
+}
 
-  // fallback: extractor dał pusty tekst → bierz OCR
-  if (!text.trim() && ocrTextFull) {
-    text = ocrTextFull;
-  }
+function buildUniversalPrompt({ userPrompt, extractedText, ocrText }) {
+  const up = userPrompt ? `USER_PROMPT:\n${userPrompt}\n\n` : 'USER_PROMPT:\n(brak)\n\n';
 
-  if (text.length > MAX_TEXT_CHARS) {
-    text = text.slice(0, MAX_TEXT_CHARS) + '\n...[TRUNCATED]';
-  }
+  // Hard clamp to prevent token blow-ups.
+  const ex = extractedText ? clampText(extractedText, 9000) : '';
+  const ocr = ocrText ? clampText(ocrText, 9000) : '';
 
-  const ocrPreview = ocrTextFull
-    ? ocrTextFull.slice(0, Math.min(MAX_TEXT_CHARS, 3500))
-    : '';
-
-  // ceny z pluginu (jeśli są)
-  const pluginPrices = Array.isArray(plugin_prices)
-    ? plugin_prices
-    : Array.isArray(snapshot.plugin_prices)
-      ? snapshot.plugin_prices
-      : [];
-
-  const normalizedUserPrompt = normalizeUserPromptValue(userPrompt);
-  const effectiveUserPrompt = resolveEffectivePrompt(
-    normalizedUserPrompt,
-    SYSTEM_DEFAULT_SNAPSHOT_PROMPT,
+  // NOTE: LLM gets only text from the page (extracted/OCR). No images.
+  return (
+    up +
+    'CONTEXT:\n\n' +
+    (ex ? `EXTRACTED_TEXT:\n${ex}\n\n` : '') +
+    (ocr ? `OCR_TEXT:\n${ocr}\n\n` : '') +
+    'Zwróć JSON o strukturze:\n\n' +
+    '{ "summary": string, "metrics": { "rating": number|null, "reviews_count": number|null }, "universal_data": [ { "key": string, "label": string, "value": string } ] }'
   );
-  const { trackedFields, strict } = parseTrackedFields(normalizedUserPrompt);
-  const intent = {
-    userPrompt: normalizedUserPrompt,
-    userPromptHash: hashUserPrompt(normalizedUserPrompt),
-    schemaVersion: 'extras_v1',
-    trackedFields,
-    strict,
-  };
+}
 
-  const ocrPrice = extractPriceHintFromText(ocrTextFull);
-  const extractorMain = parseExtractorPrice(extracted_v2?.price);
-const pluginMain = pickMainPriceFromPluginPrices(pluginPrices);
+function buildUniversalSystem() {
+  return [
+    'Jesteś narzędziem do ekstrakcji uniwersalnych danych ze strony na podstawie TEKSTU.',
+    'Nie zgadujesz. Jeśli czegoś nie ma lub jest niejednoznaczne -> użyj null/"unknown".',
+    'Zwróć WYŁĄCZNIE poprawny JSON.',
+  ].join('\n');
+}
 
-// OCR fallback zostawiamy jako “hint”, ale też parsujemy do number
-const ocrMain =
-  ocrPrice?.value ? { value: toNumberMaybe(ocrPrice.value), currency: ocrPrice.currency ?? null } : null;
+function isValidChunkTemplate(tpl) {
+  if (!tpl || typeof tpl !== 'object') return false;
+  if (tpl.error) return false;
+  if (!Array.isArray(tpl.chunks) || tpl.chunks.length < 1) return false;
+  // minimalna walidacja struktury (żeby nie reuse'ować śmieci)
+  return tpl.chunks.every((c) =>
+    c &&
+    typeof c === 'object' &&
+    typeof c.key === 'string' &&
+    c.key.trim().length > 0 &&
+    Array.isArray(c.anchor_candidates) &&
+    c.anchor_candidates.length > 0,
+  );
+}
 
-const mainPrice =
-  extractorMain ||
-  pluginMain ||
-  (ocrMain && typeof ocrMain.value === 'number' ? ocrMain : null);
+async function buildOrReuseChunkTemplate({
+  snapshot,
+  // userPrompt intentionally ignored for chunk template.
+  // Chunking must be page-structure-driven and reusable across runs.
+  userPrompt,
+  reuseTemplate,
+  logger,
+}) {
+  const log = logger || console;
+  const enabled = process.env.LLM_CHUNKING_ENABLED === '1';
+  if (!enabled) return null;
 
+  const { primary, secondary } = chooseTextSources(snapshot);
 
-  let priceInfo;
-  const contextPack = buildContextPack({
-    title,
-    description,
-    text,
-    ocrText: ocrTextFull,
-    pluginPrices,
-  });
+  // For chunking we want the text that stays relatively stable across snapshots.
+  // Prefer extracted text, fallback to OCR.
+  const candidate = primary && primary.text.trim().length >= 400 ? primary : secondary;
+  if (!candidate) return null;
 
-  const extras = await extractExtrasForTrackedFields({
-    trackedFields,
-    contextPack,
-    extracted_v2,
-    pluginPrices,
-    mainPrice,
-    logger,
-  });
-
-  // extractor: obsłuż i "object", i "string"
-  if (extracted_v2?.price) {
-    const p = extracted_v2.price;
-    if (typeof p === 'string') {
-      priceInfo = `Cena główna z extractora: ${p}`;
-    } else {
-      priceInfo = `Cena główna z extractora: ${p.value ?? ''} ${p.currency ?? ''}`.trim();
+  // 1) Reuse (if provided and fits)
+  if (isValidChunkTemplate(reuseTemplate)) {
+    const fit = scoreTemplateFit(candidate.text, reuseTemplate);
+    const minFit = Number(process.env.LLM_CHUNK_MIN_FIT_RATIO || 0.6);
+    if (fit >= minFit) {
+      return {
+        ...reuseTemplate,
+        source: reuseTemplate.source || candidate.source,
+        reused: true,
+        fitRatio: fit,
+      };
     }
-  } else if (pluginPrices.length) {
-    const values = pluginPrices
-      .map((p) => Number(p.value))
-      .filter((x) => !Number.isNaN(x));
 
-    if (values.length) {
-      const minPrice = Math.min(...values);
-      priceInfo = `Cena z pluginu (minimalna znaleziona): ${minPrice}`;
-    } else {
-      priceInfo = `Ceny znalezione przez plugin: ${JSON.stringify(pluginPrices).slice(0, 500)}`;
-    }
-  } else if (ocrPrice.value) {
-    priceInfo = `Cena z OCR: ${ocrPrice.value}${ocrPrice.currency ? ` ${ocrPrice.currency}` : ''}`;
-  } else {
-    priceInfo = 'Brak ceny w extractorze i w pluginie (i nie wykryto jej z OCR).';
-  }
-
-  // twardy guard: jak naprawdę nie ma danych → nie odpalaj LLM
-  const hasAnyInput =
-    !!title.trim() || !!description.trim() || !!text.trim() || (pluginPrices.length > 0) || !!ocrTextFull.trim();
-
-  if (!hasAnyInput) {
-    const doc = {
-      zadanieId: String(zadanie_id),
-      monitorId: String(monitor_id),
-      score: new Double(0.0),
-      createdAt: new Date(),
-      type: 'snapshot',
-      snapshot_id: _id,
-      url,
-      model: process.env.OLLAMA_TEXT_MODEL || 'llama3',
-      prompt: null,
-      summary: '',
-      podsumowanie: '',
-      product_type: '',
-      main_currency: null,
-      price: { value: null, currency: null },
-      price_hint: { min: null, max: null },
-      features: [],
-      intent,
-      extras,
-      raw_response: null,
-      error: 'NO_INPUT_DATA',
-    };
-
-
-    const { doc: storedDoc, insertedId } = await safeInsertAnalysis(doc, {
-      logger,
-      snapshotId: _id,
+    log?.warn?.('llm_chunk_template_reuse_rejected', {
+      snapshotId: snapshot?._id?.toString?.() || null,
+      source: candidate.source,
+      fitRatio: fit,
+      minFit,
     });
-    if (insertedId) {
-      storedDoc._id = insertedId;
-      storedDoc._inserted = true;
-    } else {
-      storedDoc._id = null;
-      storedDoc._inserted = false;
-    }
-    return storedDoc;
   }
 
+  // 2) Build new template via LLM
+  const chunkModel = process.env.OLLAMA_CHUNK_MODEL || OLLAMA_MODEL;
+  const res = await buildChunkTemplateLLM(
+    {
+      text: candidate.text,
+      source: candidate.source,
+      url: snapshot?.url || null,
+      // NIE przekazujemy userPrompt do template chunków.
+      // UserPrompt ma wpływać na ocenę zmian, nie na segmentację.
+      model: chunkModel,
+    },
+    { logger: log },
+  );
 
-  const dataBlock = `
-Tytuł: ${title}
-Opis: ${description}
-${priceInfo}
+  if (!res?.ok || !res?.template) {
+    return {
+      source: candidate.source,
+      model: chunkModel,
+      createdAt: new Date().toISOString(),
+      durationMs: res?.durationMs || null,
+      chunks: [],
+      error: res?.error || 'LLM_CHUNK_TEMPLATE_FAILED',
+      reused: false,
+      fitRatio: 0,
+    };
+  }
 
-Tekst strony (extractor/OCR fallback, przycięty):
-${text}
+  // Store the normalized template with some metadata
+  const fitRatio = scoreTemplateFit(candidate.text, res.template);
+  return {
+    version: res.template.version,
+    source: candidate.source,
+    model: chunkModel,
+    createdAt: res.createdAt,
+    durationMs: res.durationMs,
+    text_sha1: res.text_sha1,
+    chunks: res.template.chunks,
+    error: null,
+    reused: false,
+    fitRatio,
+    repaired: res.repaired || 0,
+    fallbackUsed: !!res.fallbackUsed,
+  };
+}
 
-${ocrPreview ? `\nOCR ze screenshotu (preview):\n${ocrPreview}\n` : ''}
-`;
+export async function ensureSnapshotAnalysis(snapshotRef, options = {}) {
+  const { force = false, logger, userPrompt, reuseChunkTemplate } = options;
+  const log = logger || console;
+  const t0 = performance.now();
 
-  const userPromptSection = `
-Instrukcje użytkownika:
-${effectiveUserPrompt}
-`;
+  // Load snapshot if needed
+  let snapshot = snapshotRef;
+  if (!snapshot || typeof snapshot !== 'object' || !snapshot._id) {
+    snapshot = await snapshotsCol.findOne({ _id: new ObjectId(snapshotRef) });
+  }
+  if (!snapshot) return null;
 
-  const prompt = `
-Jesteś asystentem analizującym strony e-commerce.
-Zwróć WYŁĄCZNIE blok w formacie:
+  // Cache hit
+  if (!force) {
+    const existing = await getExistingAnalysisForSnapshot(snapshot._id);
+    if (existing) return existing;
+  }
 
-BEGIN_TRACKLY_ANALYSIS
-SUMMARY=krótki opis (1-3 zdania) co to za strona
-PRODUCT_TYPE=np. 'obuwie męskie', 'kurtki damskie', 'lista ogłoszeń', 'strona produktu'
-MAIN_CURRENCY=PLN|null
-PRICE_MIN=number|null
-PRICE_MAX=number|null
-FEATURE=- krótka lista cech typu: 'lista ofert', 'ma filtry rozmiaru', 'zawiera promocje'
-END_TRACKLY_ANALYSIS
+  const normalizedUserPrompt = normalizeUserPrompt(userPrompt || snapshot?.llm_prompt);
 
-Jeśli nie da się czegoś ustalić, wpisz null. FEATURE może wystąpić wielokrotnie (po jednej cesze na linię).
-ZWRÓĆ WYŁĄCZNIE TEN BLOK — bez żadnego dodatkowego tekstu, komentarzy, markdown ani bloków kodu.
+  const { primary, secondary } = chooseTextSources(snapshot);
+  const extractedText = primary?.source === 'extracted' ? primary.text : '';
+  const ocrText = secondary?.source === 'ocr' ? secondary.text : '';
 
-${userPromptSection}
-${dataBlock}
-`;
+  const prompt = buildUniversalPrompt({
+    userPrompt: normalizedUserPrompt,
+    extractedText,
+    ocrText,
+  });
 
+  log?.info?.('snapshot_analysis_llm_start', {
+    snapshotId: snapshot._id.toString(),
+    monitorId: String(snapshot.monitor_id || ''),
+    zadanieId: String(snapshot.zadanie_id || snapshot.zadanieId || ''),
+    model: OLLAMA_MODEL,
+    hasUserPrompt: !!normalizedUserPrompt,
+  });
 
-  let rawResponse = null;
+  let raw = null;
   let parsed = null;
-  let parsedKvMode = 'none';
-  let parsedKvDirect = false;
-  let parsedKvExtracted = false;
-  let fallbackUsed = false;
-  let fallbackReason = null;
+  let err = null;
 
   try {
-    const tLlm0 = performance.now();
-const analysisTimeoutMsRaw = Number(process.env.OLLAMA_TIMEOUT_MS_ANALYSIS);
-const analysisTimeoutMs = Number.isFinite(analysisTimeoutMsRaw) ? analysisTimeoutMsRaw : undefined;
-rawResponse = await generateTextWithOllama({
-  prompt,
-  logger,
-  options: { temperature: 0 },
-  timeoutMs: analysisTimeoutMs,
-});
-logger?.info('snapshot_analysis_llm_done', {
-  snapshotId: _id.toString(),
-  monitorId: String(monitor_id || ''),
-  zadanieId: String(zadanie_id || ''),
-  url,
-  durationMs: Math.round(performance.now() - tLlm0),
-});
-
-
-    const parsedResult = parseKeyValueBlock(rawResponse);
-    parsed = parsedResult.parsed;
-    parsedKvMode = parsedResult.parseMode || 'none';
-    parsedKvDirect = parsedKvMode === 'direct';
-    parsedKvExtracted = parsedKvMode === 'extracted';
-    logger?.info('analysis_kv_parse_mode', {
-      snapshotId: _id.toString(),
-      kv_parse_mode: parsedKvMode,
+    raw = await generateTextWithOllama({
+      prompt,
+      system: buildUniversalSystem(),
+      model: OLLAMA_MODEL,
+      format: 'json',
+      temperature: 0,
+      timeoutMs: Number(process.env.OLLAMA_TIMEOUT_MS_ANALYSIS || process.env.OLLAMA_TIMEOUT_MS || 180000),
     });
-    logger?.info('analysis_kv_extract_used', {
-      snapshotId: _id.toString(),
-      kv_extract_used: parsedResult.extracted,
-    });
-    if (parsedResult.error) {
-      logger?.info('analysis_kv_extract_error', {
-        snapshotId: _id.toString(),
-        kv_extract_error: parsedResult.error,
-      });
-    }
-    if (!parsed) {
-      fallbackUsed = true;
-      fallbackReason = parsedResult.error || 'LLM_NO_BLOCK_FOUND';
-    }
-  } catch (err) {
-    fallbackUsed = true;
-    fallbackReason = err?.message || String(err);
+    parsed = typeof raw === 'object' ? raw : JSON.parse(String(raw));
+  } catch (e) {
+    err = e;
   }
 
-  if (fallbackUsed) {
-    const normalizedPrice = normalizePriceObject(mainPrice);
-    const fallbackCurrency =
-      ocrPrice?.currency ?? normalizeCurrencyFromText(ocrTextFull) ?? null;
-    const price_hint = normalizePriceHint(null);
+  // Chunk template (reuse or build) happens even if universal extraction fails,
+  // because it is useful for diffs and judge.
+  let chunkTemplate = null;
+  try {
+    chunkTemplate = await buildOrReuseChunkTemplate({
+      snapshot,
+      userPrompt: normalizedUserPrompt,
+      reuseTemplate: reuseChunkTemplate,
+      logger: log,
+    });
+  } catch (e) {
+    chunkTemplate = {
+      source: 'unknown',
+      model: process.env.OLLAMA_CHUNK_MODEL || OLLAMA_MODEL,
+      createdAt: new Date().toISOString(),
+      durationMs: null,
+      chunks: [],
+      error: e?.message || String(e),
+      reused: false,
+      fitRatio: 0,
+    };
+  }
 
-    const fallbackDoc = {
-      zadanieId: String(zadanie_id),
-      monitorId: String(monitor_id),
-      score: new Double(0.0),
+  // If universal extraction failed -> save an error doc (still with chunk_template).
+  if (!parsed) {
+    const docErr = {
+      zadanieId: String(snapshot.zadanie_id || snapshot.zadanieId || ''),
+      monitorId: String(snapshot.monitor_id || ''),
       createdAt: new Date(),
-
       type: 'snapshot',
-      snapshot_id: _id,
-      url,
-      model: process.env.OLLAMA_TEXT_MODEL || 'llama3',
-      prompt,
-
+      snapshot_id: snapshot._id,
+      url: snapshot?.url || null,
+      model: OLLAMA_MODEL,
+      score: new Double(1.0),
+      schema_version: 'universal_v1',
+      intent: {
+        userPrompt: normalizedUserPrompt,
+        userPromptHash: hashUserPrompt(normalizedUserPrompt),
+      },
       summary: '',
-      podsumowanie: '',
-      product_type: null,
-      main_currency: fallbackCurrency,
-      price: normalizedPrice,
-      price_hint,
-      features: [],
-      intent,
-      extras,
-      raw_response: rawResponse != null ? String(rawResponse) : null,
-      parsed_kv_mode: parsedKvMode,
-      parsed_kv_direct: parsedKvDirect,
-      parsed_kv_extracted: parsedKvExtracted,
-      parsed_json_extracted: false,
-      parsed_json_direct: false,
-      fallback_used: true,
-      fallback_reason: 'NO_BLOCK_FROM_LLM',
-      error: 'LLM_NO_BLOCK_FOUND',
+      metrics: { rating: null, reviews_count: null },
+      universal_data: [],
+      chunk_template: chunkTemplate || null,
+      prompt,
+      raw_response: raw != null ? String(raw) : null,
+      error: err?.message || String(err),
     };
 
-    logger?.warn('snapshot_analysis_llm_fallback', {
-      snapshotId: _id.toString(),
-      monitorId: String(monitor_id),
-      zadanieId: String(zadanie_id),
-      url,
-      fallbackReason,
-      durationMs: Math.round(performance.now() - t0),
-    });
-
-    const { doc: storedDoc, insertedId } = await safeInsertAnalysis(fallbackDoc, {
-      logger,
-      snapshotId: _id,
-    });
+    const { insertedId } = await safeInsertAnalysis(docErr, { logger: log, snapshotId: snapshot._id });
     if (insertedId) {
-      storedDoc._id = insertedId;
-      storedDoc._inserted = true;
+      docErr._id = insertedId;
+      docErr._inserted = true;
     } else {
-      storedDoc._id = null;
-      storedDoc._inserted = false;
+      docErr._inserted = false;
     }
-    return storedDoc;
+    return docErr;
   }
 
-  // ✅ sukces – pełny dokument analizy
-  const normalizedPrice = normalizePriceObject(mainPrice);
-  const normalizedMainCurrency =
-    sanitizeNullableStringUtil(parsed?.main_currency) ||
-    normalizedPrice.currency ||
-    sanitizeNullableStringUtil(extracted_v2?.price?.currency);
-  let price_hint = normalizePriceHint(parsed?.price_hint);
-  if (!price_hint || typeof price_hint !== 'object') {
-    price_hint = { min: null, max: null };
+  const summary = sanitizeRequiredString(parsed?.summary);
+  const rating = normalizeNumberOrNull(parsed?.metrics?.rating);
+  const reviewsCount = normalizeNumberOrNull(parsed?.metrics?.reviews_count);
+  const universalData = normalizeUniversalData(parsed?.universal_data);
+
+  const userPromptHash = normalizedUserPrompt ? hashUserPrompt(normalizedUserPrompt) : null;
+
+  // Evidence extraction for judge: for the given user prompt, extract SHORT verbatim quotes
+  // from chunk texts. This runs regardless of whether a change is "important" – it is just
+  // building a compact, prompt-specific view of the snapshot.
+  let evidenceV1 = null;
+  let promptChunksV1 = null;
+  if (normalizedUserPrompt) {
+    try {
+      const chunkDoc = await ensureSnapshotChunks(snapshot, {
+        logger: log,
+        chunkTemplate: chunkTemplate || null,
+      });
+
+      const chunks = Array.isArray(chunkDoc?.chunks) ? chunkDoc.chunks : [];
+      if (chunks.length) {
+        const ev = await extractEvidenceFromChunksLLM({
+          model: OLLAMA_MODEL,
+          userPrompt: normalizedUserPrompt,
+          chunks,
+          maxQuotesPerChunk: 4,
+          maxQuoteChars: 160,
+          timeoutMs: Number(process.env.LLM_EVIDENCE_TIMEOUT_MS || 12000),
+          trace: {
+            snapshotId: String(snapshot?._id || ''),
+            monitorId: String(snapshot?.monitor_id || ''),
+          },
+        });
+
+        evidenceV1 = {
+          version: 'evidence_v1',
+          promptHash: userPromptHash,
+          source: chunkDoc?.source || null,
+          model: OLLAMA_MODEL,
+          createdAt: new Date(),
+          // [{ quote, chunk_id }]
+          items: ev.items,
+          // { [chunkId]: boolean }
+          chunk_relevance: ev.byChunk,
+        };
+
+        promptChunksV1 = {
+          version: 'prompt_chunks_v1',
+          promptHash: userPromptHash,
+          source: chunkDoc?.source || null,
+          focus_chunk_ids: ev.focusChunkIds,
+        };
+      }
+    } catch (err) {
+      log?.warn?.('snapshot_evidence_failed', {
+        snapshotId: String(snapshot?._id || ''),
+        err: err?.message || String(err),
+      });
+    }
   }
-  const features = parseFeatures(parsed?.features);
+
   const doc = {
-    zadanieId: String(zadanie_id),
-    monitorId: String(monitor_id),
-    score: new Double(1.0),
+    zadanieId: String(snapshot.zadanie_id || snapshot.zadanieId || ''),
+    monitorId: String(snapshot.monitor_id || ''),
     createdAt: new Date(),
-
     type: 'snapshot',
-    snapshot_id: _id,
-    url,
-    model: process.env.OLLAMA_TEXT_MODEL || 'llama3',
+    snapshot_id: snapshot._id,
+    url: snapshot?.url || null,
+    model: OLLAMA_MODEL,
+    score: new Double(1.0),
+    schema_version: 'universal_v1',
+    intent: {
+      userPrompt: normalizedUserPrompt,
+      userPromptHash,
+    },
+    summary,
+    metrics: { rating, reviews_count: reviewsCount },
+    universal_data: universalData,
+    evidence_v1: evidenceV1,
+    prompt_chunks_v1: promptChunksV1,
+    chunk_template: chunkTemplate || null,
     prompt,
-
-    summary: sanitizeRequiredStringUtil(parsed?.summary),
-    podsumowanie: sanitizeRequiredStringUtil(parsed?.summary),
-    product_type: sanitizeRequiredStringUtil(parsed?.product_type),
-    main_currency: normalizedMainCurrency,
-    price: normalizedPrice,
-    price_hint,
-    features: normalizeFeatures(features),
-    intent,
-    extras,
-    raw_response: rawResponse != null ? String(rawResponse) : null,
-    parsed_kv_mode: parsedKvMode,
-    parsed_kv_direct: parsedKvDirect,
-    parsed_kv_extracted: parsedKvExtracted,
-    parsed_json_extracted: false,
-    parsed_json_direct: false,
-    fallback_used: false,
-    fallback_reason: null,
+    raw_response: raw != null ? String(raw) : null,
     error: null,
   };
 
-
-logger?.info('snapshot_analysis_success', {
-  snapshotId: _id.toString(),
-  monitorId: String(monitor_id),
-  zadanieId: String(zadanie_id),
-  durationMs: Math.round(performance.now() - t0),
-});
-
-  const { doc: storedDoc, insertedId } = await safeInsertAnalysis(doc, {
-    logger,
-    snapshotId: _id,
-  });
+  const { insertedId } = await safeInsertAnalysis(doc, { logger: log, snapshotId: snapshot._id });
   if (insertedId) {
-    storedDoc._id = insertedId;
-    storedDoc._inserted = true;
+    doc._id = insertedId;
+    doc._inserted = true;
   } else {
-    storedDoc._id = null;
-    storedDoc._inserted = false;
+    doc._inserted = false;
   }
-  return storedDoc;
+
+  log?.info?.('snapshot_analysis_success', {
+    snapshotId: snapshot._id.toString(),
+    monitorId: String(snapshot.monitor_id || ''),
+    zadanieId: String(snapshot.zadanie_id || snapshot.zadanieId || ''),
+    durationMs: Math.round(performance.now() - t0),
+    universalDataItems: doc.universal_data.length,
+    chunkTemplate: {
+      enabled: process.env.LLM_CHUNKING_ENABLED === '1',
+      reused: !!doc.chunk_template?.reused,
+      chunks: Array.isArray(doc.chunk_template?.chunks) ? doc.chunk_template.chunks.length : 0,
+      fitRatio: doc.chunk_template?.fitRatio ?? null,
+      error: doc.chunk_template?.error || null,
+    },
+  });
+
+  return doc;
 }

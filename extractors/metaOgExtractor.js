@@ -49,7 +49,10 @@ export const metaOgExtractor = {
     const domPrice = detectMainPriceFromDom(doc);
     const price = domPrice || detectPrice(doc);
     const images = collectImages(doc);
-    const bodyText = normalizeWhitespace(doc.querySelector('body')?.textContent || '');
+    // IMPORTANT: og/meta extractor is *metadata-first*. Returning whole bodyText
+    // tends to include navigation / footer noise and breaks "structured-only" pipelines.
+    // Keep it minimal and stable: use the description as a text proxy.
+    const bodyText = description;
     const confidence = title ? 0.6 : 0.45;
     return {
       url,

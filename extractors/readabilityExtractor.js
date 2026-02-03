@@ -1,6 +1,18 @@
-import { clampTextLength, normalizeWhitespace, normalizePriceCandidate, inferContentType } from '../utils/normalize.js';
-import { detectMainPriceFromDom } from './priceUtils.js';
+// orchestrator/extractors/readabilityExtractor.js
+// Readability-style DOM extractor (best-container heuristic) that preserves *section structure*.
+//
+// Key change vs old version:
+// - Instead of normalizeWhitespace(clone.textContent) (which collapses newlines),
+//   we serialize blocks (h1-h6/p/li/...) into a stable multi-line format.
 
+import {
+  clampTextLength,
+  normalizeWhitespace,
+  normalizePriceCandidate,
+  inferContentType,
+} from '../utils/normalize.js';
+import { detectMainPriceFromDom } from './priceUtils.js';
+import { domToStructuredText } from './domStructuredText.js';
 
 function detectPrice(text) {
   if (!text) return null;
@@ -8,8 +20,6 @@ function detectPrice(text) {
   if (!match) return null;
   return normalizePriceCandidate(match[0]);
 }
-
-
 
 function scoreElement(element) {
   if (!element) return 0;
@@ -28,11 +38,11 @@ function findBestContainer(doc) {
     doc.querySelector('#content'),
   ].filter(Boolean);
 
+  // Generic fallback: large text-y sections/divs
   const additional = Array.from(doc.querySelectorAll('section, div')).filter((el) => {
     const paragraphs = el.querySelectorAll('p').length;
-    return paragraphs >= 3 && el.textContent?.length > 500;
+    return paragraphs >= 3 && (el.textContent?.length || 0) > 500;
   });
-
   candidates.push(...additional);
 
   let best = null;
@@ -53,20 +63,32 @@ export const readabilityExtractor = {
     const { score } = findBestContainer(doc);
     return Math.min(1, score);
   },
-    extract(doc, { url }) {
+  extract(doc, { url }) {
     const { element, score } = findBestContainer(doc);
     if (!element) return null;
 
-    // NOWE: klon + wycięcie script/style/noscript
+    // Clone + remove scripts/styles (keeps text stable, avoids JSON-LD)
     const clone = element.cloneNode(true);
-    clone.querySelectorAll('script, style, noscript').forEach(el => el.remove());
+    clone.querySelectorAll('script, style, noscript, template').forEach((el) => el.remove());
 
-    const text = normalizeWhitespace(clone.textContent || '');
+    // NEW: structured multi-line serialization -> enables chunking by sections
+    const text = domToStructuredText(clone, {
+      maxChars: 25000,
+      maxBlocks: 2000,
+      dropBoilerplate: true,
+    });
     if (!text) return null;
 
     const htmlMain = clampTextLength(clone.innerHTML || '');
-    const title = normalizeWhitespace(doc.querySelector('h1')?.textContent || doc.querySelector('title')?.textContent || '');
-    const description = normalizeWhitespace(doc.querySelector('meta[name="description"]')?.getAttribute('content') || '');
+    const title = normalizeWhitespace(
+      doc.querySelector('h1')?.textContent || doc.querySelector('title')?.textContent || '',
+    );
+    const description = normalizeWhitespace(
+      doc.querySelector('meta[name="description"]')?.getAttribute('content') ||
+        doc.querySelector('meta[property="og:description"]')?.getAttribute('content') ||
+        '',
+    );
+
     const domPrice = detectMainPriceFromDom(doc);
     const price = domPrice || detectPrice(text);
 
@@ -75,17 +97,18 @@ export const readabilityExtractor = {
       title: title || null,
       description: description || null,
       text,
-      //htmlMain,
+      htmlMain,
       price: price || null,
       images: Array.from(element.querySelectorAll('img'))
         .map((img) => img.getAttribute('src'))
         .filter(Boolean),
-      attributes: {},
-      confidence: Math.min(0.8, 0.4 + Math.min(0.4, score)),
+      attributes: {
+        structured: true,
+        structured_format: 'markdown-ish',
+      },
+      confidence: Math.min(0.85, 0.45 + Math.min(0.4, score)),
       extractor: 'readability',
       contentType: inferContentType({ text }),
     };
-
   },
-
 };
