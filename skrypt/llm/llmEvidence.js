@@ -1,5 +1,5 @@
 // skrypt/llm/llmEvidence.js
-// Evidence extraction v3 (prompt-adaptive + chunk-selection):
+// Evidence extraction v4 (prompt-adaptive + chunk-selection):
 // - Build short verbatim candidate snippets deterministically (so we never "hallucinate" quotes).
 // - Select the *most relevant* chunks across the whole text (not just the first N).
 // - LLM only selects candidate IDs relevant to USER_PROMPT.
@@ -23,6 +23,26 @@ const DEFAULT_MAX_ITEMS_TOTAL = Number.parseInt(
   process.env.EVIDENCE_MAX_ITEMS_TOTAL || '10',
   10
 );
+
+// Deterministic selection for "new item" prompts (recommended ON to avoid nondeterministic evidence subsets).
+const DEFAULT_DETERMINISTIC_NEW_ITEM =
+  String(process.env.EVIDENCE_DETERMINISTIC_NEW_ITEM ?? 'true').trim().toLowerCase() === 'true';
+const DEFAULT_MAX_ITEMS_TOTAL_NEW_ITEM = Number.parseInt(
+  process.env.EVIDENCE_MAX_ITEMS_TOTAL_NEW_ITEM || '60',
+  10
+);
+
+// Deterministic ranking extraction (ON by default).
+// Enables stable evidence for "top-N / ranking / ranks" prompts without LLM selection.
+// Disable via: EVIDENCE_DETERMINISTIC_RANKING=false
+const DEFAULT_DETERMINISTIC_RANKING =
+  String(process.env.EVIDENCE_DETERMINISTIC_RANKING ?? 'true').trim().toLowerCase() === 'true';
+
+const DEFAULT_MAX_ITEMS_TOTAL_RANKING = Number.parseInt(
+  process.env.EVIDENCE_MAX_ITEMS_TOTAL_RANKING || '60',
+  10
+);
+
 
 const DEFAULT_WINDOW_CHARS = Number.parseInt(process.env.EVIDENCE_WINDOW_CHARS || '48', 10);
 const DEFAULT_MAX_QUOTE_LEN = Number.parseInt(process.env.EVIDENCE_MAX_QUOTE_LEN || '180', 10);
@@ -174,9 +194,10 @@ function extractWindowByLines(text, matchStart, matchEnd, opts = {}) {
 
 function extractWindowSmart(text, matchStart, matchEnd, opts = {}) {
   // Prefer line-based snippets when input is line-oriented (DOM clean_lines / OCR lines).
-  // Keeps evidence stable & readable: usually "one bullet / one line".
+  // Keeps evidence stable & readable: usually one bullet / one line.
+  // NOTE: We do NOT force linesAfter=1 here because it can create long 2-line snippets that then get truncated.
   const hasNewlines = typeof text === 'string' && text.indexOf('\n') !== -1;
-  if (hasNewlines) return extractWindowByLines(text, matchStart, matchEnd, { ...opts, linesBefore: 0, linesAfter: 1 });
+  if (hasNewlines) return extractWindowByLines(text, matchStart, matchEnd, opts);
   return extractWindowByWords(text, matchStart, matchEnd, opts);
 }
 
@@ -188,13 +209,14 @@ function normKey(s) {
     .trim();
 }
 
-function pushCandidate(out, seen, id, quote, kind) {
+function pushCandidate(out, seen, id, quote, kind, extra = null) {
   const q = String(quote || '').trim();
   if (!q) return;
   const key = normKey(q);
   if (!key || seen.has(key)) return;
   seen.add(key);
-  out.push({ id, quote: q, kind });
+  const more = extra && typeof extra === 'object' ? extra : null;
+  out.push({ id, quote: q, kind, ...(more || {}) });
 }
 
 function escapeRegExp(str) {
@@ -207,6 +229,8 @@ const PROMPT_STOPWORDS = new Set([
   'tylko', 'gdy', 'kiedy', 'że', 'ze', 'sie', 'się', 'nie', 'tak', 'jak', 'żeby', 'zeby', 'aby',
   // common prompt words
   'monitoruj', 'monitorować', 'monitorowac', 'powiadom', 'powiadomić', 'powiadomic', 'ignoruj', 'ignore',
+  'jezeli', 'jeśli', 'jesli', 'pojawi', 'pojawić', 'pojawic', 'pojawia', 'pojawie', 'nowy', 'nowa', 'nowe', 'dodaj', 'dodane', 'dodany',
+  'new', 'added', 'add', 'appears', 'appear', 'notify',
   'oferta', 'oferte', 'strona', 'strony', 'elementy', 'pozostałe', 'pozostale',
   // platform generic
   'allegro', 'ceneo', 'amazon', 'ebay', 'booking', 'steam', 'zalando', 'decathlon',
@@ -246,6 +270,22 @@ function isPriceOrDeliveryNoiseLower(s) {
 function detectPromptIntents(userPrompt) {
   const p = String(userPrompt || '').toLowerCase();
 
+  // Parse "top-N" (e.g. top-10, top 10, TOP 10) from prompt when present.
+  let rankLimit = null;
+  const mTop = p.match(/\btop\s*[- ]?\s*(\d{1,3})\b/);
+  if (mTop && mTop[1]) {
+    const n = Number.parseInt(mTop[1], 10);
+    if (Number.isFinite(n) && n > 0) rankLimit = n;
+  } else if (/\btop\s*ten\b/.test(p) || /\btop-?ten\b/.test(p)) {
+    rankLimit = 10;
+  }
+
+  const wantsRanking =
+    /\brank(?:s|ing)?\b/.test(p) || /\branking\b/.test(p) || rankLimit !== null;
+
+  // If the user asks about ranking but doesn't specify N, default to 10 (keeps evidence bounded).
+  if (wantsRanking && (rankLimit === null || !Number.isFinite(rankLimit))) rankLimit = 10;
+
   const wants = {
     reviews: /(opin|recenz|review|rating|ocen|gwiazd|★|\/5|\/10)/.test(p),
     price: /(cena|price|koszt|pln|\bzł\b|\bzl\b|€|\$|usd|eur)/.test(p),
@@ -255,6 +295,8 @@ function detectPromptIntents(userPrompt) {
     list_items: /(nowe|dodane|usunię|usunie|removed|added|lista|pozycje|pozycja|top|ranking|rank)/.test(p),
     filters: /(filtr|marka|brand|rozmiar|size|kolor|color|kategoria|category)/.test(p),
     headline: /(nagł|naglo|headline|tytuł|tytul|title|podtytuł|podtytul|subheadline)/.test(p),
+    new_item: /(pojawi|pojaw(?:i|ię)|pojawic|nowy|nowa|nowe|dodaj|dodane|dodany|added|new|appear|appears)\b/.test(p),
+    ranking: wantsRanking,
   };
 
   const exclude = {
@@ -262,7 +304,7 @@ function detectPromptIntents(userPrompt) {
     delivery: /(ignoruj|ignore).{0,30}(dostaw|delivery|wysył|wysyl)/.test(p),
   };
 
-  return { wants, exclude };
+  return { wants, exclude, rankLimit };
 }
 
 function countMatches(text, re) {
@@ -276,6 +318,65 @@ function countMatches(text, re) {
     if (n > 999) break;
   }
   return n;
+}
+
+function countRankLinesUpTo(text, rankLimit) {
+  const limit = Number.isFinite(rankLimit) ? rankLimit : 10;
+  const t = String(text || '');
+  if (!t) return 0;
+  const re = /(?:^|\n)\s*-\s*#\s*(\d{1,3})\b/g;
+  let n = 0;
+  let m;
+  while ((m = re.exec(t)) !== null) {
+    const r = Number.parseInt(m[1], 10);
+    if (Number.isFinite(r) && r > 0 && r <= limit) n++;
+    if (m.index === re.lastIndex) re.lastIndex++;
+    if (n > 999) break;
+  }
+  return n;
+}
+
+function buildRankCandidatesFromText(text, chunkId, { rankLimit, maxCandidates, maxLen } = {}) {
+  const limit = Number.isFinite(rankLimit) ? rankLimit : 10;
+  const maxC = Math.max(1, Number.isFinite(maxCandidates) ? maxCandidates : DEFAULT_MAX_CANDIDATES_PER_CHUNK);
+  const maxQ = Math.max(40, Number.isFinite(maxLen) ? maxLen : DEFAULT_MAX_QUOTE_LEN);
+
+  const t = String(text || '');
+  if (!t) return [];
+
+  // Find all rank starts (we keep ALL ranks to compute boundaries, but emit only <=limit).
+  const re = /(?:^|\n)\s*-\s*#\s*(\d{1,3})\b/g;
+  const starts = [];
+  let m;
+  while ((m = re.exec(t)) !== null) {
+    const rank = Number.parseInt(m[1], 10);
+    // Adjust start: if match begins with \n, skip it so quote starts at '-'
+    const raw = m.index;
+    const start = t[raw] === '\n' ? raw + 1 : raw;
+    starts.push({ rank, start });
+    if (m.index === re.lastIndex) re.lastIndex++;
+    if (starts.length > 2000) break;
+  }
+  if (!starts.length) return [];
+
+  const out = [];
+  const seen = new Set();
+  let idx = 0;
+
+  for (let i = 0; i < starts.length; i++) {
+    const cur = starts[i];
+    const nextStart = i + 1 < starts.length ? starts[i + 1].start : t.length;
+    const quoteRaw = t.slice(cur.start, nextStart).trim();
+    if (!quoteRaw) continue;
+
+    if (Number.isFinite(cur.rank) && cur.rank > 0 && cur.rank <= limit) {
+      const quote = quoteRaw.length > maxQ ? quoteRaw.slice(0, maxQ).trim() : quoteRaw;
+      pushCandidate(out, seen, `cand#${chunkId}#${idx++}`, quote, 'rank_item', { rank: cur.rank });
+      if (out.length >= maxC) break;
+    }
+  }
+
+  return out;
 }
 
 // Common patterns
@@ -335,9 +436,24 @@ function scoreChunkForEvidence(text, { promptKeywords, intents }) {
     score += countMatches(lower, /(filtr|marka:|brand:|rozmiar|size|kolor|color|kategoria|category)/g) * 3;
   }
 
-  if (intents?.wants?.list_items) {
+  if (intents?.wants?.ranking) {
+    const limit = Number.isFinite(intents?.rankLimit) ? intents.rankLimit : 10;
+    const topRanks = countRankLinesUpTo(t, limit);
+    // Ranking lines are the strongest signal for "top-N / ranks" prompts.
+    score += topRanks * 28;
+    // Any rank lines still matter (even if >limit).
+    score += countMatches(t, /(?:^|\n)\s*-\s*#\s*\d{1,3}\b/g) * 6;
+  }
+
+  if (intents?.wants?.list_items && !intents?.wants?.ranking) {
     // bullets/numbered lines hint: list pages, rankings, etc.
     score += countMatches(t, /(^|\n)\s*(?:[-•]|(?:\d{1,3}[.)]))\s+/g) * 2;
+  }
+
+  if (intents?.wants?.new_item && !intents?.wants?.ranking) {
+    // New/added-item prompts typically need broad coverage of list rows.
+    score += countMatches(t, /(^|\n)\s*[-•]\s+/g) * 3;
+    score += countMatches(t, RE_CURRENCY) * 2;
   }
 
   // Tiny bump for very short chunks if headline is requested (often first lines).
@@ -349,6 +465,15 @@ function scoreChunkForEvidence(text, { promptKeywords, intents }) {
 function selectChunksForEvidence(allChunks, { maxChunks, promptKeywords, intents }) {
   const list = Array.isArray(allChunks) ? allChunks : [];
   const k = Math.max(1, Number.isFinite(maxChunks) ? maxChunks : DEFAULT_MAX_CHUNKS);
+
+  if (intents?.wants?.ranking) {
+    const limit = Number.isFinite(intents?.rankLimit) ? intents.rankLimit : 10;
+    const ranked = list.filter((c) => countRankLinesUpTo(String(c?.text || ''), limit) > 0);
+    if (ranked.length) {
+      ranked.sort((a, b) => (Number(a?.order) || 0) - (Number(b?.order) || 0));
+      return ranked.slice(0, Math.min(k, ranked.length));
+    }
+  }
 
   if (list.length <= k) return list;
 
@@ -376,6 +501,56 @@ function selectChunksForEvidence(allChunks, { maxChunks, promptKeywords, intents
   return picked;
 }
 
+
+function deterministicSelectRankingEvidence(chunksWithCandidates, { intents, maxItemsTotal } = {}) {
+  const limit = clamp(Number.isFinite(intents?.rankLimit) ? intents.rankLimit : 10, 1, 50);
+  const totalMaxRaw = Number.isFinite(maxItemsTotal) ? maxItemsTotal : Math.min(limit, DEFAULT_MAX_ITEMS_TOTAL_RANKING);
+  const totalMax = clamp(totalMaxRaw, 1, DEFAULT_MAX_ITEMS_TOTAL_RANKING);
+
+  const pool = [];
+  for (const c of chunksWithCandidates || []) {
+    for (const cand of c.candidates || []) {
+      if (cand.kind !== 'rank_item') continue;
+      const r = Number.isFinite(cand.rank) ? cand.rank : null;
+      if (!r || r < 1 || r > limit) continue;
+      pool.push({
+        chunkId: c.id,
+        order: Number.isFinite(c.order) ? c.order : 0,
+        candId: cand.id,
+        quote: cand.quote,
+        rank: r,
+      });
+    }
+  }
+
+  // Sort by rank, then by chunk order for stability.
+  pool.sort((a, b) => (a.rank !== b.rank ? a.rank - b.rank : a.order - b.order));
+
+  const byChunk = {};
+  for (const c of chunksWithCandidates || []) byChunk[c.id] = { relevant: false, chosen: [] };
+
+  const focusChunkIds = [];
+  const items = [];
+  const seenRanks = new Set();
+
+  for (const it of pool) {
+    if (items.length >= totalMax) break;
+    if (seenRanks.has(it.rank)) continue;
+    seenRanks.add(it.rank);
+
+    if (!byChunk[it.chunkId]) byChunk[it.chunkId] = { relevant: false, chosen: [] };
+    byChunk[it.chunkId].relevant = true;
+    byChunk[it.chunkId].chosen.push(it.candId);
+
+    if (!focusChunkIds.includes(it.chunkId)) focusChunkIds.push(it.chunkId);
+
+    items.push({ id: `evidence#${it.candId}`, chunk_id: it.chunkId, quote: it.quote });
+  }
+
+  // Ensure deterministic order: already rank-sorted.
+  return { items, focusChunkIds, byChunk, llmFailed: false };
+}
+
 function buildCandidatesForChunk(chunkText, chunkId, opts = {}) {
   const text = String(chunkText || '');
   const maxCandidates = Number.isFinite(opts.maxCandidates)
@@ -389,9 +564,81 @@ function buildCandidatesForChunk(chunkText, chunkId, opts = {}) {
 
   const maxLen = Number.isFinite(opts.maxQuoteChars) ? opts.maxQuoteChars : DEFAULT_MAX_QUOTE_LEN;
 
+  // Ranking prompts: prefer exact "#N ..." entries (bounded by rankLimit).
+  // This prevents picking navigation bullets (e.g. categories) as evidence.
+  if (intents?.wants?.ranking) {
+    const limit = Number.isFinite(intents?.rankLimit) ? intents.rankLimit : 10;
+    const anyRankStarts = countMatches(text, /(?:^|\n)\s*-\s*#\s*\d{1,3}\b/g);
+
+    const rankCands = buildRankCandidatesFromText(text, chunkId, {
+      rankLimit: limit,
+      maxCandidates,
+      maxLen,
+    });
+
+    if (rankCands.length) return rankCands.slice(0, maxCandidates);
+
+    // If the chunk contains ranks but only above the limit (e.g. #11+), keep it empty
+    // so we don't accidentally pick prices/categories as "top-N" evidence.
+    if (anyRankStarts > 0) return [];
+  }
+
   const seen = new Set();
   const out = [];
   let idx = 0;
+
+  // New-item prompts: prefer product/list rows and avoid navigation bullets.
+  // We don't know (yet) what is NEW between snapshots, so we provide a broad, representative pool
+  // of item lines so the judge can compare BEFORE vs AFTER.
+  if (intents?.wants?.new_item && !intents?.wants?.ranking) {
+    const lines = text.split('\n').map((x) => x.trim()).filter(Boolean);
+    const strongKw = (promptKeywords || [])
+      .map((x) => String(x || '').toLowerCase())
+      .filter((x) =>
+        x.length >= 5 &&
+        !/^(nowy|nowa|nowe|dodane|dodany|dodaj|pojawi|pojawic|pojaw|jezeli|jesli|jeśli|notify|new|added|add|appear|appears)$/.test(x)
+      );
+
+    const navRe = /^(?:filtry?\b|filtry?\s*\d+|marka:|brand:|kategoria\b|category\b|sortuj\b|sort\b|szukaj\b|search\b|menu\b|home\b|kontakt\b|help\b|about\b)/i;
+
+    for (const ln of lines) {
+      if (out.length >= maxCandidates) break;
+      if (!/^([-•]|(\d{1,3}[.)]))\s+/.test(ln)) continue;
+
+      const noBullet = ln.replace(/^([-•]|(\d{1,3}[.)]))\s+/, '').trim();
+      if (noBullet.length < 12) continue;
+      if (navRe.test(noBullet)) continue;
+
+      const lower = noBullet.toLowerCase();
+      if (strongKw.length) {
+        let ok = false;
+        for (const kw of strongKw) {
+          if (kw && lower.includes(kw)) {
+            ok = true;
+            break;
+          }
+        }
+        if (!ok) continue;
+      }
+
+      const looksLikeRow = strongKw.length ? true :
+        /(\b\d+\s*ml\b|\b\d+\s*g\b|\bpln\b|\bzł\b|\bzl\b|€|\$|\b\d{3,}\b|\(|\)|,)/i.test(noBullet) ||
+        noBullet.length >= 28;
+
+      if (!looksLikeRow) continue;
+
+      // Keep the FULL line (verbatim).
+      pushCandidate(out, seen, `cand#${chunkId}#${idx++}`, ln.slice(0, maxLen), 'product_line');
+    }
+
+    // Add a brand/filter anchor if present (useful grounding for the judge).
+    if (out.length < maxCandidates) {
+      const anchor = lines.find((l) => /(?:^[-•]\s*)?(?:marka:|brand:)/i.test(l));
+      if (anchor) {
+        pushCandidate(out, seen, `cand#${chunkId}#${idx++}`, anchor.slice(0, maxLen), 'brand_line');
+      }
+    }
+  }
 
   // --- Build prompt-adaptive pattern list (ordered by intent)
   /** @type {{kind:string, re:RegExp}[]} */
@@ -432,7 +679,16 @@ function buildCandidatesForChunk(chunkText, chunkId, opts = {}) {
     while ((m = p.re.exec(text)) !== null) {
       const start = m.index;
       const end = start + m[0].length;
-      const quote = extractWindowSmart(text, start, end, { maxLen });
+      const afterLines =
+        p.kind === 'rating_frac' ||
+        p.kind === 'rating_num_stars' ||
+        p.kind === 'delivery_keyword' ||
+        p.kind === 'date' ||
+        p.kind === 'count_results' ||
+        p.kind === 'price_currency'
+          ? 1
+          : 0;
+      const quote = extractWindowSmart(text, start, end, { maxLen, linesBefore: 0, linesAfter: afterLines });
       pushCandidate(out, seen, `cand#${chunkId}#${idx++}`, quote, p.kind);
       if (out.length >= maxCandidates) return out;
       if (m.index === p.re.lastIndex) p.re.lastIndex++;
@@ -441,13 +697,14 @@ function buildCandidatesForChunk(chunkText, chunkId, opts = {}) {
 
   // Keyword anchors for reviews
   if (intents?.wants?.reviews && out.length < maxCandidates) {
-    const keywordRe = /\b(?:opinie|opinia|ocena|oceny|recenzja|recenzje|review|reviews|rating|ratings)\b/gi;
+    const keywordRe = /\\b(?:opinie|opinia|ocena|oceny|recenzja|recenzje|review|reviews|rating|ratings)\\b/gi;
     keywordRe.lastIndex = 0;
     let km;
     while ((km = keywordRe.exec(text)) !== null) {
       const start = km.index;
       const end = start + km[0].length;
-      const quote = extractWindowSmart(text, start, end, { maxLen });
+      // Reviews often wrap (e.g., '4.6 out of 5' then 'stars ...'), so allow one continuation line.
+      const quote = extractWindowSmart(text, start, end, { maxLen, linesBefore: 0, linesAfter: 1 });
       pushCandidate(out, seen, `cand#${chunkId}#${idx++}`, quote, 'review_keyword');
       if (out.length >= maxCandidates) return out;
       if (km.index === keywordRe.lastIndex) keywordRe.lastIndex++;
@@ -526,6 +783,14 @@ function buildCandidatesForChunk(chunkText, chunkId, opts = {}) {
 
 function candidatePriority(kind, intents) {
   const wants = intents?.wants || {};
+  if (wants.new_item && !wants.ranking) {
+    if (kind === 'product_line') return 1;
+    if (kind === 'brand_line') return 2;
+    if (kind === 'list_item') return 3;
+  }
+  if (wants.ranking) {
+    if (kind === 'rank_item') return 1;
+  }
   if (wants.price && !intents?.exclude?.price) {
     if (kind === 'price_currency') return 1;
     if (kind === 'percent') return 4;
@@ -574,6 +839,7 @@ function fallbackSelectCandidatesDeterministic(chunksWithCandidates, { intents, 
         candId: cand.id,
         quote: cand.quote,
         kind: cand.kind,
+        rank: Number.isFinite(cand.rank) ? cand.rank : null,
         pr: candidatePriority(cand.kind, intents),
         qlen: String(cand.quote || '').length,
         order: Number.isFinite(c.order) ? c.order : 0,
@@ -582,6 +848,14 @@ function fallbackSelectCandidatesDeterministic(chunksWithCandidates, { intents, 
   }
 
   pool.sort((a, b) => {
+    if (intents?.wants?.ranking) {
+      const ra = Number.isFinite(a.rank) ? a.rank : 999999;
+      const rb = Number.isFinite(b.rank) ? b.rank : 999999;
+      if (ra !== rb) return ra - rb;
+      if (a.order !== b.order) return a.order - b.order;
+      if (a.pr !== b.pr) return a.pr - b.pr;
+      return a.qlen - b.qlen;
+    }
     if (a.pr !== b.pr) return a.pr - b.pr;
     if (a.order !== b.order) return a.order - b.order;
     return a.qlen - b.qlen;
@@ -610,6 +884,97 @@ function fallbackSelectCandidatesDeterministic(chunksWithCandidates, { intents, 
   return { items, focusChunkIds, byChunk, llmFailed: true };
 }
 
+function stableProductKeyForEvidence(line) {
+  let s = String(line || '').toLowerCase();
+  s = s.replace(/^[-•]\s+/, '');
+  // remove availability suffixes
+  s = s.replace(/\bw tej chwili nie mamy\b.*$/i, '');
+  s = s.replace(/\bbrak\b.*$/i, '');
+  // strip common volume and price tokens for stable sorting
+  s = s.replace(/\b\d+\s*(?:ml|l|g|kg)\b/gi, '');
+  s = s.replace(/\b\d{1,3}(?:[ .]\d{3})*(?:[.,]\d{2})?\s*(?:zł|zl|pln|€|eur|usd|\$)\b/gi, '');
+  s = s.replace(/\s+/g, ' ').trim();
+  return s;
+}
+
+function deterministicSelectNewItemEvidence(chunksWithCandidates, { maxItemsTotal } = {}) {
+  const totalMax = clamp(
+    Number.isFinite(maxItemsTotal) ? maxItemsTotal : DEFAULT_MAX_ITEMS_TOTAL_NEW_ITEM,
+    6,
+    DEFAULT_MAX_ITEMS_TOTAL_NEW_ITEM
+  );
+
+  const byChunk = {};
+  const focusChunkIds = [];
+  const brandPool = [];
+  const prodPool = [];
+
+  // Collect candidates across chunks.
+  for (const ch of chunksWithCandidates || []) {
+    const chunkId = String(ch?.id || '');
+    const order = Number.isFinite(ch?.order) ? ch.order : 0;
+    if (!byChunk[chunkId]) byChunk[chunkId] = { relevant: false, chosen: [] };
+
+    for (const cand of ch.candidates || []) {
+      const quote = String(cand?.quote || '').trim();
+      if (!quote) continue;
+
+      const kind = String(cand?.kind || '');
+      if (kind === 'brand_line' || /(?:^[-•]\s*)?(?:marka:|brand:)/i.test(quote)) {
+        brandPool.push({ chunkId, candId: cand.id, quote, order });
+        continue;
+      }
+
+      if (kind === 'product_line' || kind === 'list_item') {
+        // Prefer list rows that look like actual products (often have size/price or parentheses).
+        const looksLikeProduct = /(\b\d+\s*(ml|g|l|kg)\b|pln|\bzł\b|\bzl\b|€|\$|\(|\)|,)/i.test(quote) || quote.length >= 28;
+        if (!looksLikeProduct) continue;
+        prodPool.push({
+          chunkId,
+          candId: cand.id,
+          quote,
+          order,
+          key: stableProductKeyForEvidence(quote),
+        });
+      }
+    }
+  }
+
+  // Stable sort: key -> chunk order -> quote
+  prodPool.sort((a, b) => {
+    if (a.key !== b.key) return a.key.localeCompare(b.key);
+    if (a.order !== b.order) return a.order - b.order;
+    return a.quote.localeCompare(b.quote);
+  });
+
+  // Keep only first brand anchor (if any), then fill with products.
+  const items = [];
+  if (brandPool.length) {
+    // pick earliest brand line
+    brandPool.sort((a, b) => a.order - b.order);
+    const b0 = brandPool[0];
+    const evidId = `evidence#${b0.candId}`;
+    items.push({ id: evidId, chunk_id: b0.chunkId, quote: b0.quote });
+    byChunk[b0.chunkId].relevant = true;
+    byChunk[b0.chunkId].chosen.push(b0.candId);
+    if (!focusChunkIds.includes(b0.chunkId)) focusChunkIds.push(b0.chunkId);
+  }
+
+  for (const p of prodPool) {
+    if (items.length >= totalMax) break;
+    const evidId = `evidence#${p.candId}`;
+    // de-dupe by exact quote (stable)
+    if (items.some((x) => x.quote === p.quote)) continue;
+
+    items.push({ id: evidId, chunk_id: p.chunkId, quote: p.quote });
+    byChunk[p.chunkId].relevant = true;
+    byChunk[p.chunkId].chosen.push(p.candId);
+    if (!focusChunkIds.includes(p.chunkId)) focusChunkIds.push(p.chunkId);
+  }
+
+  return { items, focusChunkIds, byChunk };
+}
+
 export async function extractEvidenceFromChunksLLM({
   chunks,
   userPrompt,
@@ -632,17 +997,38 @@ export async function extractEvidenceFromChunksLLM({
   const list = Array.isArray(chunks) ? chunks : [];
   const pickedChunks = selectChunksForEvidence(list, { maxChunks, promptKeywords, intents });
 
-  const maxCandidates = Number.isFinite(maxCandidatesPerChunk)
+  let maxCandidates = Number.isFinite(maxCandidatesPerChunk)
     ? maxCandidatesPerChunk
     : DEFAULT_MAX_CANDIDATES_PER_CHUNK;
 
-  const perChunkMax = Math.max(
+  let perChunkMax = Math.max(
     1,
     Number.isFinite(maxQuotesPerChunk) ? maxQuotesPerChunk : DEFAULT_MAX_QUOTES_PER_CHUNK
   );
 
-  const totalMax = Math.max(1, Number.isFinite(maxItemsTotal) ? maxItemsTotal : DEFAULT_MAX_ITEMS_TOTAL);
-  const maxLen = Number.isFinite(maxQuoteChars) ? maxQuoteChars : DEFAULT_MAX_QUOTE_LEN;
+  let totalMax = Math.max(1, Number.isFinite(maxItemsTotal) ? maxItemsTotal : DEFAULT_MAX_ITEMS_TOTAL);
+  const baseMaxLen = Number.isFinite(maxQuoteChars) ? maxQuoteChars : DEFAULT_MAX_QUOTE_LEN;
+  const maxLen = intents?.wants?.ranking
+    ? Math.max(baseMaxLen, 240)
+    : intents?.wants?.new_item
+      ? Math.max(baseMaxLen, 220)
+      : baseMaxLen;
+
+  // Ranking prompts often need MANY quotes from a single chunk (e.g. top-10 list in one block).
+  if (intents?.wants?.ranking) {
+    const limit = Number.isFinite(intents?.rankLimit) ? intents.rankLimit : 10;
+    const capped = clamp(limit, 1, 25);
+    perChunkMax = Math.max(perChunkMax, capped);
+    totalMax = Math.min(totalMax, capped);
+    maxCandidates = Math.max(maxCandidates, Math.min(capped + 6, 60));
+  }
+
+  // New-item prompts benefit from a broader pool of item lines (so judge can compare sets).
+  if (intents?.wants?.new_item && !intents?.wants?.ranking) {
+    perChunkMax = Math.max(perChunkMax, 12);
+    totalMax = Math.min(Math.max(totalMax, 12), 25);
+    maxCandidates = Math.max(maxCandidates, 40);
+  }
 
   // 1) Deterministically build candidates per selected chunk.
   const chunksWithCandidates = pickedChunks.map((c, idx) => {
@@ -671,6 +1057,22 @@ export async function extractEvidenceFromChunksLLM({
   if (!prompt || totalCandidates === 0) {
     return { items: [], focusChunkIds: [], byChunk };
   }
+
+
+  // Deterministic evidence for "new item" prompts:
+  // Avoid LLM selection here to prevent nondeterministic subsets across snapshots.
+    if (DEFAULT_DETERMINISTIC_RANKING && intents?.wants?.ranking) {
+    return deterministicSelectRankingEvidence(chunksWithCandidates, {
+      intents,
+      maxItemsTotal: Number.isFinite(maxItemsTotal) ? maxItemsTotal : undefined,
+    });
+  }
+
+if (DEFAULT_DETERMINISTIC_NEW_ITEM && intents?.wants?.new_item && !intents?.wants?.ranking) {
+    const maxTotal = Number.isFinite(maxItemsTotal) ? maxItemsTotal : DEFAULT_MAX_ITEMS_TOTAL_NEW_ITEM;
+    return deterministicSelectNewItemEvidence(chunksWithCandidates, { maxItemsTotal: maxTotal });
+  }
+
 
   // 2) Ask LLM to select candidate IDs.
   const schema = {
@@ -706,6 +1108,7 @@ Twoje zadanie: wybrać ID kandydatów, które są BEZPOŚREDNIO związane z USER
 
 Zasady:
 - Wybieraj tylko kandydaty, które są jednoznacznym "dowodem" pod prompt (np. cena, dostępność, data/dostawa, liczba wyników, ocena/recenzje, konkretne pozycje listy, filtry).
+- Jeśli USER_PROMPT dotyczy NOWYCH/DODANYCH/USUNIĘTYCH pozycji (np. "pojawi się nowy produkt"), preferuj cytaty, które są WERSAMI produktów/pozycji listy (a nie menu/nawigacją).
 - Jeśli USER_PROMPT zawiera prośbę typu "ignoruj cenę / dostawę" — NIE wybieraj kandydatów o tej kategorii.
 - Nie wybieraj luźnych opisów bez konkretu (liczb, dat, fraz dostępności), jeśli prompt oczekuje konkretu.
 - Jeśli nie masz pewności, NIE wybieraj.
@@ -751,12 +1154,13 @@ Wynik: WYŁĄCZNIE JSON zgodny ze schematem. Dla KAŻDEGO podanego chunka zwró�
   const candIndex = new Map();
   for (const c of chunksWithCandidates) {
     for (const x of c.candidates || []) {
-      candIndex.set(x.id, { chunkId: c.id, quote: x.quote });
+      candIndex.set(x.id, { chunkId: c.id, quote: x.quote, rank: x.rank });
     }
   }
 
   const focusChunkIds = [];
   const items = [];
+  const evidenceRank = new Map();
   const selectedPerChunk = new Map();
 
   for (const ch of parsed.chunks || []) {
@@ -787,7 +1191,9 @@ Wynik: WYŁĄCZNIE JSON zgodny ze schematem. Dla KAŻDEGO podanego chunka zwró�
 
       const info = candIndex.get(cid);
       if (info?.quote) {
-        items.push({ id: `evidence#${cid}`, chunk_id: chunkId, quote: info.quote });
+        const evidId = `evidence#${cid}`;
+        items.push({ id: evidId, chunk_id: chunkId, quote: info.quote });
+        if (Number.isFinite(info.rank)) evidenceRank.set(evidId, info.rank);
         selectedPerChunk.set(chunkId, already + 1);
       }
     }
@@ -798,8 +1204,19 @@ Wynik: WYŁĄCZNIE JSON zgodny ze schematem. Dla KAŻDEGO podanego chunka zwró�
     if (!byChunk[c.id]) byChunk[c.id] = { relevant: false, chosen: [] };
   }
 
-  // Ensure stable order
-  items.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  // Ensure stable order (and rank order for ranking prompts).
+  if (intents?.wants?.ranking) {
+    items.sort((a, b) => {
+      const ra = evidenceRank.has(a.id) ? evidenceRank.get(a.id) : 999999;
+      const rb = evidenceRank.has(b.id) ? evidenceRank.get(b.id) : 999999;
+      if (ra !== rb) return ra - rb;
+      // fallback: chunk order + id for stability
+      if (String(a.chunk_id) !== String(b.chunk_id)) return String(a.chunk_id).localeCompare(String(b.chunk_id));
+      return String(a.id).localeCompare(String(b.id));
+    });
+  } else {
+    items.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  }
 
   return { items, focusChunkIds, byChunk };
 }
