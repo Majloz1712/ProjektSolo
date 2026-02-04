@@ -27,3 +27,7 @@ __pycache__/
 # logs/exports
 logs/
 exports/
+
+# python venv
+.venv/
+skrypt/.venv/
