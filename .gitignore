@@ -17,3 +17,9 @@ log*.txt
 # ignore runtime folders
 logs/
 exports/
+
+# python venv
+.venv/
+skrypt/.venv/
+__pycache__/
+*.pyc
