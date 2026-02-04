@@ -31,3 +31,7 @@ exports/
 # python venv
 .venv/
 skrypt/.venv/
+
+# python venv
+.venv/
+skrypt/.venv/
