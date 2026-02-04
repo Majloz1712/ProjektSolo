@@ -79,12 +79,15 @@ async function fetchSnapshot(mongo, taskRow) {
   // NOWA kolekcja: snapshots (u Ciebie nie ma już migawki)
   const col = mongo.collection('snapshots');
 
+  // UWAGA: screenshot_b64 potrafi być gigantyczne (base64) — nie wysyłamy tego do frontu / downloadów.
+  const projection = { screenshot_b64: 0 };
+
   // 1) prefer: snapshots.zadanieId = uuid (string)
-  let doc = await col.findOne({ zadanieId: taskRow.id });
+  let doc = await col.findOne({ zadanieId: taskRow.id }, { projection });
 
   // 2) fallback: snapshots._id = snapshot_mongo_id (ObjectId)
   if (!doc && taskRow.snapshot_mongo_id && isValidObjectId(taskRow.snapshot_mongo_id)) {
-    doc = await col.findOne({ _id: new ObjectId(taskRow.snapshot_mongo_id) });
+    doc = await col.findOne({ _id: new ObjectId(taskRow.snapshot_mongo_id) }, { projection });
   }
 
   return normalizeMongoDoc(doc);

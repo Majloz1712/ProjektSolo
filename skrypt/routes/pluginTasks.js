@@ -1,5 +1,4 @@
-// routes/pluginTasks.js
-
+// skrypt/routes/pluginTasks.js
 import express from "express";
 import crypto from "node:crypto";
 import { performance } from "node:perf_hooks";
@@ -13,19 +12,15 @@ import { createTaskLogger } from "../loggerZadan.js";
 const router = express.Router();
 
 // UWAGA: zadziała tylko jeśli router jest montowany przed globalnym express.json(),
-// inaczej request może być odrzucony wcześniej (413 Payload Too Large).
 router.use(express.json({ limit: "50mb" }));
 
 async function ensureMongoDb() {
   try {
-    // kompatybilnie z różnymi wersjami drivera
     const connected =
       mongoClient?.topology?.isConnected?.() ||
       mongoClient?.topology?.s?.state === "connected";
 
-    if (!connected) {
-      await mongoClient.connect();
-    }
+    if (!connected) await mongoClient.connect();
   } catch {
     await mongoClient.connect();
   }
@@ -38,7 +33,6 @@ function normalizeB64(b64) {
   if (!b64) return null;
   let s = String(b64).trim();
 
-  // obetnij "data:image/...;base64,"
   const idx = s.indexOf("base64,");
   if (idx !== -1) s = s.slice(idx + 7);
 
@@ -67,6 +61,19 @@ async function loadMonitorPrompt(client, monitorId) {
   return rows[0]?.llm_prompt || null;
 }
 
+async function safeLoadMonitorPrompt(pg, monitorId, logger, label) {
+  if (!monitorId) return null;
+  try {
+    return await loadMonitorPrompt(pg, monitorId);
+  } catch (err) {
+    logger?.warn?.(`${label}_monitor_prompt_failed`, {
+      monitorId,
+      error: String(err?.message || err),
+    });
+    return null;
+  }
+}
+
 // Bezpieczne: działa niezależnie czy w URL jest plugin_tasks.id czy zadanie_id
 async function resolvePluginTaskByAnyId(client, anyId) {
   const { rows } = await client.query(
@@ -91,11 +98,11 @@ async function setPluginTaskStatus(client, pluginTaskId, status, bladOpis = null
   );
 }
 
-async function finishScanTask(client, zadanieId, {
-  status,
-  blad_opis = null,
-  snapshot_mongo_id = null,
-}) {
+async function finishScanTask(
+  client,
+  zadanieId,
+  { status, blad_opis = null, snapshot_mongo_id = null },
+) {
   if (!zadanieId) return;
 
   await client.query(
@@ -117,7 +124,7 @@ router.get("/next", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    // Atomowe "claim": nie ma wyścigów przy wielu klientach pluginu
+    // Atomowe "claim"
     const { rows } = await client.query(
       `WITH picked AS (
          SELECT id
@@ -176,7 +183,7 @@ router.post("/:id/result", async (req, res) => {
 
   const {
     monitor_id: monitorId,
-    zadanie_id: zadanieId,
+    zadanie_id: zadanieIdFromBody,
     screenshot_b64: screenshotB64,
     url,
     html,
@@ -194,77 +201,30 @@ router.post("/:id/result", async (req, res) => {
 
   let logger = console;
   try {
-    logger = await createTaskLogger({ monitorId, zadanieId: zadanieId || id });
+    logger = await createTaskLogger({ monitorId, zadanieId: zadanieIdFromBody || id });
   } catch {
     // ignore
   }
 
   const pg = await pool.connect();
   let pluginTask = null;
+  let scanTaskId = null;
 
   try {
     pluginTask = await resolvePluginTaskByAnyId(pg, id);
-    if (!pluginTask) {
-      return res.status(404).json({ error: "PLUGIN_TASK_NOT_FOUND" });
-    }
+    if (!pluginTask) return res.status(404).json({ error: "PLUGIN_TASK_NOT_FOUND" });
 
-    let monitorPrompt = null;
-    try {
-      monitorPrompt = await loadMonitorPrompt(pg, monitorId);
-    } catch (err) {
-      logger?.warn?.("plugin_result_monitor_prompt_failed", {
-        monitorId,
-        error: String(err?.message || err),
-      });
-    }
+    // finalne zadanie (UI patrzy na zadania_skanu)
+    scanTaskId = zadanieIdFromBody || pluginTask.zadanie_id || null;
 
-    // zostawiamy in_progress (już jest), ale jakby ktoś strzelił "z palca" endpoint:
+    // ktoś mógł strzelić endpoint z palca
     if (pluginTask.status === "pending") {
       await setPluginTaskStatus(pg, pluginTask.id, "in_progress", null);
     }
 
-    // do domykania PG taska (UI patrzy na zadania_skanu)
-    const scanTaskId = zadanieId || pluginTask.zadanie_id || null;
-
-  } catch (err) {
-    pg.release();
-    logger?.error?.("plugin_result_pg_resolve_error", { error: String(err?.message || err) });
-    return res.status(500).json({ error: "PG_ERROR" });
-  } finally {
-    // pg będzie zwolniony niżej (po status update done/error)
-  }
-
-  // wczytaj prompt monitora (żeby nie było ReferenceError i żeby zapisać go do snapshotu)
-  let monitorPrompt = null;
-  try {
-    monitorPrompt = await loadMonitorPrompt(pg, monitorId);
-    if (typeof monitorPrompt === "string") {
-      monitorPrompt = monitorPrompt.trim();
-      if (!monitorPrompt.length) monitorPrompt = null;
-    } else {
-      monitorPrompt = null;
-    }
-  } catch (err) {
-    logger?.warn?.("plugin_screenshot_load_prompt_error", {
-      monitorId,
-      error: String(err?.message || err),
-    });
-    monitorPrompt = null;
-  }
-
-  try {
+    const monitorPrompt = await safeLoadMonitorPrompt(pg, monitorId, logger, "plugin_result");
     const db = await ensureMongoDb();
     const snapshots = db.collection("snapshots");
-
-    let monitorPrompt = null;
-    try {
-      monitorPrompt = await loadMonitorPrompt(pg, monitorId);
-    } catch (err) {
-      logger?.warn?.("plugin_screenshot_monitor_prompt_failed", {
-        monitorId,
-        error: String(err?.message || err),
-      });
-    }
     const now = new Date();
 
     // 1) Extractory, jeśli dostaliśmy DOM
@@ -302,35 +262,31 @@ router.post("/:id/result", async (req, res) => {
     const screenshotSha1 = normShot ? sha1(normShot) : null;
     const screenshotLen = normShot ? normShot.length : 0;
 
-    // 3) Najpierw spróbuj zaktualizować snapshot (po monitor+zadanie, najnowszy)
-    let snapshotIdStr = null;
-
-    let existing = null;
-    if (zadanieId) {
-      existing = await snapshots
-        .find({ monitor_id: monitorId, zadanie_id: zadanieId })
+    // 3) Upsert snapshot
+    let snapshot = null;
+    if (scanTaskId) {
+      snapshot = await snapshots
+        .find({ monitor_id: monitorId, zadanie_id: scanTaskId })
         .sort({ ts: -1 })
         .limit(1)
         .next();
     }
 
-    if (existing) {
+    let snapshotIdStr = null;
+
+    if (snapshot) {
       const $set = {
         mode: "plugin",
         blocked: false,
         block_reason: null,
-        final_url: url || existing.final_url || null,
+        final_url: url || snapshot.final_url || null,
         plugin_result_at: now,
+        ...(monitorPrompt ? { llm_prompt: monitorPrompt } : {}),
       };
-      if (monitorPrompt) {
-        $set.llm_prompt = monitorPrompt;
-      }
 
       if (hasDom) {
         $set.plugin_dom_text = text || null;
         $set.plugin_dom_fetched_at = now;
-        // opcjonalnie trzymaj html (jeśli chcesz) – ale to bywa duże
-        // $set.plugin_dom_html = typeof html === "string" ? html : null;
       }
 
       if (hasScreenshot) {
@@ -342,12 +298,10 @@ router.post("/:id/result", async (req, res) => {
         $set.plugin_screenshot_fullpage = true;
       }
 
-      if (extracted) {
-        $set.extracted_v2 = extracted;
-      }
+      if (extracted) $set.extracted_v2 = extracted;
 
-      await snapshots.updateOne({ _id: existing._id }, { $set });
-      snapshotIdStr = existing._id?.toString?.() ?? null;
+      await snapshots.updateOne({ _id: snapshot._id }, { $set });
+      snapshotIdStr = snapshot._id.toString();
 
       logger?.info?.("plugin_result_mongo_update_done", {
         pluginTaskId: pluginTask.id,
@@ -359,7 +313,7 @@ router.post("/:id/result", async (req, res) => {
     } else {
       const doc = {
         monitor_id: monitorId,
-        zadanie_id: zadanieId || null,
+        zadanie_id: scanTaskId,
         url: url || pluginTask.url || null,
         ts: now,
         mode: "plugin",
@@ -382,7 +336,7 @@ router.post("/:id/result", async (req, res) => {
       };
 
       const { insertedId } = await snapshots.insertOne(doc);
-      snapshotIdStr = insertedId?.toString?.() ?? null;
+      snapshotIdStr = insertedId.toString();
 
       logger?.info?.("plugin_result_mongo_insert_done", {
         pluginTaskId: pluginTask.id,
@@ -402,29 +356,24 @@ router.post("/:id/result", async (req, res) => {
         durationMs: Math.round(performance.now() - tPipe0),
       });
     } catch (err) {
-      logger?.error?.("plugin_result_pipeline_error", {
-        snapshotId: snapshotIdStr,
-        error: String(err?.message || err),
-      });
-      // pipeline error -> status error (żeby było widać, że coś nie pykło)
-      // pipeline error -> status error (żeby było widać, że coś nie pykło)
-      const errMsg = (err?.message || err).toString().slice(0, 300);
-      await setPluginTaskStatus(pg, pluginTask.id, "error", `PIPELINE_ERROR: ${errMsg}`);
+      const errMsg = String(err?.message || err).slice(0, 300);
 
+      await setPluginTaskStatus(pg, pluginTask.id, "error", `PIPELINE_ERROR: ${errMsg}`);
       await finishScanTask(pg, scanTaskId, {
         status: "blad",
         blad_opis: `PIPELINE_ERROR: ${errMsg}`.slice(0, 500),
         snapshot_mongo_id: snapshotIdStr,
       });
 
+      logger?.error?.("plugin_result_pipeline_error", {
+        snapshotId: snapshotIdStr,
+        error: String(err?.message || err),
+      });
       return res.status(500).json({ error: "PIPELINE_ERROR" });
-
     }
 
-
-    // 5) Finalnie: done
+    // 5) done
     await setPluginTaskStatus(pg, pluginTask.id, "done", null);
-
     await finishScanTask(pg, scanTaskId, {
       status: "ok",
       blad_opis: null,
@@ -437,28 +386,18 @@ router.post("/:id/result", async (req, res) => {
     });
 
     return res.json({ ok: true, snapshot_id: snapshotIdStr });
-
-
-    return res.json({ ok: true, snapshot_id: snapshotIdStr });
   } catch (err) {
-    // zawsze kończ taska, żeby nie wisiał
+    const msg = String(err?.message || err).slice(0, 500);
+
     try {
-      if (pluginTask?.id) {
-        const msg = String(err?.message || err).slice(0, 500);
-        await setPluginTaskStatus(pg, pluginTask.id, "error", msg);
-
-        // scanTaskId może istnieć (dodany wyżej)
-        try {
-          await finishScanTask(pg, scanTaskId, {
-            status: "blad",
-            blad_opis: `PLUGIN_RESULT_ERROR: ${msg}`.slice(0, 500),
-            snapshot_mongo_id: null,
-          });
-        } catch {
-          // ignore
-        }
+      if (pluginTask?.id) await setPluginTaskStatus(pg, pluginTask.id, "error", msg);
+      if (scanTaskId) {
+        await finishScanTask(pg, scanTaskId, {
+          status: "blad",
+          blad_opis: `PLUGIN_RESULT_ERROR: ${msg}`.slice(0, 500),
+          snapshot_mongo_id: null,
+        });
       }
-
     } catch {
       // ignore
     }
@@ -501,46 +440,13 @@ router.post("/:id/price", async (req, res) => {
 
   try {
     pluginTask = await resolvePluginTaskByAnyId(pg, id);
-    if (!pluginTask) {
-      return res.status(404).json({ error: "PLUGIN_TASK_NOT_FOUND" });
-    }
-  } catch (err) {
-    pg.release();
-    logger?.error?.("plugin_price_pg_resolve_error", { error: String(err?.message || err) });
-    return res.status(500).json({ error: "PG_ERROR" });
-  }
+    if (!pluginTask) return res.status(404).json({ error: "PLUGIN_TASK_NOT_FOUND" });
 
-  // prompt monitora (może być null)
-  let monitorPrompt = null;
-  try {
-    monitorPrompt = await loadMonitorPrompt(pg, monitorId);
-    if (typeof monitorPrompt === "string") {
-      monitorPrompt = monitorPrompt.trim();
-      if (!monitorPrompt.length) monitorPrompt = null;
-    }
-  } catch (err) {
-    logger?.warn?.("plugin_screenshot_load_prompt_error", {
-      monitorId,
-      error: String(err?.message || err),
-    });
-    monitorPrompt = null;
-  }
-
-  try {
+    const monitorPrompt = await safeLoadMonitorPrompt(pg, monitorId, logger, "plugin_price");
     const db = await ensureMongoDb();
     const snapshots = db.collection("snapshots");
 
-    let monitorPrompt = null;
-    try {
-      monitorPrompt = await loadMonitorPrompt(pg, monitorId);
-    } catch (err) {
-      logger?.warn?.("plugin_price_monitor_prompt_failed", {
-        monitorId,
-        error: String(err?.message || err),
-      });
-    }
-
-    // znajdź NAJNOWSZY snapshot agenta (monitor_id + zadanie_id)
+    // znajdź NAJNOWSZY snapshot (monitor_id + zadanie_id)
     const tFind0 = performance.now();
     const snapshot = await snapshots
       .find({ monitor_id: monitorId, zadanie_id: zadanieId })
@@ -557,7 +463,6 @@ router.post("/:id/price", async (req, res) => {
     });
 
     if (!snapshot) {
-      // brak snapshotu – nie ma czego wzbogacać, ale task kończymy żeby nie wisiał
       await setPluginTaskStatus(pg, pluginTask.id, "done", "SNAPSHOT_NOT_FOUND");
       return res.json({ ok: true, snapshot_id: null });
     }
@@ -566,14 +471,13 @@ router.post("/:id/price", async (req, res) => {
 
     // dopisz ceny
     const tUpd0 = performance.now();
-    const $set = { plugin_prices: prices, plugin_price_enriched_at: new Date() };
-    if (monitorPrompt) {
-      $set.llm_prompt = monitorPrompt;
-    }
-    await snapshots.updateOne(
-      { _id: snapshot._id },
-      { $set },
-    );
+    const $set = {
+      plugin_prices: prices,
+      plugin_price_enriched_at: new Date(),
+      ...(monitorPrompt ? { llm_prompt: monitorPrompt } : {}),
+    };
+
+    await snapshots.updateOne({ _id: snapshot._id }, { $set });
 
     logger?.info?.("plugin_price_mongo_update_done", {
       snapshotId: snapshotIdStr,
@@ -589,9 +493,9 @@ router.post("/:id/price", async (req, res) => {
         durationMs: Math.round(performance.now() - tPipe0),
       });
     } catch (err) {
-      const errMsg = (err?.message || err).toString().slice(0, 300);
-      await setPluginTaskStatus(pg, pluginTask.id, "error", `PIPELINE_ERROR: ${errMsg}`);
+      const errMsg = String(err?.message || err).slice(0, 300);
 
+      await setPluginTaskStatus(pg, pluginTask.id, "error", `PIPELINE_ERROR: ${errMsg}`);
       await finishScanTask(pg, zadanieId, {
         status: "blad",
         blad_opis: `PIPELINE_ERROR: ${errMsg}`.slice(0, 500),
@@ -605,11 +509,8 @@ router.post("/:id/price", async (req, res) => {
       return res.status(500).json({ error: "PIPELINE_ERROR" });
     }
 
-
     // done
-
     await setPluginTaskStatus(pg, pluginTask.id, "done", null);
-
     await finishScanTask(pg, zadanieId, {
       status: "ok",
       blad_opis: null,
@@ -621,8 +522,7 @@ router.post("/:id/price", async (req, res) => {
       durationMs: Math.round(performance.now() - t0),
     });
 
-    return res.json({ ok: true });
-
+    return res.json({ ok: true, snapshot_id: snapshotIdStr });
   } catch (err) {
     try {
       if (pluginTask?.id) {
@@ -636,6 +536,7 @@ router.post("/:id/price", async (req, res) => {
       error: String(err?.message || err),
       durationMs: Math.round(performance.now() - t0),
     });
+
     return res.status(500).json({ error: "SERVER_ERROR" });
   } finally {
     pg.release();
@@ -663,7 +564,6 @@ router.post("/:id/screenshot", async (req, res) => {
   } = req.body || {};
 
   const hasScreenshot = typeof screenshotB64 === "string" && screenshotB64.length > 0;
-
   if (!monitorId || !zadanieId || !hasScreenshot) {
     return res.status(400).json({ error: "MISSING_FIELDS" });
   }
@@ -684,39 +584,13 @@ router.post("/:id/screenshot", async (req, res) => {
 
   try {
     pluginTask = await resolvePluginTaskByAnyId(pg, id);
-    if (!pluginTask) {
-      return res.status(404).json({ error: "PLUGIN_TASK_NOT_FOUND" });
-    }
-  } catch (err) {
-    pg.release();
-    logger?.error?.("plugin_screenshot_pg_resolve_error", { error: String(err?.message || err) });
-    return res.status(500).json({ error: "PG_ERROR" });
-  }
+    if (!pluginTask) return res.status(404).json({ error: "PLUGIN_TASK_NOT_FOUND" });
 
-  // ✅ DODAJ TO: prompt monitora (może być null)
-  let monitorPrompt = null;
-  try {
-    monitorPrompt = await loadMonitorPrompt(pg, monitorId);
-    if (typeof monitorPrompt === "string") {
-      monitorPrompt = monitorPrompt.trim();
-      if (!monitorPrompt.length) monitorPrompt = null;
-    } else {
-      monitorPrompt = null;
-    }
-  } catch (err) {
-    logger?.warn?.("plugin_screenshot_load_prompt_error", {
-      monitorId,
-      error: String(err?.message || err),
-    });
-    monitorPrompt = null;
-  }
-
-  try {
+    const monitorPrompt = await safeLoadMonitorPrompt(pg, monitorId, logger, "plugin_screenshot");
     const db = await ensureMongoDb();
-
     const snapshots = db.collection("snapshots");
 
-    // znajdź NAJNOWSZY snapshot agenta (monitor_id + zadanie_id)
+    // znajdź NAJNOWSZY snapshot (monitor_id + zadanie_id)
     const tFind0 = performance.now();
     const snapshot = await snapshots
       .find({ monitor_id: monitorId, zadanie_id: zadanieId })
@@ -732,33 +606,56 @@ router.post("/:id/screenshot", async (req, res) => {
       screenshotLen,
     });
 
-    let snapshotIdStr = null;
     const now = new Date();
+
+    // LAZY: identyczny screenshot => skip pipeline
+    if (snapshot && snapshot.screenshot_sha1 && screenshotSha1 && snapshot.screenshot_sha1 === screenshotSha1) {
+      const snapshotIdStr = snapshot._id.toString();
+
+      await snapshots.updateOne(
+        { _id: snapshot._id },
+        {
+          $set: {
+            plugin_screenshot_at: now,
+            final_url: url || snapshot.final_url || null,
+            ...(monitorPrompt ? { llm_prompt: monitorPrompt } : {}),
+          },
+        },
+      );
+
+      await setPluginTaskStatus(pg, pluginTask.id, "done", null);
+      await finishScanTask(pg, zadanieId, {
+        status: "ok",
+        blad_opis: null,
+        snapshot_mongo_id: snapshotIdStr,
+      });
+
+      logger?.info?.("plugin_screenshot_lazy_skip", {
+        snapshotId: snapshotIdStr,
+        reason: "same_screenshot_sha1",
+      });
+
+      return res.json({ ok: true, snapshot_id: snapshotIdStr, skipped: true });
+    }
+
+    // update albo insert
+    let snapshotIdStr = null;
 
     if (snapshot) {
       const tUpd0 = performance.now();
       const $set = {
-        // to jest wynik pluginu, nie blokada
-        mode: "plugin_screenshot",
-        blocked: false,
-        block_reason: null,
-
+        mode: snapshot.mode || "plugin_screenshot",
+        final_url: url || snapshot.final_url || pluginTask.url || null,
         screenshot_b64: normShot,
         screenshot_b64_len: screenshotLen,
         screenshot_sha1: screenshotSha1,
-
         plugin_screenshot_at: now,
         plugin_screenshot_source: "chrome_extension",
         plugin_screenshot_fullpage: true,
-
-        final_url: url || snapshot.final_url || null,
+        ...(monitorPrompt ? { llm_prompt: monitorPrompt } : {}),
       };
-      $set.llm_prompt = monitorPrompt ?? null;
 
-      await snapshots.updateOne(
-        { _id: snapshot._id },
-        { $set },
-      );
+      await snapshots.updateOne({ _id: snapshot._id }, { $set });
       snapshotIdStr = snapshot._id.toString();
 
       logger?.info?.("plugin_screenshot_mongo_update_done", {
@@ -766,17 +663,14 @@ router.post("/:id/screenshot", async (req, res) => {
         durationMs: Math.round(performance.now() - tUpd0),
       });
     } else {
-      // jeśli brak snapshotu (rzadkie) – tworzymy nowy
       const doc = {
         monitor_id: monitorId,
         zadanie_id: zadanieId,
         url: url || pluginTask.url || null,
         ts: now,
-
         mode: "plugin_screenshot",
         final_url: url || pluginTask.url || null,
-        llm_prompt: monitorPrompt ?? null,
-
+        llm_prompt: monitorPrompt || null,
         blocked: false,
         block_reason: null,
 
@@ -810,26 +704,27 @@ router.post("/:id/screenshot", async (req, res) => {
         durationMs: Math.round(performance.now() - tPipe0),
       });
     } catch (err) {
-      const errMsg = (err?.message || err).toString().slice(0, 300);
-      await setPluginTaskStatus(pg, pluginTask.id, "error", `PIPELINE_ERROR: ${errMsg}`);
+      const errMsg = String(err?.message || err).slice(0, 300);
 
+      await setPluginTaskStatus(pg, pluginTask.id, "error", `PIPELINE_ERROR: ${errMsg}`);
       await finishScanTask(pg, zadanieId, {
         status: "blad",
         blad_opis: `PIPELINE_ERROR: ${errMsg}`.slice(0, 500),
         snapshot_mongo_id: snapshotIdStr,
       });
 
-      logger?.error?.("plugin_screenshot_pipeline_error", {
-        snapshotId: snapshotIdStr,
-        error: String(err?.message || err),
-      });
+logger.error('plugin_screenshot_pipeline_error', {
+  err: String(err),
+  stack: err?.stack,
+  monitorId,
+  zadanieId,
+});
+
       return res.status(500).json({ error: "PIPELINE_ERROR" });
     }
 
-
     // done
     await setPluginTaskStatus(pg, pluginTask.id, "done", null);
-
     await finishScanTask(pg, zadanieId, {
       status: "ok",
       blad_opis: null,
@@ -843,7 +738,6 @@ router.post("/:id/screenshot", async (req, res) => {
     });
 
     return res.json({ ok: true, snapshot_id: snapshotIdStr });
-
   } catch (err) {
     try {
       if (pluginTask?.id) {
@@ -866,3 +760,4 @@ router.post("/:id/screenshot", async (req, res) => {
 });
 
 export default router;
+

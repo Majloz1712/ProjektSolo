@@ -453,7 +453,7 @@ async function runExtractors(doc, html, context, logger) {
 
   // We prefer *structured* text (multi-line blocks, headings, lists) over
   // meta-only extractors (JSON-LD / og:...) even if meta returns a high detect score.
-  const META_EXTRACTOR_NAMES = new Set(["meta-og"]);
+  const META_EXTRACTOR_NAMES = new Set(["jsonld", "meta-og"]);
 
   function structuredTextScore(result) {
     const text = String(result?.text || "").trim();
