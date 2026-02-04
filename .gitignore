@@ -23,3 +23,7 @@ exports/
 skrypt/.venv/
 __pycache__/
 *.pyc
+
+# logs/exports
+logs/
+exports/
