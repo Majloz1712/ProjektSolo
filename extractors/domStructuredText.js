@@ -7,6 +7,9 @@
 
 import { clampTextLength, normalizeWhitespace } from '../utils/normalize.js';
 
+export const PARA_MARKER = '<PARA>';
+export const PARA = PARA_MARKER;
+
 export const DOM_STRUCTURED_TEXT_VERSION = '2026-02-02_v7';
 
 const BOILERPLATE_CONTAINERS = [
@@ -244,7 +247,8 @@ function removeSerializedBlobs(s) {
     out += ch;
   }
 
-  return out;
+  while (out.endsWith(PARA_MARKER)) out = out.slice(0, -PARA_MARKER.length);
+return out;
 }
 
 function shouldDropLine(line) {
@@ -396,7 +400,14 @@ function _serializeTable(table) {
 
 // Extract structured text from DOM in a way that preserves sections (headings),
 // list nesting and key/value pairs, while dropping UI boilerplate.
-function extractFromDom(rootEl, { dropBoilerplate = true } = {}) {
+function extractFromDom(rootEl, {
+  dropBoilerplate = true,
+  paragraphMarker = '<PARA>',
+  emitParagraphMarkers = true,
+} = {}) {
+  const PARA = (typeof paragraphMarker === 'string' && paragraphMarker.trim()) ? paragraphMarker.trim() : '<PARA>';
+  const emitPara = !!emitParagraphMarkers;
+  const isParaMarker = (s) => s === PARA;
   const contentRoot0 = pickContentRoot(rootEl);
   // Work on a clone so we never mutate the original DOM passed by callers.
   const contentRoot = _cloneAndDrop(contentRoot0, 'script,style,noscript,template,svg,canvas');
@@ -408,10 +419,23 @@ function extractFromDom(rootEl, { dropBoilerplate = true } = {}) {
   const push = (line) => {
     const v = cleanLinePreserveIndent(line);
     if (!v) return;
+
+    // Structural paragraph marker: keep (but collapse immediate repeats).
+    if (isParaMarker(v)) {
+      if (!emitPara) return;
+      if (!lines.length || lines[lines.length - 1] !== PARA) lines.push(PARA);
+      return;
+    }
+
     // Keep duplicates rare, but don't over-dedupe: only exact duplicates globally.
     if (seen.has(v)) return;
     seen.add(v);
     lines.push(v);
+  };
+
+  const pushPara = () => {
+    if (!emitPara) return;
+    push(PARA);
   };
 
   const visit = (node) => {
@@ -545,4 +569,3 @@ export function domToStructuredText(root, {
   const cleaned = finalizeToOcrLike(rawText, { maxBlocks, maxLineChars });
   return clampTextLength(cleaned || '', maxChars);
 }
-

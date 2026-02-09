@@ -473,7 +473,21 @@ function diffUniversalData(prevAnalysis, newAnalysis) {
   };
 }
 
-export async function computeMachineDiff(prevSnapshot, newSnapshot, { logger, prevAnalysis, newAnalysis } = {}) {
+export async function computeMachineDiff(
+  prevSnapshot,
+  newSnapshot,
+  {
+    logger,
+    prevAnalysis,
+    newAnalysis,
+
+    // Optional overrides (backward-compatible):
+    // - focusChunkIds: restrict "significant" decision to a subset of chunk IDs
+    // - chunkTemplate: force a specific chunk template (e.g. baseline template) even when analyses are missing
+    focusChunkIds,
+    chunkTemplate: chunkTemplateOverride,
+  } = {},
+) {
   const log = logger || console;
 
   if (!prevSnapshot) {
@@ -538,12 +552,14 @@ if (metrics.ocrTextChanged && metrics.ocrTextDiffScore > 0.05) {
   reasons.push(`ocr_text_changed(score=${metrics.ocrTextDiffScore.toFixed(3)})`);
 }
 
-// ---- Chunk diff (LLM template if available; fallback to algorithmic) ----
-const chunkTemplate = prevAnalysis?.chunk_template || newAnalysis?.chunk_template || null;
+  // ---- Chunk diff (LLM template if available; fallback to algorithmic) ----
+  // NOTE: chunkTemplateOverride is used mainly by diffLite (when analyses are not loaded yet).
+  const chunkTemplate = chunkTemplateOverride || prevAnalysis?.chunk_template || newAnalysis?.chunk_template || null;
 const llmChunkingEnabled = process.env.LLM_CHUNKING_ENABLED === '1';
 
 if (llmChunkingEnabled && chunkTemplate?.chunks?.length) {
-  const source = chunkTemplate?.source === 'ocr' ? 'ocr' : 'extracted';
+  const src = String(chunkTemplate?.source || '').toLowerCase();
+  const source = src.startsWith('ocr') ? 'ocr' : 'extracted';
 
   const prevSrcText = source === 'ocr' ? prevOcrRaw : prevTextRaw;
   const newSrcText = source === 'ocr' ? newOcrRaw : newTextRaw;
@@ -551,6 +567,7 @@ if (llmChunkingEnabled && chunkTemplate?.chunks?.length) {
   const prevChunked = extractChunksByTemplate(prevSrcText, chunkTemplate);
   const newChunked = extractChunksByTemplate(newSrcText, chunkTemplate);
 
+  // Full diff (all template chunks)
   metrics.textChunkDiff = computeChunkDiff(prevChunked.chunks, newChunked.chunks);
   metrics.textChunkDiff.mode = 'llm_template';
   metrics.textChunkDiff.templateSource = source;
@@ -571,6 +588,57 @@ if (llmChunkingEnabled && chunkTemplate?.chunks?.length) {
   if (Array.isArray(metrics.textChunkDiff.changed)) {
     metrics.textChunkDiff.changed_for_judge = metrics.textChunkDiff.changed.slice(0, maxChanged);
   }
+
+  // Focus-mode diff: restrict change significance to a known subset of chunk IDs.
+  const focusIds = Array.isArray(focusChunkIds)
+    ? focusChunkIds.map((x) => String(x || '').trim()).filter(Boolean)
+    : [];
+
+  if (focusIds.length) {
+    const set = new Set(focusIds);
+    const prevFocus = (prevChunked.chunks || []).filter((c) => c && set.has(c.id));
+    const newFocus = (newChunked.chunks || []).filter((c) => c && set.has(c.id));
+    const focusDiff = computeChunkDiff(prevFocus, newFocus);
+    focusDiff.mode = 'llm_template_focus';
+    focusDiff.templateSource = source;
+
+    const foundPrev = new Set(prevFocus.map((c) => c.id));
+    const foundNew = new Set(newFocus.map((c) => c.id));
+    const missingPrevIds = focusIds.filter((id) => !foundPrev.has(id));
+    const missingNewIds = focusIds.filter((id) => !foundNew.has(id));
+
+    metrics.textChunkDiffFocus = {
+      ...focusDiff,
+      focusIds,
+      missing: {
+        prevMissingIds: missingPrevIds,
+        newMissingIds: missingNewIds,
+      },
+    };
+
+    const focusChanged =
+      (focusDiff?.changedChunks || 0) > 0 ||
+      (Array.isArray(focusDiff?.added) && focusDiff.added.length > 0) ||
+      (Array.isArray(focusDiff?.removed) && focusDiff.removed.length > 0);
+
+    // Discovery = something changed that might invalidate focus (template mismatch / big structural change).
+    // Conservative by design: we'd rather run analysis than miss a change.
+    const discovery =
+      !focusChanged &&
+      (
+        missingPrevIds.length > 0 ||
+        missingNewIds.length > 0 ||
+        metrics.textChunkDiff?.significant === true ||
+        metrics.textDiffScore > 0.2 ||
+        metrics.ocrTextDiffScore > 0.2
+      );
+
+    metrics.focus = {
+      enabled: true,
+      focusChanged,
+      discovery,
+    };
+  }
 } else {
   // fallback: chunkuj to samo źródło co evidence (OCR jeśli jest, inaczej extracted)
   const basePrev = (prevOcrRaw || prevOcr) ? prevOcrRaw : prevTextRaw;
@@ -584,6 +652,11 @@ if (metrics.textChunkDiff?.changedChunks > 0) {
   reasons.push(
     `text_chunk_changed(changed=${metrics.textChunkDiff.changedChunks}/${metrics.textChunkDiff.nowChunks},mode=${metrics.textChunkDiff.mode})`
   );
+}
+
+if (metrics?.focus?.enabled) {
+  if (metrics.focus.focusChanged) reasons.push('focus_chunk_changed');
+  else if (metrics.focus.discovery) reasons.push('focus_discovery');
 }
 
 
@@ -683,7 +756,13 @@ if (metrics.textChunkDiff?.changedChunks > 0) {
   if (metrics.ocrTextDiffScore > 0.15) hasSignificantMachineChange = true;
 
   // Chunk diff = istotne przy małych zmianach w dużym tekście
-  if (metrics.textChunkDiff?.significant) hasSignificantMachineChange = true;
+  // If focus-mode is enabled, we only treat "significant" as true if focus changed
+  // OR if we detect a discovery (focus/template may no longer be trustworthy).
+  if (metrics?.focus?.enabled) {
+    if (metrics.focus.focusChanged || metrics.focus.discovery) hasSignificantMachineChange = true;
+  } else {
+    if (metrics.textChunkDiff?.significant) hasSignificantMachineChange = true;
+  }
 
   if (metrics.universalDataChanged) hasSignificantMachineChange = true;
 

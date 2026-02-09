@@ -111,7 +111,7 @@ function buildUniversalPrompt({ userPrompt, extractedText, ocrText }) {
     (ex ? `EXTRACTED_TEXT:\n${ex}\n\n` : '') +
     (ocr ? `OCR_TEXT:\n${ocr}\n\n` : '') +
     'Zwróć JSON o strukturze:\n\n' +
-    '{ "summary": string, "metrics": { "rating": number|null, "reviews_count": number|null }, "universal_data": [ { "key": string, "label": string, "value": string } ] }'
+    '{ "summary": string, "metrics": { "rating": number|null, "reviews_count": number|null } }'
   );
 }
 
@@ -340,7 +340,7 @@ export async function ensureSnapshotAnalysis(snapshotRef, options = {}) {
   const summary = sanitizeRequiredString(parsed?.summary);
   const rating = normalizeNumberOrNull(parsed?.metrics?.rating);
   const reviewsCount = normalizeNumberOrNull(parsed?.metrics?.reviews_count);
-  const universalData = normalizeUniversalData(parsed?.universal_data);
+  const universalData = [];
 
   const userPromptHash = normalizedUserPrompt ? hashUserPrompt(normalizedUserPrompt) : null;
 
@@ -362,9 +362,9 @@ export async function ensureSnapshotAnalysis(snapshotRef, options = {}) {
           model: OLLAMA_MODEL,
           userPrompt: normalizedUserPrompt,
           chunks,
-          maxQuotesPerChunk: 4,
-          maxQuoteChars: 160,
-          timeoutMs: Number(process.env.LLM_EVIDENCE_TIMEOUT_MS || 12000),
+          maxQuotesPerChunk: 30,
+          maxQuoteChars: 300,
+          timeoutMs: Number(process.env.LLM_EVIDENCE_TIMEOUT_MS || 40000),
           trace: {
             snapshotId: String(snapshot?._id || ''),
             monitorId: String(snapshot?.monitor_id || ''),
@@ -414,7 +414,7 @@ export async function ensureSnapshotAnalysis(snapshotRef, options = {}) {
     },
     summary,
     metrics: { rating, reviews_count: reviewsCount },
-    universal_data: universalData,
+    universal_data: [],
     evidence_v1: evidenceV1,
     prompt_chunks_v1: promptChunksV1,
     chunk_template: chunkTemplate || null,
@@ -436,7 +436,7 @@ export async function ensureSnapshotAnalysis(snapshotRef, options = {}) {
     monitorId: String(snapshot.monitor_id || ''),
     zadanieId: String(snapshot.zadanie_id || snapshot.zadanieId || ''),
     durationMs: Math.round(performance.now() - t0),
-    universalDataItems: doc.universal_data.length,
+    universalDataItems: Array.isArray(doc.universal_data) ? doc.universal_data.length : 0,
     chunkTemplate: {
       enabled: process.env.LLM_CHUNKING_ENABLED === '1',
       reused: !!doc.chunk_template?.reused,

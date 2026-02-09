@@ -2,6 +2,14 @@
 // Refactor: JSON-first decisioning based on analysis.universal_data.
 // - No legacy regex/BEGIN_TRACKLY parsing.
 // - Optional LLM judge (format=json) only when userPrompt requires interpretation.
+//
+// FIX (2026-02-08): Map LLM-provided evidence_used QUOTES back to evidence_before#/evidence_after# IDs.
+// Some models return verbatim quotes instead of IDs even when instructed.
+// We now normalize and map those quotes to the correct evidence IDs before validation,
+// so important=true won't be discarded solely due to quote-form evidence_used.
+//
+// FIX (2026-02-09): Judge schema + prompt consistency (reason vs importance_reason)
+// and prefer out.json when calling Ollama with JSON schema.
 
 import { generateTextWithOllama } from './ollamaClient.js';
 import { pool } from '../polaczeniePG.js';
@@ -15,6 +23,27 @@ const OLLAMA_MODEL =
   process.env.OLLAMA_TEXT_MODEL ||
   process.env.LLM_MODEL ||
   'llama3.2:3b';
+
+// --- IMPORTANT ---
+// Prompt asks for "reason", so schema MUST require "reason" (not "importance_reason").
+// Also require evidence_used to reduce "important=true without evidence" cases.
+const JUDGE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['important', 'category', 'reason', 'evidence_used'],
+  properties: {
+    important: { type: 'boolean' },
+    category: { type: 'string' },
+    reason: { type: 'string' },
+    short_title: { type: 'string' },
+    short_description: { type: 'string' },
+    evidence_used: {
+      type: 'array',
+      items: { type: 'string' },
+    },
+    llm_fallback_used: { type: 'boolean' },
+  },
+};
 
 function normalizeUserPrompt(value) {
   const prompt = String(value || '').trim();
@@ -47,7 +76,6 @@ function extractRatingFromText(text) {
 
 function extractRatingFromEvidenceQuotes(quotes) {
   if (!Array.isArray(quotes) || !quotes.length) return null;
-  // Try each quote first (more precise), then joined text.
   for (const q of quotes) {
     const v = extractRatingFromText(q);
     if (v != null) return v;
@@ -56,17 +84,20 @@ function extractRatingFromEvidenceQuotes(quotes) {
 }
 
 
+
 function extractReviewsCountFromText(text) {
   if (!text) return null;
   const s = String(text).toLowerCase();
-  // Common multilingual keywords; intentionally generic.
-  const m = s.match(/(\d{1,6})\s*(?:opin(?:ia|ie|ii)?|recenz(?:ja|je|ji)?|review(?:s)?|rating(?:s)?|ocen(?:a|y)?)/i);
+  const m = s.match(
+    /(\d{1,6})\s*(?:opin(?:ia|ie|ii)?|recenz(?:ja|je|ji)?|review(?:s)?|rating(?:s)?|ocen(?:a|y)?)/i
+  );
   if (m) {
     const val = Number(m[1]);
     if (Number.isFinite(val) && val >= 0) return val;
   }
-  // Fallback: "(123)" next to a review/ratings keyword
-  const m2 = s.match(/(?:opin(?:ia|ie|ii)?|recenz(?:ja|je|ji)?|review(?:s)?|rating(?:s)?|ocen(?:a|y)?)[^\d]{0,30}\(\s*(\d{1,6})\s*\)/i);
+  const m2 = s.match(
+    /(?:opin(?:ia|ie|ii)?|recenz(?:ja|je|ji)?|review(?:s)?|rating(?:s)?|ocen(?:a|y)?)[^\d]{0,30}\(\s*(\d{1,6})\s*\)/i
+  );
   if (m2) {
     const val = Number(m2[1]);
     if (Number.isFinite(val) && val >= 0) return val;
@@ -81,14 +112,6 @@ function extractReviewsCountFromEvidenceQuotes(quotes) {
     if (v != null) return v;
   }
   return extractReviewsCountFromText(quotes.join(' '));
-}
-
-
-
-function normalizeForJsonPrompt(value, max = 240) {
-  const s = String(value || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  const trimmed = s.length > max ? `${s.slice(0, max)}…` : s;
-  return trimmed;
 }
 
 const UNIVERSAL_KEYWORDS = {
@@ -107,72 +130,18 @@ function promptMentions(promptLower, keywords) {
 function userCaresAboutKey(userPrompt, key) {
   const p = String(userPrompt || '').toLowerCase();
   if (!p) return false;
-
-  // jeśli user wpisze key wprost
   if (p.includes(String(key).toLowerCase())) return true;
-
   const kw = UNIVERSAL_KEYWORDS[key];
   if (!kw) return false;
   return promptMentions(p, kw);
 }
-
-
 
 function userIgnoresKey(userPrompt, key) {
   const p = String(userPrompt || '').toLowerCase();
   if (!p.includes('ignoruj') && !p.includes('pomi')) return false;
-
   const kw = UNIVERSAL_KEYWORDS[key];
   if (!kw) return false;
   return promptMentions(p, kw);
-}
-
-function decideByUniversalData(userPrompt, universalDataDiff) {
-  if (!universalDataDiff?.any) return null;
-
-  const changed = Array.isArray(universalDataDiff.changed) ? universalDataDiff.changed : [];
-  const added = Array.isArray(universalDataDiff.added) ? universalDataDiff.added : [];
-  const removed = Array.isArray(universalDataDiff.removed) ? universalDataDiff.removed : [];
-
-  const touchedKeys = [
-    ...changed.map((x) => x.key),
-    ...added.map((x) => x.key),
-    ...removed.map((x) => x.key),
-  ].filter(Boolean);
-
-  if (!touchedKeys.length) return null;
-
-  const cared = touchedKeys
-    .filter((k) => !userIgnoresKey(userPrompt, k))
-    .filter((k) => userCaresAboutKey(userPrompt, k));
-
-  // jeśli user nie wskazuje nic dot. tych kluczy -> nie wymuszaj (oddaj do judge)
-  if (!cared.length) return null;
-
-  const lines = [];
-  for (const c of changed) {
-    if (cared.includes(c.key)) lines.push(`${c.key}: ${c.before} -> ${c.after}`);
-  }
-  for (const a of added) {
-    if (cared.includes(a.key)) lines.push(`${a.key}: (added) -> ${a.after}`);
-  }
-  for (const r of removed) {
-    if (cared.includes(r.key)) lines.push(`${r.key}: ${r.before} -> (removed)`);
-  }
-
-  return {
-    important: true,
-    category: cared.includes('rating')
-      ? 'rating_change'
-      : cared.includes('reviews_count')
-        ? 'reviews_change'
-        : 'tracked_universal_change',
-    importance_reason: `Wykryto zmianę w monitorowanych polach: ${lines.join('; ')}`,
-    evidence_used: cared.map((k) => `universal_data.${k}`),
-    short_title: 'Zmiana w monitorowanych danych',
-    short_description: lines.join('; '),
-    llm_fallback_used: false,
-  };
 }
 
 function normalizeKey(s) {
@@ -234,99 +203,21 @@ function metricDelta(prevAnalysis, newAnalysis) {
   };
 }
 
-function classifyByKey(key) {
-  const k = key.toLowerCase();
-  if (k.includes('price') || k.includes('cena')) return 'price_change';
-  if (k.includes('avail') || k.includes('dost')) return 'availability_change';
-  if (k.includes('rating') || k.includes('ocena')) return 'rating_change';
-  if (k.includes('review') || k.includes('opin')) return 'reviews_change';
-  if (k.includes('deliver') || k.includes('wysy') || k.includes('shipping')) return 'delivery_change';
-  if (k.includes('seller') || k.includes('sprzed')) return 'seller_change';
-  return 'content_update';
-}
+function buildDeterministicDecision({ mDiff }) {
+  const ratingChanged = typeof mDiff?.rating === 'number' && mDiff.rating !== 0;
+  const reviewsChanged = typeof mDiff?.reviews_count === 'number' && mDiff.reviews_count !== 0;
 
-function buildDeterministicDecision({ uDiff, mDiff }) {
-  // 1) Metrics first (rating/reviews_count)
-  if (mDiff.rating) {
-    return {
-      important: true,
-      category: 'rating_change',
-      importance_reason: `Zmiana oceny: ${mDiff.rating.before} → ${mDiff.rating.after}.`,
-      evidence_used: ['metrics.rating'],
-      short_title: 'Zmiana oceny',
-      short_description: `Ocena zmieniła się z ${mDiff.rating.before} na ${mDiff.rating.after}.`,
-    };
-  }
-  if (mDiff.reviews_count) {
-    return {
-      important: true,
-      category: 'reviews_change',
-      importance_reason: `Zmiana liczby opinii: ${mDiff.reviews_count.before} → ${mDiff.reviews_count.after}.`,
-      evidence_used: ['metrics.reviews_count'],
-      short_title: 'Zmiana liczby opinii',
-      short_description: `Liczba opinii zmieniła się z ${mDiff.reviews_count.before} na ${mDiff.reviews_count.after}.`,
-    };
-  }
+  const important = ratingChanged || reviewsChanged;
 
-  // 2) Universal data diff
-  if (!uDiff.any) {
-    return {
-      important: false,
-      category: 'minor_change',
-      importance_reason: 'Brak różnic w extracted universal_data (i brak różnic w metrics).',
-      evidence_used: [],
-      short_title: 'Brak istotnej zmiany',
-      short_description: 'Nie wykryto różnic w kluczowych danych.',
-    };
-  }
-
-  const changedKey = uDiff.changed[0]?.key || uDiff.added[0]?.key || uDiff.removed[0]?.key || 'content';
-  const category = classifyByKey(changedKey);
-
-  if (uDiff.changed.length) {
-    const c = uDiff.changed[0];
-    return {
-      important: true,
-      category,
-      importance_reason: `Zmiana danych: ${c.key}: "${c.before}" → "${c.after}".`,
-      evidence_used: [`universal_data.${c.key}`],
-      short_title: 'Zmiana na stronie',
-      short_description: `${c.key}: "${c.before}" → "${c.after}"`,
-    };
-  }
-
-  if (uDiff.added.length) {
-    const a = uDiff.added[0];
-    return {
-      important: true,
-      category,
-      importance_reason: `Pojawiły się nowe dane: ${a.key}="${a.after}".`,
-      evidence_used: [`universal_data.${a.key}`],
-      short_title: 'Nowa informacja na stronie',
-      short_description: `${a.key}: "${a.after}"`,
-    };
-  }
-
-  const r = uDiff.removed[0];
   return {
-    important: true,
-    category,
-    importance_reason: `Zniknęły dane: ${r.key} (wcześniej: "${r.before}").`,
-    evidence_used: [`universal_data.${r.key}`],
-    short_title: 'Zmiana na stronie',
-    short_description: `${r.key} zostało usunięte/ukryte.`,
+    important,
+    category: important ? 'metric_change' : 'minor_change',
+    reason: important
+      ? 'Wykryto zmianę metryki liczbowej (na podstawie porównania analiz).'
+      : 'Brak potwierdzonej zmiany metryki liczbowej.',
+    evidence_used: [],
+    llm_fallback_used: true,
   };
-}
-
-function evidencePool({ uDiff, mDiff, diff }) {
-  const pool = [];
-  if (mDiff.rating) pool.push('metrics.rating');
-  if (mDiff.reviews_count) pool.push('metrics.reviews_count');
-  for (const c of uDiff.changed) pool.push(`universal_data.${c.key}`);
-  for (const a of uDiff.added) pool.push(`universal_data.${a.key}`);
-  for (const r of uDiff.removed) pool.push(`universal_data.${r.key}`);
-  if (Array.isArray(diff?.reasons)) pool.push(...diff.reasons.map((x) => `diff_reason:${x}`));
-  return pool;
 }
 
 function safeParseJsonFromLLM(raw) {
@@ -338,7 +229,6 @@ function safeParseJsonFromLLM(raw) {
     return JSON.parse(s);
   } catch {}
 
-  // fallback: wytnij pierwszego JSON-a z tekstu
   const start = s.indexOf('{');
   const end = s.lastIndexOf('}');
   if (start !== -1 && end !== -1 && end > start) {
@@ -349,27 +239,6 @@ function safeParseJsonFromLLM(raw) {
   return null;
 }
 
-function validateEvidenceUsed(evidenceUsed, evidencePool) {
-  if (!Array.isArray(evidenceUsed)) return false;
-
-  const pool = new Set(
-    (evidencePool || [])
-      .map((x) => String(x || '').trim())
-      .filter(Boolean),
-  );
-
-  // jeśli pool pusty, jedyny poprawny wybór to []
-  if (pool.size === 0) return evidenceUsed.length === 0;
-
-  return evidenceUsed.every((item) => pool.has(String(item || '').trim()));
-}
-
-/**
- * Sanityzacja: model czasem zwraca "chunk:section-5:Computer Components"
- * albo "universal_data.brand:Computer Components".
- * Tu obcinamy "dodatki" po dwukropkach i zostawiamy tylko klucze,
- * które faktycznie istnieją w allowedKeys.
- */
 function sanitizeEvidenceUsedAgainstAllowedKeys(evidenceUsed, allowedKeys) {
   if (!Array.isArray(evidenceUsed)) return [];
   const allowed = allowedKeys instanceof Set ? allowedKeys : new Set(allowedKeys || []);
@@ -381,7 +250,6 @@ function sanitizeEvidenceUsedAgainstAllowedKeys(evidenceUsed, allowedKeys) {
     let candidate = String(item ?? '').trim();
     if (!candidate) continue;
 
-    // 1) Spróbuj dokładnie
     if (allowed.has(candidate)) {
       if (!seen.has(candidate)) {
         seen.add(candidate);
@@ -390,7 +258,6 @@ function sanitizeEvidenceUsedAgainstAllowedKeys(evidenceUsed, allowedKeys) {
       continue;
     }
 
-    // 2) Jeśli LLM dopisał coś po dwukropku, tnij od końca aż do trafienia
     let trimmed = candidate;
     while (trimmed.includes(':')) {
       trimmed = trimmed.slice(0, trimmed.lastIndexOf(':')).trim();
@@ -402,199 +269,172 @@ function sanitizeEvidenceUsedAgainstAllowedKeys(evidenceUsed, allowedKeys) {
         break;
       }
     }
-
-    // 3) Jeśli nadal nic — odrzuć (halucynacja / nie-dozwolone)
   }
 
   return out;
 }
 
+// --- FIX helpers: quote -> evidence id mapping ---
+
+function normalizeQuoteForMatch(s) {
+  return String(s || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\s*\n\s*/g, '\n')
+    .trim()
+    .toLowerCase();
+}
+
+function buildQuoteToIdMap(evidenceBefore, evidenceAfter) {
+  const map = new Map();
+  for (const e of evidenceBefore || []) {
+    const key = normalizeQuoteForMatch(e?.quote);
+    if (key) map.set(key, e?.id);
+  }
+  for (const e of evidenceAfter || []) {
+    const key = normalizeQuoteForMatch(e?.quote);
+    if (key) map.set(key, e?.id);
+  }
+  return map;
+}
+
+function mapEvidenceUsedQuotesToIds(evidenceUsed, quoteToId) {
+  if (!Array.isArray(evidenceUsed) || !evidenceUsed.length) return [];
+  const out = [];
+
+  for (const item of evidenceUsed) {
+    const s = String(item ?? '').trim();
+    if (!s) continue;
+
+    if (s.startsWith('evidence_before#') || s.startsWith('evidence_after#') || s.startsWith('diff_reason:')) {
+      out.push(s);
+      continue;
+    }
+
+    const norm = normalizeQuoteForMatch(s);
+    const mapped = quoteToId.get(norm);
+    if (mapped) {
+      out.push(mapped);
+      continue;
+    }
+
+    const variants = [
+      s.replace(/^["']|["']$/g, ''),
+      s.replace(/^\-\s*/, ''),
+      s.replace(/^["']|["']$/g, '').replace(/^\-\s*/, ''),
+    ];
+
+    let found = null;
+    for (const v of variants) {
+      const m = quoteToId.get(normalizeQuoteForMatch(v));
+      if (m) {
+        found = m;
+        break;
+      }
+    }
+    if (found) out.push(found);
+  }
+
+  const seen = new Set();
+  return out.filter((x) => {
+    const k = String(x).trim();
+    if (!k || seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
 
 async function judgeImportanceWithLLM(
-  { userPrompt, prevSummary, newSummary, diffMetrics, diffReasons, metricsDelta },
-  { logger } = {},
+  { userPrompt, prevSummary, newSummary, diffMetrics },
+  { logger } = {}
 ) {
   const log = logger || console;
 
-  // ---- evidence pool (stabilne identyfikatory, w tym universal_data.*) ----
-  const uDiff = diffMetrics?.universalDataDiff;
-  const universalKeysChanged = [
-    ...(uDiff?.changed || []).map((x) => x?.key).filter(Boolean),
-    ...(uDiff?.added || []).map((x) => x?.key).filter(Boolean),
-    ...(uDiff?.removed || []).map((x) => x?.key).filter(Boolean),
-  ];
+  const beforeQuotes = Array.isArray(diffMetrics?.evidence_v1?.before) ? diffMetrics.evidence_v1.before : [];
+  const afterQuotes = Array.isArray(diffMetrics?.evidence_v1?.after) ? diffMetrics.evidence_v1.after : [];
 
-  // ---- chunk evidence as STABLE ids (we provide details separately) ----
-  const tcd = diffMetrics?.textChunkDiff && typeof diffMetrics.textChunkDiff === 'object' ? diffMetrics.textChunkDiff : null;
-  const changedChunks = Array.isArray(tcd?.changed_for_judge)
-    ? tcd.changed_for_judge
-    : Array.isArray(tcd?.changed)
-      ? tcd.changed
-      : [];
-  const addedChunks = Array.isArray(tcd?.added) ? tcd.added : [];
-  const removedChunks = Array.isArray(tcd?.removed) ? tcd.removed : [];
+  const norm = (s) =>
+    String(s || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
 
-const changedChunkKeys = new Set();
+  const beforeNormSet = new Set(beforeQuotes.map(norm).filter(Boolean));
+  const afterNormSet = new Set(afterQuotes.map(norm).filter(Boolean));
 
-// changedChunks: zwykle [{ key: ... }]
-for (const c of changedChunks) {
-  if (c?.key) changedChunkKeys.add(c.key);
-}
+  const setsEqual =
+    beforeNormSet.size === afterNormSet.size &&
+    [...beforeNormSet].every((x) => afterNormSet.has(x));
 
-// tcd.changedChunks: czasem lista stringów, czasem obiekty — obsłuż oba
-if (Array.isArray(tcd?.changedChunks)) {
-  for (const it of tcd.changedChunks) {
-    if (typeof it === 'string' && it.trim()) changedChunkKeys.add(it.trim());
-    else if (it?.key) changedChunkKeys.add(it.key);
-  }
-}
-
-const chunkIds = [...changedChunkKeys];
-
-const chunkAddedIds = addedChunks.map((c) => c?.key).filter(Boolean);
-const chunkRemovedIds = removedChunks.map((c) => c?.key).filter(Boolean);
-
-  // Prompt-driven evidence quotes (verbatim) extracted during snapshot analysis.
-  // We expose them as stable short IDs so the model can cite them deterministically.
-  const beforeQuotes = Array.isArray(diffMetrics?.evidence_v1?.before)
-    ? diffMetrics.evidence_v1.before
-    : [];
-  const afterQuotes = Array.isArray(diffMetrics?.evidence_v1?.after)
-    ? diffMetrics.evidence_v1.after
-    : [];
-
-  // Aliases used by generic metric extractors further down.
-  // They expect arrays of quote strings.
-  const evidenceBefore = beforeQuotes;
-  const evidenceAfter = afterQuotes;
-  const evidenceQuoteRefs = [];
-  const evidenceQuoteMap = {};
-  for (let i = 0; i < beforeQuotes.length; i += 1) {
-    const ref = `evidence_before#${i}`;
-    evidenceQuoteRefs.push(ref);
-    evidenceQuoteMap[ref] = String(beforeQuotes[i]);
-  }
-  for (let i = 0; i < afterQuotes.length; i += 1) {
-    const ref = `evidence_after#${i}`;
-    evidenceQuoteRefs.push(ref);
-    evidenceQuoteMap[ref] = String(afterQuotes[i]);
+  if (setsEqual) {
+    return {
+      prompt: null,
+      raw: null,
+      result: {
+        important: false,
+        category: 'minor_change',
+        reason: 'Dowody BEFORE i AFTER są identyczne (po treści) — brak wykrywalnej różnicy.',
+        evidence_used: [],
+        llm_fallback_used: false,
+      },
+      fallbackUsed: true,
+    };
   }
 
+  const evidenceBefore = beforeQuotes.map((q, i) => ({ id: `evidence_before#${i}`, quote: String(q) }));
+  const evidenceAfter = afterQuotes.map((q, i) => ({ id: `evidence_after#${i}`, quote: String(q) }));
 
   const evidencePool = [
-    ...(Array.isArray(diffReasons) ? diffReasons.map((r) => `diff_reason:${r}`) : []),
-    ...(metricsDelta?.rating ? ['metrics.rating'] : []),
-    ...(metricsDelta?.reviews_count ? ['metrics.reviews_count'] : []),
-    ...evidenceQuoteRefs,
-    ...universalKeysChanged.map((k) => `universal_data.${k}`),
-    ...chunkIds.map((k) => `chunk:${k}`),
-    ...chunkAddedIds.map((k) => `chunk_added:${k}`),
-    ...chunkRemovedIds.map((k) => `chunk_removed:${k}`),
+    ...evidenceBefore.map((e) => e.id),
+    ...evidenceAfter.map((e) => e.id),
   ];
 
-  // Compact metrics for the model (avoid huge payloads)
-  const diffMetricsCompact = {
-    ...(diffMetrics || {}),
-    textChunkDiff: tcd
-      ? {
-          mode: tcd.mode,
-          templateSource: tcd.templateSource,
-          templateFit: tcd.templateFit,
-          changedChunks: tcd.changedChunks,
-          nowChunks: tcd.nowChunks,
-          significant: tcd.significant,
-          changed: changedChunks,
-          added: addedChunks,
-          removed: removedChunks,
-        }
-      : null,
+  const ratingBefore = extractRatingFromEvidenceQuotes(beforeQuotes);
+  const ratingAfter = extractRatingFromEvidenceQuotes(afterQuotes);
+  const reviewsCountBefore = extractReviewsCountFromEvidenceQuotes(beforeQuotes);
+  const reviewsCountAfter = extractReviewsCountFromEvidenceQuotes(afterQuotes);
+
+  const derivedMetrics = {
+    rating_before: ratingBefore,
+    rating_after: ratingAfter,
+    reviews_count_before: reviewsCountBefore,
+    reviews_count_after: reviewsCountAfter,
   };
 
-  const evidenceQuoteBlock = (() => {
-    const lines = [];
-    lines.push('Dowody (verbatim cytaty wybrane na etapie analizy, pod USER_PROMPT):');
-    lines.push('BEFORE:');
-    if (beforeQuotes.length === 0) {
-      lines.push('- (brak)');
-    } else {
-      for (let i = 0; i < beforeQuotes.length; i++) {
-        const ref = `evidence_before#${i}`;
-        const q = normalizeForJsonPrompt(evidenceQuoteMap[ref] ?? '');
-        lines.push(`- ${ref}: "${q}"`);
-      }
-    }
-    lines.push('AFTER:');
-    if (afterQuotes.length === 0) {
-      lines.push('- (brak)');
-    } else {
-      for (let i = 0; i < afterQuotes.length; i++) {
-        const ref = `evidence_after#${i}`;
-        const q = normalizeForJsonPrompt(evidenceQuoteMap[ref] ?? '');
-        lines.push(`- ${ref}: "${q}"`);
-      }
-    }
-    return lines.join('\n');
-  })();
-
-  const requireQuoteEvidence = String(process.env.LLM_JUDGE_REQUIRE_QUOTE_EVIDENCE || 'true') !== 'false';
-
-  // Best-effort numeric hints derived ONLY from evidence quotes.
-  // This helps the judge ignore OCR glue / trailing tokens when the numeric value is unchanged.
-  const derivedEvidenceMetrics = {
-    rating_before: extractRatingFromEvidenceQuotes(evidenceBefore),
-    rating_after: extractRatingFromEvidenceQuotes(evidenceAfter),
-    reviews_count_before: extractReviewsCountFromEvidenceQuotes(evidenceBefore),
-    reviews_count_after: extractReviewsCountFromEvidenceQuotes(evidenceAfter),
-  };
-
+  const evidenceTextBefore = evidenceBefore.map((e) => `- ${e.id}: "${e.quote}"`).join('\n');
+  const evidenceTextAfter = evidenceAfter.map((e) => `- ${e.id}: "${e.quote}"`).join('\n');
 
   const prompt = `
 Jesteś sędzią zmian na stronie.
 
 USER_PROMPT:
-${userPrompt || '(brak)'}
+${userPrompt}
 
 Dane (kontekst):
 - prevSummary: ${prevSummary || '(brak)'}
 - newSummary: ${newSummary || '(brak)'}
 
-${evidenceQuoteBlock}
+Dowody (verbatim cytaty wybrane na etapie analizy, pod USER_PROMPT):
+BEFORE:
+${evidenceTextBefore || '- (brak)'}
+AFTER:
+${evidenceTextAfter || '- (brak)'}
 
 Pochodne metryki z dowodów (tylko z powyższych cytatów; mogą być null):
-${JSON.stringify(derivedEvidenceMetrics)}
+${JSON.stringify(derivedMetrics)}
 
+Zasady oceny:
+- Porównuj BEFORE vs AFTER WYŁĄCZNIE na podstawie powyższych cytatów (ich treści).
+- Jeśli cytaty są takie same po obu stronach (może różnić się kolejność lub identyfikatory) -> important=false.
+- Jeśli USER_PROMPT oczekuje zmiany typu "pojawia się / znika / zostaje dodany" -> important=true tylko, gdy w cytatach widać KONKRET.
+- Ignoruj liczby, jeśli USER_PROMPT mówi, aby je ignorować.
 
-WAŻNE (odporność na szum OCR):
-- Twoim priorytetem są ZMIANY WARTOŚCI LICZBOWYCH, jeśli tego dotyczy USER_PROMPT (np. ocena/rating, liczba opinii/recenzji).
-- Najpierw wyłuskaj z dowodów BEFORE i AFTER te same metryki (np. ocena w skali /5, liczba opinii).
-- Uznaj zmianę za istotną tylko, gdy wartości metryk faktycznie się różnią.
-  * Przykład szumu: "Rewelacyjny 5,00/5" vs "Rewelacyjny 5,00/5 4 allegro" -> ocena nadal 5.00 -> important=false.
-- Jeśli nie potrafisz wydobyć porównywalnych metryk po OBU stronach -> important=false.
-- Ignoruj liczby niezwiązane z USER_PROMPT (ceny, raty, dostawa, % polecenia sprzedawcy), jeśli USER_PROMPT każe je ignorować.
-
-Diff metrics (JSON):
-${JSON.stringify(diffMetricsCompact ?? null)}
-
-Zmiany w chunkach (szczegóły):
-${JSON.stringify(
-  {
-    changed_chunks: changedChunks,
-    added_chunks: addedChunks,
-    removed_chunks: removedChunks,
-  },
-  null,
-  0,
-)}
-
-Zasady:
+Zasady zwrotu:
 - Zwróć WYŁĄCZNIE JSON.
 - evidence_used MUSI być tablicą stringów wybranych DOKŁADNIE z evidence_pool.
-- Jeśli important=true, evidence_used MUSI zawierać przynajmniej jeden identyfikator
-- Jeśli w evidence_pool istnieją zarówno identyfikatory "evidence_before#*" jak i "evidence_after#*", to przy important=true evidence_used MUSI zawierać co najmniej jeden dowód z KAŻDEJ strony.
-  zaczynający się od "evidence_before#" lub "evidence_after#" (czyli dowód-cytat).
-  Nie opieraj ważności wyłącznie na universal_data.* albo diff_reason.
-	- Jeśli USER_PROMPT oczekuje zmiany (np. "pojawi się", "zmieni się"), ustaw important=true tylko gdy dowody sugerują konkretną różnicę między BEFORE i AFTER (nie sama obecność sekcji).
-
+- Jeśli important=true, evidence_used MUSI zawierać przynajmniej jeden identyfikator.
+- Jeśli istnieją identyfikatory evidence_before#* ORAZ evidence_after#*, to przy important=true evidence_used MUSI zawierać co najmniej jeden dowód z KAŻDEJ strony.
 - Jeśli nie masz wystarczających dowodów -> important=false i evidence_used=[].
 
 evidence_pool:
@@ -607,25 +447,37 @@ Zwróć JSON:
   "reason": string,
   "evidence_used": string[]
 }
-`;
+`.trim();
+
+  const system = 'Jesteś sędzią zmian na stronie. Zwracaj wyłącznie JSON.';
 
   let raw = null;
+  let parsed = null;
+
   try {
-    raw = await generateTextWithOllama({
+    const out = await generateTextWithOllama({
+      model: OLLAMA_MODEL,
       prompt,
-      model: process.env.OLLAMA_TEXT_MODEL || process.env.LLM_MODEL || 'llama3.2:3b',
-      format: 'json',
+      system,
+      format: JUDGE_SCHEMA,
       temperature: 0,
-      timeoutMs: Number(process.env.OLLAMA_TIMEOUT_MS_JUDGE || process.env.OLLAMA_TIMEOUT_MS || 120000),
     });
+
+    // Keep raw for debug; prefer out.json (schema mode).
+    raw = out?.text ?? out?.raw ?? null;
+    parsed = out?.json ?? null;
+
+    // Fallback: if wrapper didn't expose .json for some reason.
+    if (!parsed) parsed = safeParseJsonFromLLM(raw);
   } catch (err) {
+    log?.warn?.('llm_judge_call_failed', { err: err?.message || String(err) });
     return {
       prompt,
-      raw: String(err?.message || err),
+      raw,
       result: {
         important: false,
         category: 'minor_change',
-        reason: 'Błąd LLM podczas oceny ważności.',
+        reason: 'Błąd wywołania LLM (judge).',
         evidence_used: [],
         llm_fallback_used: true,
       },
@@ -633,29 +485,14 @@ Zwróć JSON:
     };
   }
 
-  const parsed = safeParseJsonFromLLM(raw);
-
-
-  // allowedKeys = tylko realnie istniejące klucze:
-  // - universalDataDiff.changed + universalDataDiff.added
-  // - machineDiff.changedChunks (u nas: changedChunks => chunkIds)
-	const allowedKeys = new Set(evidencePool);
-
-
-  // przefiltruj evidence_used (uwzględnij dopiski po ':')
-  const sanitizedEvidenceUsed = sanitizeEvidenceUsedAgainstAllowedKeys(parsed?.evidence_used, allowedKeys);
-
-  // Waliduj względem pełnego evidence_pool (po sanityzacji)
-  const evidenceOk = parsed ? validateEvidenceUsed(sanitizedEvidenceUsed, evidencePool) : false;
-
-  if (!parsed || !evidenceOk) {
+  if (!parsed) {
     return {
       prompt,
       raw,
       result: {
         important: false,
         category: 'minor_change',
-        reason: 'Brak wiarygodnych dowodów spełniających kryteria userPrompt.',
+        reason: 'Nie udało się sparsować odpowiedzi LLM (judge).',
         evidence_used: [],
         llm_fallback_used: true,
       },
@@ -663,91 +500,36 @@ Zwróć JSON:
     };
   }
 
-  const important = !!parsed.important;
-  const usedHasQuoteEvidence = sanitizedEvidenceUsed.some(
-    (k) => typeof k === 'string' && (k.startsWith('evidence_before#') || k.startsWith('evidence_after#')),
-  );
+  const important = parsed.important === true;
 
-  // Hard rule for correctness:
-  // Important=true requires at least one prompt-evidence quote (before/after) to be cited.
-  // This prevents false positives based only on generic diff fields (universal_data, diff_reason, ...).
-  if (important && !usedHasQuoteEvidence) {
-    return {
-      prompt,
-      raw,
-      result: {
-        important: false,
-        category: 'minor_change',
-        reason:
-          'Model zwrócił important=true, ale nie podał żadnego dowodu-cytatu (evidence_before#/evidence_after#).',
-        evidence_used: [],
-        llm_fallback_used: true,
-      },
-      fallbackUsed: true,
-    };
+  const quoteToId = buildQuoteToIdMap(evidenceBefore, evidenceAfter);
+  const mappedEvidenceUsed = mapEvidenceUsedQuotesToIds(parsed.evidence_used, quoteToId);
+  const sanitizedEvidenceUsed = sanitizeEvidenceUsedAgainstAllowedKeys(mappedEvidenceUsed, evidencePool);
+
+  if (important) {
+    const hasBefore = sanitizedEvidenceUsed.some((x) => String(x).startsWith('evidence_before#'));
+    const hasAfter = sanitizedEvidenceUsed.some((x) => String(x).startsWith('evidence_after#'));
+    const ok =
+      sanitizedEvidenceUsed.length > 0 &&
+      (!evidenceBefore.length || hasBefore) &&
+      (!evidenceAfter.length || hasAfter);
+
+    if (!ok) {
+      return {
+        prompt,
+        raw,
+        result: {
+          important: false,
+          category: 'minor_change',
+          reason:
+            'Model zwrócił important=true, ale nie spełnił zasad evidence_used (brak wymaganych identyfikatorów).',
+          evidence_used: [],
+          llm_fallback_used: true,
+        },
+        fallbackUsed: true,
+      };
+    }
   }
-
-
-// Extra correctness rule: if we have BOTH before and after evidence quotes in the pool,
-// then important=true must cite at least one from each side (comparative decision).
-const poolHasBefore = evidencePool.some((k) => typeof k === 'string' && k.startsWith('evidence_before#'));
-const poolHasAfter = evidencePool.some((k) => typeof k === 'string' && k.startsWith('evidence_after#'));
-if (important && poolHasBefore && poolHasAfter) {
-  const usedBefore = sanitizedEvidenceUsed.some((k) => typeof k === 'string' && k.startsWith('evidence_before#'));
-  const usedAfter = sanitizedEvidenceUsed.some((k) => typeof k === 'string' && k.startsWith('evidence_after#'));
-  if (!usedBefore || !usedAfter) {
-    return {
-      prompt,
-      raw,
-      result: {
-        important: false,
-        category: 'minor_change',
-        reason:
-          'Model zwrócił important=true, ale nie podał dowodów z obu stron (BEFORE i AFTER), więc nie da się wiarygodnie potwierdzić zmiany.',
-        evidence_used: [],
-        llm_fallback_used: true,
-      },
-      fallbackUsed: true,
-    };
-  }
-}
-
-// Anti-noise guard for rating/reviews monitoring:
-// If extracted rating and/or reviews_count are identical before vs after, treat this as OCR noise and do not notify.
-const cat = String(parsed.category || '').toLowerCase();
-const looksLikeReviewCategory = /opini|recenz|review|rating|ocen/.test(cat);
-if (important && looksLikeReviewCategory) {
-  const ratingBefore = extractRatingFromEvidenceQuotes(evidenceBefore);
-  const ratingAfter = extractRatingFromEvidenceQuotes(evidenceAfter);
-  const reviewsBefore = extractReviewsCountFromEvidenceQuotes(evidenceBefore);
-  const reviewsAfter = extractReviewsCountFromEvidenceQuotes(evidenceAfter);
-
-  const ratingComparable = ratingBefore != null && ratingAfter != null;
-  const reviewsComparable = reviewsBefore != null && reviewsAfter != null;
-
-  const ratingSame = ratingComparable ? Math.abs(ratingBefore - ratingAfter) < 0.001 : false;
-  const reviewsSame = reviewsComparable ? reviewsBefore === reviewsAfter : false;
-
-  // If we can compare at least one metric and all comparable metrics are unchanged -> noise.
-  const anyComparable = ratingComparable || reviewsComparable;
-  const allComparableSame = (!ratingComparable || ratingSame) && (!reviewsComparable || reviewsSame);
-
-  if (anyComparable && allComparableSame) {
-    return {
-      prompt,
-      raw,
-      result: {
-        important: false,
-        category: 'minor_change',
-        reason:
-          'Wykryto zmianę tekstu, ale porównywalne metryki (ocena/liczba opinii) nie zmieniły się — prawdopodobny szum OCR.',
-        evidence_used: [],
-        llm_fallback_used: false,
-      },
-      fallbackUsed: false,
-    };
-  }
-}
 
   return {
     prompt,
@@ -761,12 +543,11 @@ if (important && looksLikeReviewCategory) {
     },
     fallbackUsed: false,
   };
-
 }
 
 export async function evaluateChangeWithLLM(
   { monitorId, zadanieId, url, prevAnalysis, newAnalysis, diff, userPrompt },
-  { logger } = {},
+  { logger } = {}
 ) {
   const log = logger || console;
   const t0 = performance.now();
@@ -776,8 +557,6 @@ export async function evaluateChangeWithLLM(
   const uDiff = diffUniversalData(prevAnalysis, newAnalysis);
   const mDiff = metricDelta(prevAnalysis, newAnalysis);
 
-  // If userPrompt is provided, prefer LLM judge for maximum flexibility.
-  // Deterministic logic is used only as a fallback (no userPrompt or judge failure).
   let decision = null;
   let usedMode = 'deterministic';
   let usedPrompt = null;
@@ -786,12 +565,9 @@ export async function evaluateChangeWithLLM(
   if (normalizedUserPrompt) {
     const prevSummary = prevAnalysis?.summary || '';
     const newSummary = newAnalysis?.summary || '';
-    const diffReasons = Array.isArray(diff?.reasons) ? diff.reasons : [];
-
-    // attach uDiff + (optional) chunk diff to metrics for judge
     const diffMetrics = {
       ...(diff?.metrics || {}),
-	      evidence_v1: diff?.evidence_v1 || null,
+      evidence_v1: diff?.evidence_v1 || null,
       universalDataDiff: uDiff,
     };
 
@@ -801,10 +577,8 @@ export async function evaluateChangeWithLLM(
         prevSummary,
         newSummary,
         diffMetrics,
-        diffReasons,
-        metricsDelta: mDiff,
       },
-      { logger: log },
+      { logger: log }
     );
 
     usedMode = 'judge';
@@ -822,13 +596,21 @@ export async function evaluateChangeWithLLM(
     };
   }
 
-  // 3) Bez userPrompt: czysto deterministycznie
   if (!decision) {
-    decision = buildDeterministicDecision({ uDiff, mDiff });
+    decision = buildDeterministicDecision({ mDiff });
     if (decision.llm_fallback_used == null) decision.llm_fallback_used = false;
+
+    // Normalize deterministic output into the same shape as judge.
+    decision = {
+      important: decision.important === true,
+      category: decision.category || 'minor_change',
+      importance_reason: decision.reason || 'Brak istotnych zmian.',
+      evidence_used: Array.isArray(decision.evidence_used) ? decision.evidence_used : [],
+      short_title: decision.important ? 'Zmiana na monitorowanej stronie' : 'Brak istotnej zmiany',
+      short_description: decision.reason || 'Brak istotnych zmian.',
+      llm_fallback_used: decision.llm_fallback_used === true,
+    };
   }
-
-
 
   const insertDoc = {
     createdAt: new Date(),
@@ -841,7 +623,6 @@ export async function evaluateChangeWithLLM(
     raw_response: usedRaw,
     llm_decision: decision,
     analysis_diff: {
-      universal_data: uDiff,
       metrics_delta: mDiff,
       machine_diff_reasons: diff?.reasons || [],
     },
@@ -865,7 +646,7 @@ export async function evaluateChangeWithLLM(
 
 export async function saveDetectionAndNotification(
   { monitorId, zadanieId, url, snapshotMongoId, diff, llmDecision },
-  { logger } = {},
+  { logger } = {}
 ) {
   const log = logger || console;
   const tSave0 = performance.now();
@@ -907,12 +688,11 @@ export async function saveDetectionAndNotification(
         llmDecision?.important === true,
         llmDecision?.importance_reason || null,
         JSON.stringify(diff ?? null),
-      ],
+      ]
     );
 
     detectionId = detectionsRes.rows[0].id;
 
-    // If not important – we still store wykrycie but skip notification.
     if (llmDecision?.important !== true) {
       await client.query('COMMIT');
       ok = true;
@@ -948,9 +728,11 @@ export async function saveDetectionAndNotification(
         monitorId,
         detectionId,
         'oczekuje',
-        llmDecision?.short_description || llmDecision?.importance_reason || 'Wykryto istotną zmianę na monitorowanej stronie.',
+        llmDecision?.short_description ||
+          llmDecision?.importance_reason ||
+          'Wykryto istotną zmianę na monitorowanej stronie.',
         llmDecision?.short_title || 'Zmiana na monitorowanej stronie',
-      ],
+      ]
     );
 
     await client.query('COMMIT');

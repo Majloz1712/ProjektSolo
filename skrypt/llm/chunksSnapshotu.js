@@ -85,7 +85,9 @@ function safeJsonParse(raw) {
 }
 
 const CFG = {
-  VERSION: 'text_chunks_v1',
+  // Bump internal version to force rebuild of cached chunks after changing rendering (paragraph markers).
+  // Note: field name in Mongo remains snapshot.text_chunks_v1 for backward compatibility.
+  VERSION: 'text_chunks_v3_merge_one_liners',
   MIN_FIT: Number(process.env.LLM_CHUNK_MIN_FIT_RATIO || 0.6),
 
   // mode: deterministic|semantic|auto
@@ -99,6 +101,21 @@ const CFG = {
   MAX_LINES: envNum('LLM_CHUNK_MAX_LINES', 35),
   DET_FIXED_LINES: envNum('LLM_DET_CHUNK_LINES', 0),
   DET_OVERLAP: envNum('LLM_DET_CHUNK_OVERLAP', 0),
+
+  // deterministic: paragraph/list aware chunking built from clean_lines
+  // ON by default because it improves paragraph integrity without any site-specific rules.
+  STRUCTURAL_REFLOW: envBool('LLM_STRUCTURAL_REFLOW', true),
+  // safety net if clean_meta.params.wrapAt is missing
+  REFLOW_WRAP_AT_FALLBACK: envNum('LLM_REFLOW_WRAP_AT', 140),
+  // Merge short, single-line pseudo-paragraphs (often titles) into the next paragraph.
+  // Helps reduce noisy [Pxxx] markers for headings captured as one-liners.
+  MERGE_ONE_LINER_INTO_NEXT: envBool('LLM_MERGE_ONE_LINER_INTO_NEXT', true),
+  MERGE_ONE_LINER_MAX_CHARS: envNum('LLM_MERGE_ONE_LINER_MAX_CHARS', 110),
+  MERGE_ONE_LINER_MAX_WORDS: envNum('LLM_MERGE_ONE_LINER_MAX_WORDS', 14),
+  MERGE_ONE_LINER_NEXT_MIN_CHARS: envNum('LLM_MERGE_ONE_LINER_NEXT_MIN_CHARS', 160),
+  // chunk size controls (applied in addition to DET_FIXED_LINES)
+  DET_MAX_CHARS: envNum('LLM_DET_CHUNK_MAX_CHARS', 2200),
+  DET_MIN_CHARS: envNum('LLM_DET_CHUNK_MIN_CHARS', 900),
 
   // semantic ranges (LLM)
   SEMANTIC_TARGET_RANGES: envNum('LLM_SEMANTIC_RANGES', 0),
@@ -223,10 +240,81 @@ function getCleanLines(snapshot, { source, text }) {
   return lines;
 }
 
+// ---------------- Paragraph markers --------------------------------------------------
+// Goal: make paragraph boundaries explicit for downstream LLM tasks (e.g., "monitor paragraph 15").
+// We treat paragraph boundaries deterministically based on clean_lines separators:
+//   - empty line OR '<PARA>' => paragraph boundary
+
+const PARA_TOKEN = '<PARA>';
+
+function paraTag(n) {
+  const v = Number(n);
+  const s = Number.isFinite(v) && v > 0 ? String(Math.floor(v)) : '0';
+  // minimum width 3, but allow growth (P1000...)
+  return `[P${s.padStart(3, '0')}]`;
+}
+
+function computeParagraphIndexByLine(lines) {
+  const list = Array.isArray(lines) ? lines : [];
+  const out = new Array(list.length).fill(null);
+  let p = 0;
+  let boundary = true;
+
+  for (let i = 0; i < list.length; i++) {
+    const raw = String(list[i] ?? '');
+    const t = raw.trim();
+    if (!t || t === PARA_TOKEN) {
+      boundary = true;
+      continue;
+    }
+    if (boundary) {
+      p++;
+      boundary = false;
+    }
+    out[i] = p;
+  }
+  return out;
+}
+
+function renderMarkedTextFromLinesRange(lines, paraByLine, from, to) {
+  const list = Array.isArray(lines) ? lines : [];
+  const N = list.length;
+  if (!N) return '';
+
+  const a = clamp(Number(from ?? 0), 0, N - 1);
+  const b = clamp(Number(to ?? (N - 1)), 0, N - 1);
+  if (b < a) return '';
+
+  const out = [];
+  for (let i = a; i <= b; i++) {
+    const p = paraByLine?.[i];
+    if (!p) continue;
+
+    const raw = String(list[i] ?? '');
+    const t = raw.trim();
+    if (!t || t === PARA_TOKEN) continue;
+
+    const prevP = i > 0 ? paraByLine?.[i - 1] : null;
+    const needMarker = i === a || p !== prevP;
+    out.push(needMarker ? `${paraTag(p)} ${t}` : t);
+  }
+
+  return out.join('\n').trim();
+}
+
+function renderMarkedTextFromText(text) {
+  const lines = normalizeNewlinesToLines(text);
+  const paraByLine = computeParagraphIndexByLine(lines);
+  return renderMarkedTextFromLinesRange(lines, paraByLine, 0, lines.length - 1);
+}
+
 function deterministicLineChunksFromLines(lines, { maxLines = CFG.MAX_LINES, source = null } = {}) {
   const list = Array.isArray(lines) ? lines : [];
   const N = list.length;
   if (N === 0) return [];
+
+  // Global paragraph numbering (1-based) across the whole lines array.
+  const paraByLine = computeParagraphIndexByLine(list);
 
   // Fixed-size deterministic chunking (preferred when LLM_CHUNK_MODE=deterministic).
   // If LLM_DET_CHUNK_LINES>0, we ALWAYS use that exact chunk size (no content heuristics).
@@ -247,7 +335,7 @@ function deterministicLineChunksFromLines(lines, { maxLines = CFG.MAX_LINES, sou
   while (i < N) {
     const from = i;
     const to = Math.min(N - 1, from + target - 1);
-    const textPart = list.slice(from, to + 1).join('\n');
+    const textPart = renderMarkedTextFromLinesRange(list, paraByLine, from, to);
     const id = 'c_lines_' + String(chunks.length).padStart(2, '0');
     chunks.push({
       id,
@@ -264,6 +352,346 @@ function deterministicLineChunksFromLines(lines, { maxLines = CFG.MAX_LINES, sou
     const next = (to + 1) - overlap;
     i = next > from ? next : (to + 1);
   }
+  return chunks;
+}
+
+// --- Structural paragraph/list reflow for clean_lines ---------------------------------
+// Goal: deterministically merge "wrapAt"-wrapped lines back into pseudo-paragraphs,
+// while keeping headings/lists as hard boundaries.
+
+function isHeadingLine(t) {
+  return /^#{1,6}\s+\S/.test(t);
+}
+
+function isListItemLine(t) {
+  return /^(?:[-*•]|\d+\.|\d+\))\s+\S/.test(t);
+}
+
+function isStandaloneTokenLine(t) {
+  const x = t.trim().toLowerCase();
+  return x === '[toc]' || x === 'toc';
+}
+
+function endsWithSentencePunct(t) {
+  // Treat only strong sentence endings as hard stops (avoid over-splitting on commas).
+  return /[.!?][\"'”’\)]?$/.test(t);
+}
+
+function joinSoft(a, b) {
+  const left = String(a || '').trimEnd();
+  const right = String(b || '').trimStart();
+  if (!left) return right;
+  if (!right) return left;
+
+  // hyphenation at line end: "architek-" + "tura" => "architektura"
+  if (/-$/.test(left) && !/\s-$/.test(left)) return left.replace(/-$/, '') + right;
+  return left + ' ' + right;
+}
+
+function shouldJoinWrappedLine(prev, curr, wrapAt) {
+  const p = String(prev || '').trimEnd();
+  const c = String(curr || '').trim();
+  if (!p || !c) return false;
+  if (isHeadingLine(c) || isListItemLine(c) || isStandaloneTokenLine(c)) return false;
+  if (endsWithSentencePunct(p)) return false;
+
+  // Join if prev line looks like it was wrapped (near wrapAt), or ends with a soft-continuation symbol.
+  const softEnd = /[,;:\/\(\[“„"'–—…]$/.test(p);
+  if (softEnd) return true;
+
+  const wa = Number.isFinite(wrapAt) && wrapAt > 0 ? wrapAt : 140;
+  const threshold = Math.max(40, Math.floor(wa * 0.60));
+  return p.length >= threshold;
+}
+
+function buildStructuralSegmentsFromLines(lines, { wrapAt = 140 } = {}) {
+  const list = Array.isArray(lines) ? lines : [];
+  const segs = [];
+
+  const PARA = '<PARA>';
+
+  let cur = null; // { type, from, to, text }
+
+  function flush() {
+    if (!cur) return;
+    const text = String(cur.text || '').trim();
+    if (text) segs.push({ from: cur.from, to: cur.to, text, type: cur.type || 'p' });
+    cur = null;
+  }
+
+  for (let i = 0; i < list.length; i++) {
+    const raw = String(list[i] ?? '');
+    const t = raw.trim();
+    if (!t || t === PARA) {
+      flush();
+      continue;
+    }
+
+    // Hard boundaries
+    if (isHeadingLine(t) || isStandaloneTokenLine(t)) {
+      flush();
+      segs.push({ from: i, to: i, text: t, type: isHeadingLine(t) ? 'h' : 't' });
+      continue;
+    }
+
+    // Lists: group consecutive list items as one segment (keeps list semantics, reduces noise)
+    if (isListItemLine(t)) {
+      if (!cur || cur.type !== 'list') {
+        flush();
+        cur = { type: 'list', from: i, to: i, text: t };
+      } else {
+        cur.to = i;
+        cur.text = String(cur.text || '').trimEnd() + '\n' + t;
+      }
+      continue;
+    }
+
+    // Normal paragraph text
+    if (!cur) {
+      cur = { type: 'p', from: i, to: i, text: t };
+      continue;
+    }
+
+    if (cur.type === 'p' && shouldJoinWrappedLine(cur.text, t, wrapAt)) {
+      cur.to = i;
+      cur.text = joinSoft(cur.text, t);
+      continue;
+    }
+
+    // Otherwise start a new paragraph
+    flush();
+    cur = { type: 'p', from: i, to: i, text: t };
+  }
+
+  flush();
+  return segs;
+}
+
+
+function mergeOneLinersIntoNext(segs, cfg = CFG) {
+  // Improved merge strategy:
+  // - Buffer consecutive short, single-line segments (including headings/tokens).
+  // - Merge the whole buffer into the NEXT segment that looks like a real paragraph
+  //   (multi-line OR length >= MERGE_ONE_LINER_NEXT_MIN_CHARS).
+  // This prevents '1-liner + 1-liner => 2-liner' artifacts.
+
+  const maxChars = cfg.MERGE_ONE_LINER_MAX_CHARS;
+  const maxWords = cfg.MERGE_ONE_LINER_MAX_WORDS;
+  const nextMinChars = cfg.MERGE_ONE_LINER_NEXT_MIN_CHARS;
+
+  const normalize = (t) => String(t ?? '').trim();
+  const wordCount = (t) => normalize(t).split(/\s+/).filter(Boolean).length;
+
+  const isSingleLine = (t) => !t.includes('\n');
+
+  // We buffer anything that would become a "meaningless" one-liner paragraph.
+  // For paragraphs/lists: treat as "short" if it's single-line and below nextMinChars.
+  // For headings/tokens: always buffer.
+  const shouldBuffer = (seg) => {
+    const text = normalize(seg.text);
+    if (!text) return false;
+
+    if (seg.type === 'h' || seg.type === 't') return true;
+
+    if (!isSingleLine(text)) return false;
+
+    if (seg.type === 'p' || seg.type === 'list') {
+      // Keep legacy guardrails: only buffer very small one-liners, OR anything below nextMinChars.
+      // (nextMinChars is the "find a real paragraph" threshold.)
+      const wc = wordCount(text);
+      const isVerySmall = text.length <= maxChars && wc <= maxWords;
+      const isBelowAnchor = text.length < nextMinChars;
+      return isVerySmall || isBelowAnchor;
+    }
+
+    return false;
+  };
+
+  const isAnchor = (seg) => {
+    const text = normalize(seg.text);
+    if (!text) return false;
+
+    // Multi-line (lists, wrapped paragraphs) is always a safe anchor.
+    if (!isSingleLine(text)) return true;
+
+    // Long enough single-line paragraph/list.
+    if (seg.type === 'p' || seg.type === 'list') {
+      return text.length >= nextMinChars;
+    }
+
+    // Other types: treat as anchor to avoid buffering forever.
+    return true;
+  };
+
+  const out = [];
+  let pending = [];
+  let pendingFrom = null;
+  let pendingTo = null;
+
+  const pendingText = () => pending.map((p) => normalize(p.text)).filter(Boolean).join('\n');
+  const resetPending = () => {
+    pending = [];
+    pendingFrom = null;
+    pendingTo = null;
+  };
+
+  for (const seg of segs) {
+    if (shouldBuffer(seg)) {
+      pending.push(seg);
+      if (pendingFrom === null) pendingFrom = seg.from;
+      pendingTo = seg.to;
+      continue;
+    }
+
+    if (pending.length) {
+      // If we still haven't reached an anchor, keep buffering even "medium" segments.
+      // This matches the intention: merge small paragraphs only into a real paragraph.
+      if (!isAnchor(seg)) {
+        pending.push(seg);
+        if (pendingFrom === null) pendingFrom = seg.from;
+        pendingTo = seg.to;
+        continue;
+      }
+
+      const prefix = pendingText();
+      out.push({
+        ...seg,
+        from: pendingFrom ?? seg.from,
+        to: seg.to,
+        text: prefix ? `${prefix}\n${normalize(seg.text)}` : normalize(seg.text),
+      });
+      resetPending();
+      continue;
+    }
+
+    out.push(seg);
+  }
+
+  // Trailing pending: append to previous anchor to avoid leaving one-liners at the end.
+  if (pending.length) {
+    const t = pendingText();
+    if (t) {
+      if (!out.length) {
+        out.push({
+          ...pending[pending.length - 1],
+          type: 'p',
+          from: pendingFrom ?? 0,
+          to: pendingTo ?? pending[pending.length - 1].to,
+          text: t,
+        });
+      } else {
+        // Prefer appending to the last non-token segment.
+        let idx = out.length - 1;
+        if (out[idx].type === 't' && out.length >= 2) idx = out.length - 2;
+
+        const last = out[idx];
+        out[idx] = {
+          ...last,
+          to: pendingTo ?? last.to,
+          text: `${normalize(last.text)}\n${t}`.trim(),
+        };
+
+        // If we skipped a trailing token, fold it in too (so it doesn't remain a one-liner).
+        if (idx === out.length - 2 && out[out.length - 1].type === 't') {
+          const tok = out.pop();
+          out[idx] = {
+            ...out[idx],
+            to: tok.to,
+            text: `${normalize(out[idx].text)}\n${normalize(tok.text)}`.trim(),
+          };
+        }
+      }
+    }
+  }
+
+  return out;
+}
+
+function deterministicStructuredChunksFromLines(
+  lines,
+  {
+    maxLines = CFG.MAX_LINES,
+    source = null,
+    wrapAt = 140,
+  } = {}
+) {
+  const list = Array.isArray(lines) ? lines : [];
+  const N = list.length;
+  if (N === 0) return [];
+
+  let segs = buildStructuralSegmentsFromLines(list, { wrapAt });
+  segs = mergeOneLinersIntoNext(segs);
+  if (!segs.length) return deterministicLineChunksFromLines(list, { maxLines, source });
+
+  // Assign global (document-level) paragraph indices to segments.
+  const segsWithPara = segs.map((s, idx) => ({ ...s, _p: idx + 1 }));
+
+  // Packing policy: aim for ~DET_MAX_CHARS per chunk, but never exceed maxLines (safety).
+  const maxChars = clamp(Math.floor(CFG.DET_MAX_CHARS || 2200), 600, 10000);
+  const minChars = clamp(Math.floor(CFG.DET_MIN_CHARS || 900), 0, maxChars);
+  const overlap = Number.isFinite(CFG.DET_OVERLAP) && CFG.DET_OVERLAP > 0 ? Math.floor(CFG.DET_OVERLAP) : 0;
+  const fixedSegs = Number.isFinite(CFG.DET_FIXED_LINES) && CFG.DET_FIXED_LINES > 0 ? Math.floor(CFG.DET_FIXED_LINES) : null;
+
+  const totalChars = segsWithPara.reduce((sum, s) => sum + String(s.text || '').length + 2, 0);
+  const desiredChunks = clamp(Math.ceil(totalChars / maxChars), 1, 50);
+  const targetChars = desiredChunks > 0 ? Math.ceil(totalChars / desiredChunks) : maxChars;
+
+  const chunks = [];
+  let i = 0;
+
+  while (i < segsWithPara.length) {
+    const start = i;
+    let end = i;
+    let curChars = 0;
+    let segCount = 0;
+
+    while (end < segsWithPara.length) {
+      const add = String(segsWithPara[end].text || '');
+      const addLen = add.length + (segCount ? 2 : 0);
+      const nextChars = curChars + addLen;
+
+      const wouldExceedChars = segCount > 0 && nextChars > maxChars;
+      const wouldExceedSegs = fixedSegs ? (segCount >= fixedSegs) : (segCount >= maxLines);
+
+      if (wouldExceedSegs) break;
+      if (wouldExceedChars) break;
+
+      curChars = nextChars;
+      segCount++;
+      end++;
+
+      // soft stop: if we're past target (and not too small), stop at boundary
+      if (curChars >= targetChars && curChars >= minChars) break;
+    }
+
+    // Ensure progress
+    if (end <= start) end = start + 1;
+
+    const segSlice = segsWithPara.slice(start, end);
+    // Render paragraphs explicitly: each segment starts with [Pxxx].
+    const textPart = segSlice.map((s) => `${paraTag(s._p)} ${s.text}`).join('\n');
+    const from = segSlice[0].from;
+    const to = segSlice[segSlice.length - 1].to;
+    const id = 'c_lines_' + String(chunks.length).padStart(2, '0');
+
+    chunks.push({
+      id,
+      key: null,
+      title: 'Lines ' + (from + 1) + '-' + (to + 1),
+      order: chunks.length,
+      from,
+      to,
+      sha1: sha1(textPart),
+      text: textPart,
+      len: textPart.length,
+      source,
+    });
+
+    // advance with overlap in *segments*
+    const nextStart = Math.max(start + 1, end - overlap);
+    i = nextStart;
+  }
+
   return chunks;
 }
 
@@ -384,16 +812,19 @@ function buildSemanticRepairPrompt(lines, errors) {
 }
 
 function rebuildChunksFromRanges(lines, ranges, source) {
+  const paraByLine = computeParagraphIndexByLine(lines);
   const usedKeys = new Map();
   const out = [];
 
   for (let order = 0; order < ranges.length; order++) {
     const r = ranges[order];
     const slice = lines.slice(r.from, r.to + 1);
-    const raw = slice.join('\n').trim();
-    const norm = normalizeWhitespace(raw);
+    const raw = renderMarkedTextFromLinesRange(lines, paraByLine, r.from, r.to);
 
-    const firstNonEmpty = slice.find((l) => String(l || '').trim()) || '';
+    const firstNonEmpty = slice.find((l) => {
+      const t = String(l || '').trim();
+      return t && t !== PARA_TOKEN;
+    }) || '';
     const baseTitle = String(r.title || '').trim() || excerpt(firstNonEmpty, 72) || `Chunk ${order + 1}`;
     const keyBase = slugifyKey(baseTitle, { maxLen: 32 });
     const n = (usedKeys.get(keyBase) || 0) + 1;
@@ -410,7 +841,7 @@ function rebuildChunksFromRanges(lines, ranges, source) {
       from: r.from,
       to: r.to,
       sha1: sha1(raw),
-      text: norm,
+      text: raw,
       len: raw.length,
       source,
     });
@@ -580,6 +1011,7 @@ export async function ensureSnapshotChunks(snapshot, opts = {}) {
           chunked = t.chunks.map((c, idx) => {
             const key = String(c.key || c.id || '').trim() || null;
             const stableId = key ? `c_${key}` : `c_tpl_${String(idx).padStart(2, '0')}`;
+            const markedText = renderMarkedTextFromText(String(c.text || ''));
             return {
               id: stableId,
               key,
@@ -587,9 +1019,9 @@ export async function ensureSnapshotChunks(snapshot, opts = {}) {
               order: idx,
               from: null,
               to: null,
-              sha1: c.sha1 || sha1(c.text || ''),
-              text: String(c.text || ''),
-              len: Number(c.len || String(c.text || '').length || 0),
+              sha1: c.sha1 || sha1(markedText || ''),
+              text: markedText,
+              len: Number(c.len || (markedText || '').length || 0),
               source,
             };
           });
@@ -613,7 +1045,14 @@ export async function ensureSnapshotChunks(snapshot, opts = {}) {
 
   // 2) deterministic fallback
   if (!chunked) {
-    chunked = deterministicLineChunksFromLines(lines, { maxLines: CFG.MAX_LINES, source });
+    const wrapAt = snapshot?.clean_meta?.params?.wrapAt || CFG.REFLOW_WRAP_AT_FALLBACK;
+    chunked = CFG.STRUCTURAL_REFLOW
+      ? deterministicStructuredChunksFromLines(lines, {
+          source,
+          wrapAt,
+          maxLines: CFG.MAX_LINES,
+        })
+      : deterministicLineChunksFromLines(lines, { maxLines: CFG.MAX_LINES, source });
     method = 'deterministic';
   }
 

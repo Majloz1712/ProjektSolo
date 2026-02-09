@@ -242,12 +242,22 @@ if (promptHash && baselineAnalysis) {
   const baselinePromptHash =
     baselineAnalysis?.prompt_hash || baselineAnalysis?.intent?.userPromptHash || null;
 
-  if (
-    baselinePromptHash === promptHash &&
-    Array.isArray(baselineAnalysis?.important_chunk_ids) &&
-    baselineAnalysis.important_chunk_ids.length
-  ) {
-    focusChunkIds = baselineAnalysis.important_chunk_ids;
+  // Backward/forward compatibility:
+  // - new: analysis.prompt_chunks_v1.focus_chunk_ids
+  // - old: analysis.important_chunk_ids
+  const focusFromV1 = baselineAnalysis?.prompt_chunks_v1?.focus_chunk_ids;
+  const focusFromLegacy = baselineAnalysis?.important_chunk_ids;
+  const focusCandidate =
+    Array.isArray(focusFromV1) && focusFromV1.length
+      ? focusFromV1
+      : (Array.isArray(focusFromLegacy) && focusFromLegacy.length ? focusFromLegacy : null);
+
+  if (baselinePromptHash === promptHash && Array.isArray(focusCandidate) && focusCandidate.length) {
+    // de-dupe + keep order
+    const seen = new Set();
+    focusChunkIds = focusCandidate
+      .map((x) => String(x || '').trim())
+      .filter((x) => x && (seen.has(x) ? false : (seen.add(x), true)));
   }
 }
 
@@ -263,7 +273,7 @@ log?.info?.('pipeline_focus_chunks', {
 
 
 
-// ---- 1.5) Ensure OCR text BEFORE diffLite for OCR-only monitors ----
+// ---- 1.5) Ensure OCR text BEFORE diffLite when needed ----
 const prevExtractedText = String(prevSnapshot?.extracted_v2?.text || '').trim();
 const newExtractedText = String(snapshot?.extracted_v2?.text || '').trim();
 
@@ -274,9 +284,11 @@ const newOcrText = String(
   snapshot?.vision_ocr?.clean_text || snapshot?.vision_ocr?.text || ''
 ).trim();
 
-// Jeśli któraś strona NIE MA ŻADNEGO tekstu (ani extracted ani OCR) -> dobuduj OCR przed diffLite
-const needPrevOcrForDiff = !prevExtractedText && !prevOcrText;
-const needNewOcrForDiff  = !newExtractedText && !newOcrText;
+// If template is OCR-based, diffLite should use OCR text; otherwise we only OCR when we have no text at all.
+const tplWantsOcrForDiff = String(baselineChunkTemplate?.source || '').toLowerCase().startsWith('ocr');
+
+const needPrevOcrForDiff = (tplWantsOcrForDiff && !prevOcrText) || (!prevExtractedText && !prevOcrText);
+const needNewOcrForDiff  = (tplWantsOcrForDiff && !newOcrText)  || (!newExtractedText && !newOcrText);
 
 if (needPrevOcrForDiff || needNewOcrForDiff) {
   const tOcr0 = performance.now();
@@ -327,29 +339,28 @@ if (shouldEarlyExit(diffLite, { forceAnalysis, hasUserPrompt: !!normalizedUserPr
     return;
   }
 
-await ensureSnapshotOcr(prevSnapshot, { logger: log });
-await ensureSnapshotOcr(snapshot, { logger: log });
+  // From here on, we only run OCR if it is actually needed:
+  // - analysis has no extracted text AND OCR is missing
+  // - or full diff uses an OCR-based chunk template
+  let prevOcr = null;
+  let newOcr = null;
 
+  const needOcrForAnalysisOrDiff = shouldRunOcr(snapshot) || shouldRunOcr(prevSnapshot);
+  const tOcrFull0 = performance.now();
 
-const needOcr = shouldRunOcr(snapshot);
+  if (needOcrForAnalysisOrDiff) {
+    prevOcr = await ensureSnapshotOcr(prevSnapshot, { logger: log });
+    newOcr = await ensureSnapshotOcr(snapshot, { logger: log });
 
-
-// jeśli OCR potrzebny dla new, to prawie zawsze potrzebny też dla prev (żeby diff OCR miał sens)
-if (needOcr) {
-  const tOcr0 = performance.now();
-
-  prevOcr = await ensureSnapshotOcr(prevSnapshot, { logger: log });
-  newOcr = await ensureSnapshotOcr(snapshot, { logger: log });
-
-  log?.info?.('pipeline_step_done', {
-    step: 'ensureSnapshotOcr_prev_and_new',
-    snapshotId: snapshotIdStr,
-    monitorId: snapshot.monitor_id,
-    durationMs: Math.round(performance.now() - tOcr0),
-    prevOcrPresent: !!prevOcr,
-    newOcrPresent: !!newOcr,
-  });
-}
+    log?.info?.('pipeline_step_done', {
+      step: 'ensureSnapshotOcr_for_analysis',
+      snapshotId: snapshotIdStr,
+      monitorId: snapshot.monitor_id,
+      durationMs: Math.round(performance.now() - tOcrFull0),
+      prevOcrPresent: !!prevOcr,
+      newOcrPresent: !!newOcr,
+    });
+  }
 
   // ---- 3) Analyses (LLM) – only now ----
   const tAnalysis0 = performance.now();
@@ -420,13 +431,47 @@ if (prevSnapshot) {
 
 
   // ---- 4) Enriched diff (includes universal_data changes) ----
+  // If the template for the full diff is OCR-based, make sure OCR text exists on both snapshots.
+  // (Otherwise we might compute a spurious "added everything" diff from empty OCR.)
+  const tplForFullDiff = baselineAnalysis?.chunk_template || newAnalysis?.chunk_template || prevAnalysis?.chunk_template || null;
+  const tplWantsOcrFull = String(tplForFullDiff?.source || '').toLowerCase().startsWith('ocr');
+
+  const hasUsableOcrText = (snap) => {
+    const t = String(snap?.vision_ocr?.clean_text || snap?.vision_ocr?.text || '').trim();
+    if (!t) return false;
+    if (snap?.vision_ocr && snap.vision_ocr.ok === false) return false;
+    return true;
+  };
+
+  if (tplWantsOcrFull) {
+    const tOcrTpl0 = performance.now();
+    let did = false;
+    if (!hasUsableOcrText(prevSnapshot)) {
+      await ensureSnapshotOcr(prevSnapshot, { logger: log });
+      did = true;
+    }
+    if (!hasUsableOcrText(snapshot)) {
+      await ensureSnapshotOcr(snapshot, { logger: log });
+      did = true;
+    }
+
+    if (did) {
+      log?.info?.('pipeline_step_done', {
+        step: 'ensureSnapshotOcr_for_fullDiffTemplate',
+        snapshotId: snapshotIdStr,
+        monitorId: snapshot.monitor_id,
+        durationMs: Math.round(performance.now() - tOcrTpl0),
+      });
+    }
+  }
+
   const tDiff1 = performance.now();
   const diff = await computeMachineDiff(prevSnapshot, snapshot, {
     logger: log,
     prevAnalysis,
     newAnalysis,
     focusChunkIds: focusChunkIds || null,
-    chunkTemplate: baselineAnalysis?.chunk_template || null,
+    chunkTemplate: tplForFullDiff,
   });
 
   log?.info?.('pipeline_step_done', {

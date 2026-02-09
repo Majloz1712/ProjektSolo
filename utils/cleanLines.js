@@ -9,6 +9,15 @@
 
 // NOTE: This module intentionally contains no project-specific imports.
 
+// Structural markers that should survive dedupe/boilerplate filters (used by DOM->clean_lines).
+const STRUCTURAL_MARKERS = new Set(['<PARA>']);
+
+function isStructuralMarker(line) {
+  const v = String(line || '').trim();
+  return STRUCTURAL_MARKERS.has(v);
+}
+
+
 /**
  * Aggressively remove non-content blobs that break LLM analysis:
  * - HTML tags (if raw HTML accidentally slips through)
@@ -395,7 +404,24 @@ export function cleanTextToLines(rawText, opts = {}) {
   if (!keepNewlines) s = s.replace(/\n+/g, ' ');
   if (collapseSpaces) s = keepNewlines ? _collapseSpacesPreserveNewlines(s) : s.replace(/\s+/g, ' ').trim();
 
-  let lines = s.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
+  let rawLines = s.split('
+').map((l) => l.trim());
+
+  // Preserve paragraph boundaries: keep empty lines, but collapse multiple empties.
+  let lines = [];
+  let prevEmpty = true;
+  for (const l of rawLines) {
+    const isEmpty = !l;
+    if (isEmpty) {
+      if (!prevEmpty) lines.push('');
+    } else {
+      lines.push(l);
+    }
+    prevEmpty = isEmpty;
+  }
+  // Trim leading/trailing empties
+  while (lines.length && lines[0] === '') lines.shift();
+  while (lines.length && lines[lines.length - 1] === '') lines.pop();
 
   const docStats = _countByScriptAndClass(lines.join('\n'));
   const latinShare = docStats.letters > 0 ? (docStats.latin / docStats.letters) : 1;

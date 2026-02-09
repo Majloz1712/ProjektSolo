@@ -1,6 +1,7 @@
 // skrypt/llm/ollamaClient.js
 import { withOllamaSemaphore } from "./semaforOllama.js";
 import { performance } from "node:perf_hooks";
+import crypto from "node:crypto";
 
 const OLLAMA_HOST = process.env.OLLAMA_HOST || "http://127.0.0.1:11434";
 
@@ -10,6 +11,62 @@ const TEXT_MODEL =
 
 const VISION_MODEL =
   process.env.OLLAMA_VISION_MODEL || process.env.LLM_VISION_MODEL || "llava";
+
+
+// 0 = minimalnie, 1 = normal, 2 = verbose (preview prompt/response)
+const DEBUG_LEVEL = Number(process.env.OLLAMA_DEBUG_LEVEL || 1);
+// ile znaków promptu/response pokazać w logu (gdy DEBUG_LEVEL >= 2)
+const PREVIEW_CHARS = Number(process.env.OLLAMA_DEBUG_PREVIEW_CHARS || 700);
+
+function sha1(s) {
+  try {
+    return crypto.createHash("sha1").update(String(s || ""), "utf8").digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+function safePreview(s, n = PREVIEW_CHARS) {
+  if (s == null) return null;
+  const str = String(s);
+  if (str.length <= n) return str;
+  return str.slice(0, n) + `…[+${str.length - n} chars]`;
+}
+
+function looksLikeJsonText(t) {
+  if (t == null) return false;
+  const s = String(t).trim();
+  return (s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"));
+}
+
+function isJsonRequested(format) {
+  if (!format) return false;
+  if (format === "json") return true;
+  if (typeof format === "object") return true; // schema object
+  return false;
+}
+
+function getCallerHint() {
+  try {
+    const st = new Error().stack || "";
+    const lines = st.split("\n").map((l) => l.trim());
+    const interesting = lines
+      .slice(3)
+      .find((l) => l && !l.includes("ollamaClient.js") && !l.includes("semaforOllama.js"));
+    return interesting || lines[3] || null;
+  } catch {
+    return null;
+  }
+}
+
+function attachAsStringObject(text, raw, parsedJson, meta) {
+  const sObj = new String(text ?? "");
+  sObj.text = text ?? "";
+  sObj.raw = raw ?? null;
+  sObj.json = parsedJson ?? null;
+  sObj.meta = meta ?? null;
+  return sObj;
+}
 
 function normalizeB64(input) {
   if (!input) return null;
@@ -63,6 +120,11 @@ async function ollamaGenerate(
       let httpStatus = null;
       let aborted = false;
 
+      const requestId = crypto.randomUUID
+        ? crypto.randomUUID()
+        : crypto.randomBytes(8).toString("hex");
+      const caller = getCallerHint();
+
       try {
         const body = {
           model,
@@ -72,11 +134,36 @@ async function ollamaGenerate(
           context: [],
         };
 
-
         if (system) body.system = system;
-        if (format) body.format = format; // np. "json"
+        if (format) body.format = format;
         if (Array.isArray(images) && images.length) body.images = images;
         if (options && typeof options === "object") body.options = options;
+
+        if (DEBUG_LEVEL >= 1) {
+          log?.info?.(`ollama_${label}_request`, {
+            requestId,
+            caller,
+            model,
+            hasSystem: !!system,
+            formatType: format == null ? null : typeof format,
+            format,
+            promptChars: typeof prompt === "string" ? prompt.length : null,
+            promptSha1: typeof prompt === "string" ? sha1(prompt) : null,
+            imagesCount: Array.isArray(images) ? images.length : 0,
+            optionsKeys: options && typeof options === "object" ? Object.keys(options) : null,
+            timeoutMs: timeoutMsEff,
+            keepAlive: body.keep_alive,
+            stream: !!stream,
+          });
+
+          if (DEBUG_LEVEL >= 2) {
+            log?.info?.(`ollama_${label}_request_preview`, {
+              requestId,
+              promptPreview: safePreview(prompt),
+              systemPreview: safePreview(system),
+            });
+          }
+        }
 
         const res = await fetch(`${OLLAMA_HOST}/api/generate`, {
           method: "POST",
@@ -88,15 +175,91 @@ async function ollamaGenerate(
         httpStatus = res.status;
 
         if (!res.ok) {
-          const text = await res.text();
-          throw new Error(`Ollama error (${res.status}): ${text}`);
+          const textErr = await res.text();
+          throw new Error(`Ollama error (${res.status}): ${textErr}`);
         }
 
         const data = await res.json();
         ok = true;
-        return data?.response ?? "";
+
+        const text = data?.response ?? "";
+        const wantsJson = isJsonRequested(format);
+
+        let parsedJson = null;
+        let jsonParseOk = false;
+        let jsonParseErr = null;
+
+        if (wantsJson) {
+          try {
+            if (looksLikeJsonText(text)) {
+              parsedJson = JSON.parse(String(text));
+              jsonParseOk = true;
+            } else {
+              const s = String(text || "");
+              const firstObj = s.indexOf("{");
+              const lastObj = s.lastIndexOf("}");
+              const firstArr = s.indexOf("[");
+              const lastArr = s.lastIndexOf("]");
+
+              let candidate = null;
+              if (firstObj !== -1 && lastObj !== -1 && lastObj > firstObj) candidate = s.slice(firstObj, lastObj + 1);
+              else if (firstArr !== -1 && lastArr !== -1 && lastArr > firstArr) candidate = s.slice(firstArr, lastArr + 1);
+
+              if (candidate) {
+                parsedJson = JSON.parse(candidate);
+                jsonParseOk = true;
+              }
+            }
+          } catch (e) {
+            jsonParseErr = String(e?.message || e);
+          }
+        }
+
+        const meta = {
+          requestId,
+          caller,
+          label,
+          model,
+          wantsJson,
+          jsonParseOk,
+          jsonParseErr,
+          promptSha1: typeof prompt === "string" ? sha1(prompt) : null,
+          promptChars: typeof prompt === "string" ? prompt.length : null,
+          responseChars: typeof text === "string" ? text.length : null,
+          responseSha1: typeof text === "string" ? sha1(text) : null,
+          httpStatus,
+        };
+
+        if (DEBUG_LEVEL >= 1) {
+          log?.info?.(`ollama_${label}_response_meta`, meta);
+          log?.info?.(`ollama_${label}_response_keys`, {
+            requestId,
+            keys: data && typeof data === "object" ? Object.keys(data) : null,
+          });
+
+          if (DEBUG_LEVEL >= 2) {
+            log?.info?.(`ollama_${label}_response_preview`, {
+              requestId,
+              responsePreview: safePreview(text),
+              parsedJsonPreview: parsedJson ? safePreview(JSON.stringify(parsedJson)) : null,
+            });
+          }
+        }
+
+        return attachAsStringObject(text, data, parsedJson, meta);
       } catch (err) {
         aborted = err?.name === "AbortError";
+        if (DEBUG_LEVEL >= 1) {
+          log?.error?.(`ollama_${label}_error`, {
+            requestId,
+            caller,
+            model,
+            httpStatus,
+            aborted,
+            message: String(err?.message || err),
+            stack: err?.stack ? safePreview(err.stack, 2000) : null,
+          });
+        }
         throw err;
       } finally {
         clearTimeout(timeout);
@@ -199,28 +362,3 @@ export async function compareImagesWithOllama({
     "vision_compare",
   );
 }
-
-export async function ocrImageWithOllama({
-  prompt,
-  system,
-  format,
-  base64Image,
-  model = VISION_MODEL,
-  logger,
-}) {
-  const img = normalizeB64(base64Image);
-  return ollamaGenerate(
-    {
-      model,
-      prompt,
-      system,
-      format,
-      images: img ? [img] : [],
-      options: { temperature: 0, top_p: 0.1, repeat_penalty: 1.1 },
-      stream: false,
-    },
-    logger,
-    "vision_ocr",
-  );
-}
-
