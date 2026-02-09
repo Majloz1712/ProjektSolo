@@ -49,6 +49,7 @@ Szczegółowy opis wszystkich plików w repozytorium. Ścieżki są pogrupowane 
 - `ollamaClient.js` – klient HTTP do Ollamy (tekst i obraz), z konfiguracją hosta/modelu przez zmienne środowiskowe.
 - `analizaSnapshotu.js` – warstwa 1 pipeline'u: generuje prompt z tytułu/opisu/tekstu/cen, wywołuje Ollamę, zapisuje analizę snapshotu w kolekcji `analizy` (lub błąd gdy analiza niemożliwa).
 - `diffEngine.js` – narzędzia warstwy 2: pobieranie poprzedniego snapshota, prosta metryka różnicy tekstu, wykrywanie zmian cen (w tym `plugin_prices`), tytułu/opisu/tekstów/obrazów i budowanie obiektu `diff`.
+- `llmEvidence.js` – ekstrakcja `evidence_v1`: dobiera dosłowne cytaty z chunków `[Pxxx]` dopasowane do promptu, w tym linie list/sekcji z datą lub czasem dla monitoringu „nowych artykułów/wpisów”.
 - `ocenaZmianyLLM.js` – warstwa 3: prompt do LLM oceniający istotność zmiany na podstawie analizy/diffu, parsowanie odpowiedzi JSON i zapis oceny w Mongo oraz rekordów wykryć/powiadomień w Postgresie.
 - `pipelineZmian.js` – spina kroki analizy: ładuje snapshot (po ID lub obiekcie), wymusza analizę, pobiera poprzedni snapshot, liczy diff, wywołuje ocenę LLM i w razie istotności zapisuje wykrycie/powiadomienie.
 
