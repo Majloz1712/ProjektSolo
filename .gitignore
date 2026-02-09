@@ -35,3 +35,6 @@ skrypt/.venv/
 # python venv
 .venv/
 skrypt/.venv/
+
+# archives
+*.zip
