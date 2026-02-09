@@ -772,6 +772,7 @@ function detectPromptIntents(userPrompt) {
     // Optional: hints for focused extraction
     color_or_category: /(kolor|color|kategoria|category)/.test(p),
     headline: /(nagł|naglo|headline|tytuł|tytul|title|podtytuł|podtytul|subheadline)/.test(p),
+    news_list: /\b(artykul|artykuł|artykuly|artykuły|wiadomosc|wiadomość|wiadomosci|wiadomości|news|wpis|wpisy|entry|entries|ogloszenie|ogłoszenie|ogloszenia|ogłoszenia|pozycja|pozycje)\b/.test(p),
   };
 
   const exclude = {
@@ -1289,6 +1290,7 @@ function buildCandidatesForChunk(chunkText, chunkId, opts = {}) {
   const promptKeywords = Array.isArray(opts.promptKeywords) ? opts.promptKeywords : [];
   const intents = opts.intents || detectPromptIntents(userPrompt);
   const priceOnly = !!(intents?.wants?.price && intents?.wants?.only && !intents?.wants?.reviews);
+  const wantsNewsList = !!intents?.wants?.news_list;
 
   // If the user asked for specific paragraph(s)/akapit(y), reduce noise by keeping
   // only those paragraph blocks (neighbor expansion handled in parsing).
@@ -1331,6 +1333,11 @@ function buildCandidatesForChunk(chunkText, chunkId, opts = {}) {
   // of item lines so the judge can compare BEFORE vs AFTER.
     if (intents?.wants?.new_item && !intents?.wants?.ranking) {
     const lines = text.split('\n').map((x) => x.trim()).filter(Boolean);
+    const newsSectionRe = /\b(?:najnowsze|najważniejsze|najwazniejsze|polska|swiat|świat|biznes|sport|kultura|technologia|tech|gospodarka|ekonomia|polityka|region|regionalne|opinie|zdrowie|moto|podróże|podroze|rozrywka)\b/i;
+    const reRelTime = /\b\d+\s*(?:min(?:\.|ut(?:y|ę)?)|godz\.?|godzin(?:y)?|hours?|minutes?|mins?)\b(?:\s*(?:temu|ago))?\b/i;
+    const reDateHint = /\b(?:dzisiaj|dziś|wczoraj|today|yesterday)\b/i;
+    const reClock = /\b\d{1,2}:\d{2}\b/;
+    const reDateNum = /\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b/;
 
     // If the user provided specific entity keywords (e.g., a brand/product/person),
     // we require at least one of them to appear in the selected line.
@@ -1356,29 +1363,37 @@ function buildCandidatesForChunk(chunkText, chunkId, opts = {}) {
 
     const navRe = /^(?:filtry?\b|filtry?\s*\d+|marka:|brand:|kategoria\b|category\b|sortuj\b|sort\b|szukaj\b|search\b|menu\b|home\b|kontakt\b|help\b|about\b)/i;
 
-    // Relative time markers are extremely unstable (e.g., "33 minuty temu") and can cause false positives.
-    // When we detect them, we cut the line BEFORE the relative time so evidence stays stable.
-    const reRelTime = /\b\d+\s*(?:min(?:\.|ut(?:y|ę)?)|godz\.?|hours?|minutes?|mins?)\b(?:\s*\d+\s*(?:min(?:\.|ut(?:y|ę)?)))?\s*(?:temu|ago)\b/i;
-    const reAnyTimeOrDate = /\b(?:dzisiaj|wczoraj|today|yesterday|\d{1,2}:\d{2}|\(\d{1,2}:\d{2}\)|\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?)\b/i;
-
-    const cutRelativeTime = (ln, noBullet) => {
-      const idx = noBullet.search(reRelTime);
-      if (idx < 0 || idx < 22) return ln;
-
-      const pm = /^([-•]|(\d{1,3}[.)]))\s+/.exec(ln);
-      const prefixLen = pm ? pm[0].length : 0;
-      const cutIdx = prefixLen + idx;
-      const cut = ln.slice(0, cutIdx).trimEnd();
-      return cut.length >= 12 ? cut : ln;
-    };
+    const cleanLineForMatch = (ln) => ln.replace(/^\[P\d+\]\s*/i, '').trim();
 
     for (const ln of lines) {
       if (out.length >= maxCandidates) break;
-      if (!/^([-•]|(\d{1,3}[.)]))\s+/.test(ln)) continue;
-
-      const noBullet = ln.replace(/^([-•]|(\d{1,3}[.)]))\s+/, '').trim();
+      const cleaned = cleanLineForMatch(ln);
+      const isBullet = /^([-•]|(\d{1,3}[.)]))\s+/.test(cleaned);
+      const noBullet = cleaned.replace(/^([-•]|(\d{1,3}[.)]))\s+/, '').trim();
       if (noBullet.length < 12) continue;
       if (navRe.test(noBullet)) continue;
+
+      if (wantsNewsList) {
+        const hasTimeOrDate = reRelTime.test(noBullet) || reDateHint.test(noBullet) || reClock.test(noBullet) || reDateNum.test(noBullet);
+        const hasSection = newsSectionRe.test(noBullet);
+        const isHeader =
+          hasSection &&
+          noBullet.length <= 40 &&
+          !/[.!?]/.test(noBullet) &&
+          !/\d/.test(noBullet);
+
+        if (isHeader) {
+          pushCandidate(out, seen, `cand#${chunkId}#${idx++}`, ln.slice(0, maxLen), 'news_header');
+          continue;
+        }
+
+        if (isBullet || hasTimeOrDate || hasSection) {
+          pushCandidate(out, seen, `cand#${chunkId}#${idx++}`, ln.slice(0, maxLen), 'news_line');
+          continue;
+        }
+      }
+
+      if (!isBullet) continue;
 
       const tokens = noBullet.split(/\s+/).filter(Boolean);
       const isShortCategory =
@@ -1409,7 +1424,7 @@ function buildCandidatesForChunk(chunkText, chunkId, opts = {}) {
         if (!ok) continue;
       }
 
-      const hasAnyTime = reAnyTimeOrDate.test(noBullet);
+      const hasAnyTime = reRelTime.test(noBullet) || reDateHint.test(noBullet) || reClock.test(noBullet) || reDateNum.test(noBullet);
       const looksLikeProduct =
         /(\b\d+\s*(?:ml|g|l|kg)\b|\bpln\b|\bzł\b|\bzl\b|€|\$|\(|\)|,)/i.test(noBullet) ||
         /\b\d{3,}\b/.test(noBullet);
@@ -1424,29 +1439,25 @@ function buildCandidatesForChunk(chunkText, chunkId, opts = {}) {
       // For generic new-item monitoring, we only keep list-like rows.
       if (!requireEntityMatch && !looksLikeRow) continue;
 
-      let quote = ln;
-      if (!requireEntityMatch) quote = cutRelativeTime(ln, noBullet);
-
       // Keep verbatim substring.
-      pushCandidate(out, seen, `cand#${chunkId}#${idx++}`, quote.slice(0, maxLen), 'product_line');
+      pushCandidate(out, seen, `cand#${chunkId}#${idx++}`, ln.slice(0, maxLen), 'product_line');
     }
 
     // If we found nothing and prompt was generic, do a relaxed pass (still list-ish, still no nav).
     if (out.length === 0 && !requireEntityMatch) {
       for (const ln of lines) {
         if (out.length >= maxCandidates) break;
-        if (!/^([-•]|(\d{1,3}[.)]))\s+/.test(ln)) continue;
+        const cleaned = cleanLineForMatch(ln);
+        if (!/^([-•]|(\d{1,3}[.)]))\s+/.test(cleaned)) continue;
 
-        const noBullet = ln.replace(/^([-•]|(\d{1,3}[.)]))\s+/, '').trim();
+        const noBullet = cleaned.replace(/^([-•]|(\d{1,3}[.)]))\s+/, '').trim();
         if (noBullet.length < 20) continue;
         if (navRe.test(noBullet)) continue;
 
         const tokens = noBullet.split(/\s+/).filter(Boolean);
         if (tokens.length < 4) continue;
 
-        let quote = ln;
-        quote = cutRelativeTime(ln, noBullet);
-        pushCandidate(out, seen, `cand#${chunkId}#${idx++}`, quote.slice(0, maxLen), 'product_line');
+        pushCandidate(out, seen, `cand#${chunkId}#${idx++}`, ln.slice(0, maxLen), 'product_line');
       }
     }
 
@@ -1798,7 +1809,72 @@ function stableProductKeyForEvidence(line) {
   return out;
 }
 
-function deterministicSelectNewItemEvidence(chunksWithCandidates, { maxItemsTotal } = {}) {
+function deterministicSelectNewsListEvidence(chunksWithCandidates, { maxItemsTotal, logger } = {}) {
+  const totalMax = clamp(Number.isFinite(maxItemsTotal) ? maxItemsTotal : 8, 3, 8);
+  const byChunk = {};
+  const focusChunkIds = [];
+
+  for (const ch of chunksWithCandidates || []) {
+    const chunkId = String(ch?.id || '');
+    if (!byChunk[chunkId]) byChunk[chunkId] = { relevant: false, chosen: [] };
+  }
+
+  const chunkScores = (chunksWithCandidates || [])
+    .map((ch) => {
+      const newsCands = (ch.candidates || []).filter(
+        (c) => c.kind === 'news_line' || c.kind === 'news_header'
+      );
+      const density = newsCands.reduce((acc, c) => acc + (c.kind === 'news_header' ? 0.6 : 1), 0);
+      return {
+        id: String(ch?.id || ''),
+        order: Number.isFinite(ch?.order) ? ch.order : 0,
+        candidates: newsCands,
+        density,
+      };
+    })
+    .filter((c) => c.density > 0);
+
+  if (!chunkScores.length) return null;
+
+  chunkScores.sort((a, b) => {
+    if (b.density !== a.density) return b.density - a.density;
+    return a.order - b.order;
+  });
+
+  const chosenChunks = chunkScores.slice(0, 2);
+
+  const parseCandIdx = (id) => {
+    const m = /#(\d+)$/.exec(String(id || ''));
+    return m ? Number.parseInt(m[1], 10) : 999999;
+  };
+
+  const items = [];
+  for (const ch of chosenChunks) {
+    if (items.length >= totalMax) break;
+    const ordered = [...ch.candidates].sort((a, b) => parseCandIdx(a.id) - parseCandIdx(b.id));
+    for (const cand of ordered) {
+      if (items.length >= totalMax) break;
+      const evidId = `evidence#${cand.id}`;
+      items.push({ id: evidId, chunk_id: ch.id, quote: cand.quote });
+      byChunk[ch.id].relevant = true;
+      byChunk[ch.id].chosen.push(cand.id);
+      if (!focusChunkIds.includes(ch.id)) focusChunkIds.push(ch.id);
+    }
+  }
+
+  if (items.length === 0 && logger?.info) {
+    const counts = (chunksWithCandidates || []).map((c) => ({
+      chunkId: c.id,
+      candidates: (c.candidates || []).length,
+      newsCandidates: (c.candidates || []).filter((x) => x.kind === 'news_line' || x.kind === 'news_header').length,
+    }));
+    logger.info('evidence_empty', { reason: 'news_list_no_items', counts });
+  }
+
+  return { items, focusChunkIds, byChunk };
+}
+
+function deterministicSelectNewItemEvidence(chunksWithCandidates, { maxItemsTotal, intents, logger } = {}) {
   const totalMax = clamp(
     Number.isFinite(maxItemsTotal) ? maxItemsTotal : DEFAULT_MAX_ITEMS_TOTAL_NEW_ITEM,
     6,
@@ -1814,22 +1890,6 @@ function deterministicSelectNewItemEvidence(chunksWithCandidates, { maxItemsTota
     let s = String(q || '');
     s = s.replace(/^\s*[-*•]\s+/, '');
 
-    // Relative time / timestamps (PL+EN)
-    s = s.replace(/\b\d+\s*(?:minut(?:y)?|min|minutes?|mins?)\s+temu\b/gi, ' ');
-    s = s.replace(/\b\d+\s*(?:h|hrs?|hours?)\s+ago\b/gi, ' ');
-    s = s.replace(/\b\d+\s*(?:godz\.?|godzin(?:y)?)\s*(?:\d+\s*minut(?:y)?)?\s+temu\b/gi, ' ');
-
-    // Day labels
-    s = s.replace(/\b(?:dziś|dzisiaj|wczoraj|today|yesterday)\b[, ]*/gi, ' ');
-    s = s.replace(/\b(?:poniedziałek|poniedzialek|wtorek|środa|sroda|czwartek|piątek|piatek|sobota|niedziela)\b[, ]*/gi, ' ');
-
-    // Date fragments with month names (PL)
-    s = s.replace(/\b\d{1,2}\s+(?:stycznia|lutego|marca|kwietnia|maja|czerwca|lipca|sierpnia|września|wrzesnia|października|pazdziernika|listopada|grudnia)\b/gi, ' ');
-
-    // Times
-    s = s.replace(/\(\s*\d{1,2}:\d{2}\s*\)/g, ' ');
-    s = s.replace(/\b\d{1,2}:\d{2}\b/g, ' ');
-
     // De-dupe leading word duplicates (e.g., "Kraków Kraków ...")
     s = s.replace(/^([\p{L}-]{3,})\s+\1\b/ui, '$1');
 
@@ -1837,6 +1897,14 @@ function deterministicSelectNewItemEvidence(chunksWithCandidates, { maxItemsTota
     s = s.replace(/\s+/g, ' ').trim();
     return s;
   };
+
+  if (intents?.wants?.news_list) {
+    const news = deterministicSelectNewsListEvidence(chunksWithCandidates, {
+      maxItemsTotal: 8,
+      logger,
+    });
+    if (news && news.items.length) return news;
+  }
 
   // Collect candidates across chunks.
   for (const ch of chunksWithCandidates || []) {
@@ -1932,7 +2000,24 @@ function deterministicSelectNewItemEvidence(chunksWithCandidates, { maxItemsTota
     if (!focusChunkIds.includes(p.chunkId)) focusChunkIds.push(p.chunkId);
   }
 
+  if (items.length === 0 && logger?.info) {
+    const counts = (chunksWithCandidates || []).map((c) => ({
+      chunkId: c.id,
+      candidates: (c.candidates || []).length,
+    }));
+    logger.info('evidence_empty', { reason: 'new_item_no_items', counts });
+  }
+
   return { items, focusChunkIds, byChunk };
+}
+
+function logEmptyEvidence(logger, reason, chunksWithCandidates = []) {
+  if (!logger?.info) return;
+  const counts = (chunksWithCandidates || []).map((c) => ({
+    chunkId: c.id,
+    candidates: (c.candidates || []).length,
+  }));
+  logger.info('evidence_empty', { reason, counts });
 }
 
 export async function extractEvidenceFromChunksLLM({
@@ -2049,6 +2134,9 @@ if (DEFAULT_LLM_ROUTER_ENABLED && prompt) {
   for (const c of chunksWithCandidates) byChunk[c.id] = { relevant: false, chosen: [] };
 
   if (!prompt || totalCandidates === 0) {
+    if (prompt && totalCandidates === 0) {
+      logEmptyEvidence(trace?.logger, 'no_candidates', chunksWithCandidates);
+    }
     return { items: [], focusChunkIds: [], byChunk };
   }
 
@@ -2089,7 +2177,11 @@ if (DEFAULT_DETERMINISTIC_ITEM_LIST && detWantsItemList && !detWantsRanking) {
   const maxTotal = Number.isFinite(maxItemsTotal)
     ? maxItemsTotal
     : (detWantsDiff ? DEFAULT_MAX_ITEMS_TOTAL_ITEM_LIST_DIFF : DEFAULT_MAX_ITEMS_TOTAL_ITEM_LIST);
-  return deterministicSelectNewItemEvidence(chunksWithCandidates, { maxItemsTotal: maxTotal });
+  return deterministicSelectNewItemEvidence(chunksWithCandidates, {
+    maxItemsTotal: maxTotal,
+    intents,
+    logger: trace?.logger,
+  });
 }
 
 // Reviews/ratings monitoring prompts: stable evidence lines with rating + counts.
@@ -2106,7 +2198,11 @@ if (DEFAULT_DETERMINISTIC_REVIEWS && detWantsReviews) {
 
 if (DEFAULT_DETERMINISTIC_NEW_ITEM && detWantsDiff && !detWantsRanking && !detWantsItemList) {
   const maxTotal = Number.isFinite(maxItemsTotal) ? maxItemsTotal : DEFAULT_MAX_ITEMS_TOTAL_NEW_ITEM;
-  return deterministicSelectNewItemEvidence(chunksWithCandidates, { maxItemsTotal: maxTotal });
+  return deterministicSelectNewItemEvidence(chunksWithCandidates, {
+    maxItemsTotal: maxTotal,
+    intents,
+    logger: trace?.logger,
+  });
 }
 
 // 2) Ask LLM to select candidate IDs.
@@ -2252,6 +2348,10 @@ Wynik: WYŁĄCZNIE JSON zgodny ze schematem. Dla KAŻDEGO podanego chunka zwró�
     });
   } else {
     items.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  }
+
+  if (items.length === 0) {
+    logEmptyEvidence(trace?.logger, 'llm_no_items', chunksWithCandidates);
   }
 
   return { items, focusChunkIds, byChunk };
