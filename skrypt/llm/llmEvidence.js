@@ -754,7 +754,8 @@ function detectPromptIntents(userPrompt) {
   );
 
   const wants = {
-    price: /\b(cen|price|koszt|pln|zł|zl|€|\$)\b/.test(p),
+    // Accept Polish inflections: cena/ceny/cenie/cenę etc.
+    price: /\b(cen\w*|price|koszt\w*|pln|zł|zl|€|\$)\b/.test(p),
     reviews: hasReviewIntent,
     first_paragraph: /\b(pierwszy\s+akapit|1\.?\s+akapit|first\s+paragraph)\b/.test(p),
     list_items: /\b(lista|pozycj|elementy\s+listy|produkty|wyniki|katalog|asortyment)\b/.test(p),
@@ -772,6 +773,7 @@ function detectPromptIntents(userPrompt) {
     // Optional: hints for focused extraction
     color_or_category: /(kolor|color|kategoria|category)/.test(p),
     headline: /(nagł|naglo|headline|tytuł|tytul|title|podtytuł|podtytul|subheadline)/.test(p),
+    news_list: /\b(artykul|artykuł|artykuly|artykuły|wiadomosc|wiadomość|wiadomosci|wiadomości|news|wpis|wpisy|entry|entries|ogloszenie|ogłoszenie|ogloszenia|ogłoszenia|pozycja|pozycje)\b/.test(p),
   };
 
   const exclude = {
@@ -788,19 +790,32 @@ function detectPromptIntents(userPrompt) {
   // When router returns no labels, we DO NOT run deterministic shortcuts (ranking/new-item/list),
   // and we fall back to classic LLM evidence selection.
   const ROUTER_LABELS = [
-    'ITEM_LIST',          // user wants full list / all items / all variants
-    'RANKING',            // top-N / ranking / sorted list
-    'LIST',               // alias / future-proof (some models output a generic "LIST")
-    'PRICE',              // price as a field (not necessarily diff)
-    'REVIEWS',            // rating / reviews / stars
-    'TITLE_ONLY',         // title only
-    'FIRST_PARAGRAPH',    // first paragraph only
-    'PARAGRAPHS',         // user asks to monitor specific paragraph(s) / akapit(s) by number or [Pxxx]
-    'SUMMARY',            // summary / overview
-    'DIFF_MODE',          // user asks "what changed" / "what's new" / baseline compare
-    'PRICE_CHANGE_MODE',  // user asks "did it get cheaper/more expensive" (implies diff)
-    'UNKNOWN',
-  ];
+  // --- New unified labels (preferred) ---
+  'PARAGRAPH_RANGE',     // prompt references [Pxxx] / akapit / paragraf / zakres paragrafów
+  'PRICE_MAIN',          // główna cena (cena produktu/oferty)
+  'PRICE_ANY',           // ceny ogólnie (lista cen / wiele cen)
+  'FX_RATE',             // kursy walut / notowania (USD/PLN, EUR/PLN, itp.)
+  'AVAILABILITY',        // dostępność (in stock / out of stock / niedostępne)
+  'RANKING_ORDER',       // top-N z kolejnością (zmiana pozycji = zmiana)
+  'RANKING_SET',         // top-N jako zbiór (ignoruj kolejność, liczy się skład)
+  'ITEM_LIST',           // pełna lista elementów / wariantów
+  'REVIEWS',             // opinie/recenzje (pojedyncze wpisy)
+  'RATING_SUMMARY',      // agregaty: ocena + liczba opinii
+  'ANNOUNCEMENT_NEWS',   // aktualności/ogłoszenia/wpisy (lista pozycji)
+  'GENERIC',             // brak jasnej intencji / ogólny prompt
+
+  // --- Backward-compatibility (older prompts / older routers) ---
+  'RANKING',
+  'LIST',
+  'PRICE',
+  'PARAGRAPHS',
+  'TITLE_ONLY',
+  'FIRST_PARAGRAPH',
+  'SUMMARY',
+  'DIFF_MODE',
+  'PRICE_CHANGE_MODE',
+  'UNKNOWN',
+];
 
   const ROUTER_SCHEMA = {
     type: 'object',
@@ -832,27 +847,38 @@ function detectPromptIntents(userPrompt) {
     const p = String(prompt || '').trim();
     if (!p) return { ok: true, labels: [], confidence: 0 };
 
-    const system = `Jesteś routerem intencji dla systemu wyciągania EVIDENCE.
-Masz przeczytać prompt użytkownika i zwrócić listę ETYKIET (multi-label), które NAJLEPIEJ opisują intencję.
+    
+    const system = `Jesteś ROUTEREM INTENCJI dla modułu wyciągania EVIDENCE.
+Czytasz USER_PROMPT i zwracasz listę ETYKIET (multi-label), które najlepiej opisują intencję monitorowania.
 
 Zasady:
-- Zwracaj tylko etykiety z listy ROUTER_LABELS.
-- Jeśli nie masz pewności, zwróć [] (pustą listę) lub ["UNKNOWN"].
-- Nie tłumacz, nie komentuj, nie dodawaj tekstu poza JSON.
-- Etykiety DIFF_MODE oraz PRICE_CHANGE_MODE dotyczą porównania między snapshotami (użytkownik pyta "co się zmieniło", "czy potaniało" itp.).
+- Zwracaj TYLKO etykiety z listy ROUTER_LABELS.
+- Możesz zwrócić wiele etykiet (np. ["RANKING_ORDER","PRICE_ANY"]).
+- Jeśli prompt wskazuje paragrafy ([P003], "paragraf 3", "akapit 4-9") -> zawsze dodaj PARAGRAPH_RANGE.
+- Jeśli nie masz pewności, zwróć [] lub ["GENERIC"].
+- Nie komentuj, nie tłumacz, nie dodawaj nic poza JSON.
+
+Wskazówki:
+- PRICE_MAIN: "główna cena", "cena produktu/oferty", "ile kosztuje".
+- PRICE_ANY: "ceny", "lista cen", "wszystkie ceny".
+- FX_RATE: "kurs", "USD/PLN", "EUR/PLN", "notowania walut".
+- AVAILABILITY: "dostępność", "brak w magazynie", "out of stock".
+- RANKING_ORDER: "TOP 10" + liczy się kolejność/pozycje.
+- RANKING_SET: "TOP 10" + IGNORUJ KOLEJNOŚĆ (liczy się skład).
+- ITEM_LIST: "wypisz wszystkie", "lista elementów/ofert", "wszystkie warianty".
+- REVIEWS: "opinie/recenzje/komentarze" (pojedyncze wpisy).
+- RATING_SUMMARY: "jaka ocena" + "ile opinii" (agregaty).
+- ANNOUNCEMENT_NEWS: "aktualności/ogłoszenia/wiadomości" (lista pozycji).
 
 Przykłady:
-- "Wypisz wszystkie smaki i ceny" -> ["ITEM_LIST","PRICE"]
-- "Top 5 najtańszych" -> ["RANKING","PRICE"]
-- "Detect any change in the top-10 items and their ranks" -> ["RANKING"]
-- "Wykryj zmiany w TOP-10 produktach i ich pozycjach" -> ["RANKING"]
-- "Co nowego doszło na liście i czy coś potaniało?" -> ["ITEM_LIST","PRICE_CHANGE_MODE"]
-- "Jaka ocena i ile opinii?" -> ["REVIEWS"]
-- "Streść stronę" -> ["SUMMARY"]
-- "Podaj tylko tytuł" -> ["TITLE_ONLY"]
-- "Monitoruj paragrafy od 1 do 3" -> ["PARAGRAPHS"]
+- "Powiadom tylko gdy zmieni się wartość USD/PLN albo EUR/PLN" -> ["FX_RATE"]
+- "Powiadom o zmianie głównej ceny" -> ["PRICE_MAIN"]
+- "Wypisz wszystkie smaki i ceny" -> ["ITEM_LIST","PRICE_ANY"]
+- "TOP 10 ofert — ignoruj kolejność, liczy się tylko skład" -> ["RANKING_SET"]
+- "TOP 10 ofert i ich pozycje" -> ["RANKING_ORDER"]
+- "Monitoruj paragrafy od 3 do 6" -> ["PARAGRAPH_RANGE"]
+- "Nowe ogłoszenie na stronie" -> ["ANNOUNCEMENT_NEWS"]
 - Niejasne -> []`;
-
     try {
       const resp = await generateTextWithOllama({
         model,
@@ -882,46 +908,70 @@ Przykłady:
   }
 
   function applyRouterLabelsToIntents(intents, labels) {
-    if (!intents || typeof intents !== 'object') return intents;
-    if (!intents.wants || typeof intents.wants !== 'object') intents.wants = {};
+  if (!intents || typeof intents !== 'object') intents = {};
+  if (!intents.wants || typeof intents.wants !== 'object') intents.wants = {};
+  if (!intents.exclude || typeof intents.exclude !== 'object') intents.exclude = intents.exclude || {};
 
-    const set = new Set(Array.isArray(labels) ? labels : []);
+  const raw = Array.isArray(labels) ? labels : [];
+  const set = new Set(raw.map((x) => String(x || '').trim()).filter(Boolean));
 
-    if (set.has('ITEM_LIST')) intents.wants.list_items = true;
-    if (set.has('RANKING')) intents.wants.ranking = true;
-    if (set.has('PRICE')) intents.wants.price = true;
-    if (set.has('REVIEWS')) intents.wants.reviews = true;
-    if (set.has('TITLE_ONLY')) {
-      intents.wants.title_only = true;
-      intents.wants.only = true;
-    }
-    if (set.has('FIRST_PARAGRAPH')) intents.wants.first_paragraph = true;
-    if (set.has('PARAGRAPHS')) intents.wants.paragraphs = true;
+  // --- Normalize legacy labels -> new labels ---
+  if (set.has('RANKING')) set.add('RANKING_ORDER');
+  if (set.has('PRICE')) set.add('PRICE_ANY');
+  if (set.has('PARAGRAPHS')) set.add('PARAGRAPH_RANGE');
 
-    // Diff-oriented modes: we want a broad pool of list rows so the judge can compare snapshots.
-    if (set.has('DIFF_MODE') || set.has('PRICE_CHANGE_MODE')) {
-      intents.wants.new_item = true;
-      intents.wants.list_items = true; // extract list rows with details
-      intents.wants.price = intents.wants.price || set.has('PRICE_CHANGE_MODE');
-    }
+  // --- Intents derived from labels ---
+  if (set.has('PARAGRAPH_RANGE')) intents.wants.paragraphs = true;
 
-    // Attach for debugging (harmless extra field).
-    intents.router = { labels: Array.from(set) };
-    return intents;
+  if (set.has('PRICE_MAIN')) {
+    intents.wants.price = true;
+    intents.wants.price_main = true;
+  }
+  if (set.has('PRICE_ANY')) intents.wants.price = true;
+
+  if (set.has('FX_RATE')) {
+    intents.wants.fx_rate = true;
+    // FX is not "price" (avoid PRICE-only fallback behavior on FX prompts).
+    intents.wants.price = false;
   }
 
-function countMatches(text, re) {
-  if (!text) return 0;
-  re.lastIndex = 0;
-  let n = 0;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    n++;
-    if (m.index === re.lastIndex) re.lastIndex++;
-    if (n > 999) break;
+  if (set.has('AVAILABILITY')) intents.wants.availability = true;
+
+  if (set.has('RANKING_ORDER')) intents.wants.ranking = true;
+  if (set.has('RANKING_SET')) intents.wants.ranking_set = true;
+
+  if (set.has('ITEM_LIST')) intents.wants.list_items = true;
+
+  if (set.has('REVIEWS')) intents.wants.reviews = true;
+  if (set.has('RATING_SUMMARY')) {
+    intents.wants.reviews = true;
+    intents.wants.rating_summary = true;
   }
-  return n;
+
+  if (set.has('ANNOUNCEMENT_NEWS')) {
+    intents.wants.news_list = true;
+    intents.wants.new_item = true;
+    intents.wants.list_items = true;
+  }
+
+  // Legacy diff modes (still supported)
+  if (set.has('DIFF_MODE') || set.has('PRICE_CHANGE_MODE')) {
+    intents.wants.new_item = true;
+    intents.wants.list_items = true;
+    if (set.has('PRICE_CHANGE_MODE')) intents.wants.price = true;
+  }
+
+  // Title/summary labels (optional legacy)
+  if (set.has('TITLE_ONLY')) {
+    intents.wants.title_only = true;
+    intents.wants.only = true;
+  }
+  if (set.has('FIRST_PARAGRAPH')) intents.wants.first_paragraph = true;
+
+  intents.router = { labels: Array.from(set) };
+  return intents;
 }
+
 
 function countRankLinesUpTo(text, rankLimit) {
   const limit = Number.isFinite(rankLimit) ? rankLimit : 10;
@@ -985,6 +1035,82 @@ function buildRankCandidatesFromText(text, chunkId, { rankLimit, maxCandidates, 
   return out;
 }
 
+function parseFxTargetsFromPrompt(userPrompt) {
+  const p = String(userPrompt || '').toUpperCase();
+  const codes = ['USD','EUR','CHF','GBP','JPY','CAD','AUD','NOK','SEK','DKK','CZK','HUF'];
+  const out = new Set();
+  for (const c of codes) {
+    const re = new RegExp(`\\b${c}(?:\\s*\\/\\s*PLN|PLN)?\\b`, 'i');
+    if (re.test(p)) out.add(c);
+  }
+  return out;
+}
+
+function buildFxCandidatesFromText(text, chunkId, { targets, maxCandidates, maxLen } = {}) {
+  const t = String(text || '');
+  if (!t) return [];
+  const lines = t.split('\n');
+  const out = [];
+  const seen = new Set();
+  const wants = targets instanceof Set ? targets : new Set();
+
+  const codeRe = RE_FX_CODE;
+  const pairRe = RE_FX_PAIR;
+  const numRe = RE_FX_RATE_NUM;
+
+  let idx = 0;
+  for (const rawLine of lines) {
+    if (out.length >= (Number.isFinite(maxCandidates) ? maxCandidates : 30)) break;
+    const ln = String(rawLine || '').trim();
+    if (ln.length < 6) continue;
+
+    const hasPair = pairRe.test(ln);
+    pairRe.lastIndex = 0;
+
+    const mCode = ln.match(codeRe);
+    codeRe.lastIndex = 0;
+
+    const hasNum = numRe.test(ln);
+    numRe.lastIndex = 0;
+
+    if (!hasNum) continue;
+    if (!hasPair && (!mCode || mCode.length === 0)) continue;
+
+    if (wants.size > 0) {
+      const upper = ln.toUpperCase();
+      let ok = false;
+      for (const c of wants) {
+        if (upper.includes(c)) { ok = true; break; }
+      }
+      if (!ok) continue;
+    }
+
+    const quote = ln.length > maxLen ? ln.slice(0, maxLen).trim() : ln;
+    const key = quote.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ id: `cand#${chunkId}#${idx++}`, quote, kind: 'fx_rate_line' });
+  }
+
+  if (out.length === 0) {
+    pairRe.lastIndex = 0;
+    let m;
+    while ((m = pairRe.exec(t)) !== null) {
+      const quote = extractWindowSmart(t, m.index, m.index + m[0].length, { maxLen, windowWords: 4 });
+      const key = quote.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        out.push({ id: `cand#${chunkId}#${idx++}`, quote, kind: 'fx_rate_line' });
+      }
+      if (out.length >= (Number.isFinite(maxCandidates) ? maxCandidates : 30)) break;
+      if (m.index === pairRe.lastIndex) pairRe.lastIndex++;
+    }
+  }
+
+  return out;
+}
+
+
 // Common patterns
 const RE_RATING_FRAC = /\b\d{1,2}(?:[.,]\d{1,2})?\s*\/\s*(?:5|10)\b/g;
 const RE_RATING_STARS_NUM = /\b\d{1,2}(?:[.,]\d{1,2})?\s*[★☆]{1,6}\b/g;
@@ -992,7 +1118,10 @@ const RE_STARS = /[★☆]{3,}/g;
 const RE_PERCENT = /\b\d{1,3}(?:[.,]\d{1,2})?\s*%/g;
 const RE_REVIEW_COUNT = /\b\d+\s*(?:opin|opini|ocen|oceny|review|reviews|recenz|rating|ratings)\w*/gi;
 
-const RE_CURRENCY = /\b\d{1,3}(?:[ .]\d{3})*(?:[.,]\d{2})?\s*(?:zł|zl|pln|€|eur|usd|\$)\b/gi;
+const RE_CURRENCY = /\b\d{1,6}(?:[ .]\d{3})*(?:[.,]\d{2})?\s*(?:zł|zl|pln|€|eur|usd|\$)\b/gi;
+const RE_FX_PAIR = /\b(?:USD|EUR|CHF|GBP|JPY|CAD|AUD|NOK|SEK|DKK|CZK|HUF)\s*(?:\/|\s*)\s*PLN\b|\b(?:USDPLN|EURPLN|CHFPLN|GBPPLN|JPYPLN|CADPLN|AUDPLN)\b/gi;
+const RE_FX_CODE = /\b(?:USD|EUR|CHF|GBP|JPY|CAD|AUD|NOK|SEK|DKK|CZK|HUF)\b/gi;
+const RE_FX_RATE_NUM = /\b\d{1,2}(?:[.,]\d{3,6})\b/g;
 const RE_AVAIL = /\b(?:w\s*tej\s*chwili\s*nie\s*mamy|brak|niedost[eę]pn\w*|out\s*of\s*stock|sold\s*out|unavailable|in\s*stock|available|dost[eę]pn\w*)\b/gi;
 const RE_DELIVERY = /\b(?:dostaw\w*|wysył\w*|wysyl\w*|delivery|shipping|ship(?:ping)?|kurier|odbi[oó]r\w*|pickup)\b/gi;
 const RE_DATE = /\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b/g;
@@ -1025,6 +1154,13 @@ function scoreChunkForEvidence(text, { promptKeywords, intents }) {
     score += countMatches(t, RE_PERCENT) * 2; // promotions often include %
   }
 
+
+if (intents?.wants?.fx_rate) {
+  score += countMatches(t, RE_FX_PAIR) * 18;
+  score += countMatches(t, RE_FX_CODE) * 6;
+  score += countMatches(t, RE_FX_RATE_NUM) * 5;
+}
+
   if (intents?.wants?.availability) {
     score += countMatches(t, RE_AVAIL) * 7;
   }
@@ -1042,7 +1178,7 @@ function scoreChunkForEvidence(text, { promptKeywords, intents }) {
     score += countMatches(lower, /(filtr|marka:|brand:|rozmiar|size|kolor|color|kategoria|category)/g) * 3;
   }
 
-  if (intents?.wants?.ranking) {
+  if (intents?.wants?.ranking || intents?.wants?.ranking_set) {
     const limit = Number.isFinite(intents?.rankLimit) ? intents.rankLimit : 10;
     const topRanks = countRankLinesUpTo(t, limit);
     // Ranking lines are the strongest signal for "top-N / ranks" prompts.
@@ -1278,6 +1414,161 @@ function deterministicSelectReviewsEvidence(chunksWithCandidates, { intents, max
 }
 
 
+function deterministicSelectFxEvidence(chunksWithCandidates, { intents, maxItemsTotal } = {}) {
+  const totalMaxRaw = Number.isFinite(maxItemsTotal) ? maxItemsTotal : 10;
+  const totalMax = clamp(totalMaxRaw, 1, 40);
+
+  const pool = [];
+  for (const c of chunksWithCandidates || []) {
+    for (const cand of c.candidates || []) {
+      if (cand.kind !== 'fx_rate_line') continue;
+      pool.push({ chunkId: c.id, order: c.order || 0, candId: cand.id, quote: cand.quote, pr: 1 });
+    }
+  }
+
+  pool.sort((a, b) => (a.pr !== b.pr ? a.pr - b.pr : a.order !== b.order ? a.order - b.order : a.quote.length - b.quote.length));
+
+  const byChunk = {};
+  for (const c of chunksWithCandidates || []) byChunk[c.id] = { relevant: false, chosen: [] };
+
+  const focusChunkIds = [];
+  const items = [];
+  const chosenCount = new Map();
+
+  for (const it of pool) {
+    if (items.length >= totalMax) break;
+    const n = chosenCount.get(it.chunkId) || 0;
+    if (n >= 6) continue;
+
+    chosenCount.set(it.chunkId, n + 1);
+    byChunk[it.chunkId].relevant = true;
+    byChunk[it.chunkId].chosen.push(it.candId);
+    if (!focusChunkIds.includes(it.chunkId)) focusChunkIds.push(it.chunkId);
+    items.push({ id: `evidence#${it.candId}`, chunk_id: it.chunkId, quote: it.quote });
+  }
+
+  return { items, focusChunkIds, byChunk };
+}
+
+function deterministicSelectAvailabilityEvidence(chunksWithCandidates, { intents, maxItemsTotal } = {}) {
+  const totalMaxRaw = Number.isFinite(maxItemsTotal) ? maxItemsTotal : 8;
+  const totalMax = clamp(totalMaxRaw, 1, 25);
+
+  const pool = [];
+  for (const c of chunksWithCandidates || []) {
+    for (const cand of c.candidates || []) {
+      if (cand.kind !== 'availability') continue;
+      pool.push({ chunkId: c.id, order: c.order || 0, candId: cand.id, quote: cand.quote, pr: 1 });
+    }
+  }
+
+  pool.sort((a, b) => (a.pr !== b.pr ? a.pr - b.pr : a.order !== b.order ? a.order - b.order : a.quote.length - b.quote.length));
+
+  const byChunk = {};
+  for (const c of chunksWithCandidates || []) byChunk[c.id] = { relevant: false, chosen: [] };
+
+  const focusChunkIds = [];
+  const items = [];
+  const chosenCount = new Map();
+
+  for (const it of pool) {
+    if (items.length >= totalMax) break;
+    const n = chosenCount.get(it.chunkId) || 0;
+    if (n >= 4) continue;
+
+    chosenCount.set(it.chunkId, n + 1);
+    byChunk[it.chunkId].relevant = true;
+    byChunk[it.chunkId].chosen.push(it.candId);
+    if (!focusChunkIds.includes(it.chunkId)) focusChunkIds.push(it.chunkId);
+    items.push({ id: `evidence#${it.candId}`, chunk_id: it.chunkId, quote: it.quote });
+  }
+
+  return { items, focusChunkIds, byChunk };
+}
+
+function deterministicSelectPriceEvidence(chunksWithCandidates, { intents, maxItemsTotal, mainOnly } = {}) {
+  const totalMaxRaw = Number.isFinite(maxItemsTotal) ? maxItemsTotal : (mainOnly ? 4 : 10);
+  const totalMax = clamp(totalMaxRaw, 1, 60);
+
+  const main = !!mainOnly || !!intents?.wants?.price_main;
+  const kwMain = /\b(cena|price|koszt|brutto|netto|od\b|za\b)\b/i;
+
+  const pool = [];
+  for (const c of chunksWithCandidates || []) {
+    for (const cand of c.candidates || []) {
+      if (cand.kind !== 'price_currency') continue;
+      const q = String(cand.quote || '');
+      const ql = q.toLowerCase();
+      const financeNoise = isFinanceContextLower(ql);
+      let pr = 2;
+      if (main) pr = kwMain.test(q) ? 1 : 2;
+      if (financeNoise) pr += 3;
+      pool.push({ chunkId: c.id, order: c.order || 0, candId: cand.id, quote: cand.quote, pr });
+    }
+  }
+
+  pool.sort((a, b) => (a.pr !== b.pr ? a.pr - b.pr : a.order !== b.order ? a.order - b.order : a.quote.length - b.quote.length));
+
+  const byChunk = {};
+  for (const c of chunksWithCandidates || []) byChunk[c.id] = { relevant: false, chosen: [] };
+
+  const focusChunkIds = [];
+  const items = [];
+  const chosenCount = new Map();
+
+  for (const it of pool) {
+    if (items.length >= totalMax) break;
+    const n = chosenCount.get(it.chunkId) || 0;
+    if (n >= (main ? 2 : 6)) continue;
+
+    chosenCount.set(it.chunkId, n + 1);
+    byChunk[it.chunkId].relevant = true;
+    byChunk[it.chunkId].chosen.push(it.candId);
+    if (!focusChunkIds.includes(it.chunkId)) focusChunkIds.push(it.chunkId);
+    items.push({ id: `evidence#${it.candId}`, chunk_id: it.chunkId, quote: it.quote });
+  }
+
+  return { items, focusChunkIds, byChunk };
+}
+
+function deterministicSelectRankingSetEvidence(chunksWithCandidates, { intents, maxItemsTotal } = {}) {
+  const limit = Number.isFinite(intents?.rankLimit) ? intents.rankLimit : 10;
+  const totalMaxRaw = Number.isFinite(maxItemsTotal) ? maxItemsTotal : clamp(limit, 1, 25);
+  const totalMax = clamp(totalMaxRaw, 1, 60);
+
+  const pool = [];
+  for (const c of chunksWithCandidates || []) {
+    for (const cand of c.candidates || []) {
+      if (cand.kind !== 'rank_set_item') continue;
+      const quote = String(cand.quote || '');
+      const key = stableProductKeyForEvidence(quote) || quote.toLowerCase();
+      pool.push({ chunkId: c.id, order: c.order || 0, candId: cand.id, quote: cand.quote, key });
+    }
+  }
+
+  pool.sort((a, b) => (a.key !== b.key ? a.key.localeCompare(b.key) : a.order !== b.order ? a.order - b.order : a.quote.length - b.quote.length));
+
+  const byChunk = {};
+  for (const c of chunksWithCandidates || []) byChunk[c.id] = { relevant: false, chosen: [] };
+
+  const focusChunkIds = [];
+  const items = [];
+  const chosenKeys = new Set();
+
+  for (const it of pool) {
+    if (items.length >= totalMax) break;
+    if (chosenKeys.has(it.key)) continue;
+    chosenKeys.add(it.key);
+
+    byChunk[it.chunkId].relevant = true;
+    byChunk[it.chunkId].chosen.push(it.candId);
+    if (!focusChunkIds.includes(it.chunkId)) focusChunkIds.push(it.chunkId);
+    items.push({ id: `evidence#${it.candId}`, chunk_id: it.chunkId, quote: it.quote });
+  }
+
+  return { items, focusChunkIds, byChunk };
+}
+
 function buildCandidatesForChunk(chunkText, chunkId, opts = {}) {
   let text = String(chunkText || '');
   const maxCandidates = Number.isFinite(opts.maxCandidates)
@@ -1288,7 +1579,8 @@ function buildCandidatesForChunk(chunkText, chunkId, opts = {}) {
   const userPromptLower = userPrompt.toLowerCase();
   const promptKeywords = Array.isArray(opts.promptKeywords) ? opts.promptKeywords : [];
   const intents = opts.intents || detectPromptIntents(userPrompt);
-  const priceOnly = !!(intents?.wants?.price && intents?.wants?.only && !intents?.wants?.reviews);
+  const priceOnly = !!(intents?.wants?.price && intents?.wants?.only && !intents?.wants?.reviews && !intents?.wants?.fx_rate);
+  const wantsNewsList = !!intents?.wants?.news_list;
 
   // If the user asked for specific paragraph(s)/akapit(y), reduce noise by keeping
   // only those paragraph blocks (neighbor expansion handled in parsing).
@@ -1302,6 +1594,40 @@ function buildCandidatesForChunk(chunkText, chunkId, opts = {}) {
   }
 
   const maxLen = Number.isFinite(opts.maxQuoteChars) ? opts.maxQuoteChars : DEFAULT_MAX_QUOTE_LEN;
+
+
+// Ranking SET prompts: extract top-N entries but return them WITHOUT the rank prefix,
+// so re-ordering on the page does not change the evidence strings.
+if (intents?.wants?.ranking_set) {
+  const limit = Number.isFinite(intents?.rankLimit) ? intents.rankLimit : 10;
+  const maxC = Math.max(6, Math.min(Number.isFinite(maxCandidates) ? maxCandidates : 40, 80));
+  const re = /(?:^|\n)\s*-\s*#\s*(\d{1,3})\s+([^\n]{6,280})/g;
+  const outSet = [];
+  const seenSet = new Set();
+  let mm;
+  let k = 0;
+  while ((mm = re.exec(text)) !== null) {
+    const r = Number.parseInt(mm[1], 10);
+    if (!Number.isFinite(r) || r <= 0 || r > limit) {
+      if (mm.index === re.lastIndex) re.lastIndex++;
+      continue;
+    }
+    const raw = String(mm[2] || '').trim();
+    if (raw.length < 4) {
+      if (mm.index === re.lastIndex) re.lastIndex++;
+      continue;
+    }
+    const quote = raw.length > maxLen ? raw.slice(0, maxLen).trim() : raw;
+    const key = stableProductKeyForEvidence(quote);
+    if (key && !seenSet.has(key)) {
+      seenSet.add(key);
+      outSet.push({ id: `cand#${chunkId}#${k++}`, quote, kind: 'rank_set_item', rank: r });
+      if (outSet.length >= maxC) break;
+    }
+    if (mm.index === re.lastIndex) re.lastIndex++;
+  }
+  if (outSet.length) return outSet.slice(0, maxCandidates);
+}
 
   // Ranking prompts: prefer exact "#N ..." entries (bounded by rankLimit).
   // This prevents picking navigation bullets (e.g. categories) as evidence.
@@ -1319,10 +1645,22 @@ function buildCandidatesForChunk(chunkText, chunkId, opts = {}) {
 
     // If the chunk contains ranks but only above the limit (e.g. #11+), keep it empty
     // so we don't accidentally pick prices/categories as "top-N" evidence.
-    if (anyRankStarts > 0) return [];
-  }
 
-  const seen = new Set();
+  if (anyRankStarts > 0) return [];
+}
+
+// FX rate prompts: prefer table/line entries that include a currency code (or pair) + numeric rate.
+if (intents?.wants?.fx_rate) {
+  const targets = parseFxTargetsFromPrompt(userPrompt);
+  const fxCands = buildFxCandidatesFromText(text, chunkId, {
+    targets,
+    maxCandidates,
+    maxLen,
+  });
+  if (fxCands.length) return fxCands.slice(0, maxCandidates);
+}
+
+const seen = new Set();
   const out = [];
   let idx = 0;
 
@@ -1331,6 +1669,11 @@ function buildCandidatesForChunk(chunkText, chunkId, opts = {}) {
   // of item lines so the judge can compare BEFORE vs AFTER.
     if (intents?.wants?.new_item && !intents?.wants?.ranking) {
     const lines = text.split('\n').map((x) => x.trim()).filter(Boolean);
+    const newsSectionRe = /\b(?:najnowsze|najważniejsze|najwazniejsze|polska|swiat|świat|biznes|sport|kultura|technologia|tech|gospodarka|ekonomia|polityka|region|regionalne|opinie|zdrowie|moto|podróże|podroze|rozrywka)\b/i;
+    const reRelTime = /\b\d+\s*(?:min(?:\.|ut(?:y|ę)?)|godz\.?|godzin(?:y)?|hours?|minutes?|mins?)\b(?:\s*(?:temu|ago))?\b/i;
+    const reDateHint = /\b(?:dzisiaj|dziś|wczoraj|today|yesterday)\b/i;
+    const reClock = /\b\d{1,2}:\d{2}\b/;
+    const reDateNum = /\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b/;
 
     // If the user provided specific entity keywords (e.g., a brand/product/person),
     // we require at least one of them to appear in the selected line.
@@ -1356,29 +1699,37 @@ function buildCandidatesForChunk(chunkText, chunkId, opts = {}) {
 
     const navRe = /^(?:filtry?\b|filtry?\s*\d+|marka:|brand:|kategoria\b|category\b|sortuj\b|sort\b|szukaj\b|search\b|menu\b|home\b|kontakt\b|help\b|about\b)/i;
 
-    // Relative time markers are extremely unstable (e.g., "33 minuty temu") and can cause false positives.
-    // When we detect them, we cut the line BEFORE the relative time so evidence stays stable.
-    const reRelTime = /\b\d+\s*(?:min(?:\.|ut(?:y|ę)?)|godz\.?|hours?|minutes?|mins?)\b(?:\s*\d+\s*(?:min(?:\.|ut(?:y|ę)?)))?\s*(?:temu|ago)\b/i;
-    const reAnyTimeOrDate = /\b(?:dzisiaj|wczoraj|today|yesterday|\d{1,2}:\d{2}|\(\d{1,2}:\d{2}\)|\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?)\b/i;
-
-    const cutRelativeTime = (ln, noBullet) => {
-      const idx = noBullet.search(reRelTime);
-      if (idx < 0 || idx < 22) return ln;
-
-      const pm = /^([-•]|(\d{1,3}[.)]))\s+/.exec(ln);
-      const prefixLen = pm ? pm[0].length : 0;
-      const cutIdx = prefixLen + idx;
-      const cut = ln.slice(0, cutIdx).trimEnd();
-      return cut.length >= 12 ? cut : ln;
-    };
+    const cleanLineForMatch = (ln) => ln.replace(/^\[P\d+\]\s*/i, '').trim();
 
     for (const ln of lines) {
       if (out.length >= maxCandidates) break;
-      if (!/^([-•]|(\d{1,3}[.)]))\s+/.test(ln)) continue;
-
-      const noBullet = ln.replace(/^([-•]|(\d{1,3}[.)]))\s+/, '').trim();
+      const cleaned = cleanLineForMatch(ln);
+      const isBullet = /^([-•]|(\d{1,3}[.)]))\s+/.test(cleaned);
+      const noBullet = cleaned.replace(/^([-•]|(\d{1,3}[.)]))\s+/, '').trim();
       if (noBullet.length < 12) continue;
       if (navRe.test(noBullet)) continue;
+
+      if (wantsNewsList) {
+        const hasTimeOrDate = reRelTime.test(noBullet) || reDateHint.test(noBullet) || reClock.test(noBullet) || reDateNum.test(noBullet);
+        const hasSection = newsSectionRe.test(noBullet);
+        const isHeader =
+          hasSection &&
+          noBullet.length <= 40 &&
+          !/[.!?]/.test(noBullet) &&
+          !/\d/.test(noBullet);
+
+        if (isHeader) {
+          pushCandidate(out, seen, `cand#${chunkId}#${idx++}`, ln.slice(0, maxLen), 'news_header');
+          continue;
+        }
+
+        if (isBullet || hasTimeOrDate || hasSection) {
+          pushCandidate(out, seen, `cand#${chunkId}#${idx++}`, ln.slice(0, maxLen), 'news_line');
+          continue;
+        }
+      }
+
+      if (!isBullet) continue;
 
       const tokens = noBullet.split(/\s+/).filter(Boolean);
       const isShortCategory =
@@ -1409,7 +1760,7 @@ function buildCandidatesForChunk(chunkText, chunkId, opts = {}) {
         if (!ok) continue;
       }
 
-      const hasAnyTime = reAnyTimeOrDate.test(noBullet);
+      const hasAnyTime = reRelTime.test(noBullet) || reDateHint.test(noBullet) || reClock.test(noBullet) || reDateNum.test(noBullet);
       const looksLikeProduct =
         /(\b\d+\s*(?:ml|g|l|kg)\b|\bpln\b|\bzł\b|\bzl\b|€|\$|\(|\)|,)/i.test(noBullet) ||
         /\b\d{3,}\b/.test(noBullet);
@@ -1424,29 +1775,25 @@ function buildCandidatesForChunk(chunkText, chunkId, opts = {}) {
       // For generic new-item monitoring, we only keep list-like rows.
       if (!requireEntityMatch && !looksLikeRow) continue;
 
-      let quote = ln;
-      if (!requireEntityMatch) quote = cutRelativeTime(ln, noBullet);
-
       // Keep verbatim substring.
-      pushCandidate(out, seen, `cand#${chunkId}#${idx++}`, quote.slice(0, maxLen), 'product_line');
+      pushCandidate(out, seen, `cand#${chunkId}#${idx++}`, ln.slice(0, maxLen), 'product_line');
     }
 
     // If we found nothing and prompt was generic, do a relaxed pass (still list-ish, still no nav).
     if (out.length === 0 && !requireEntityMatch) {
       for (const ln of lines) {
         if (out.length >= maxCandidates) break;
-        if (!/^([-•]|(\d{1,3}[.)]))\s+/.test(ln)) continue;
+        const cleaned = cleanLineForMatch(ln);
+        if (!/^([-•]|(\d{1,3}[.)]))\s+/.test(cleaned)) continue;
 
-        const noBullet = ln.replace(/^([-•]|(\d{1,3}[.)]))\s+/, '').trim();
+        const noBullet = cleaned.replace(/^([-•]|(\d{1,3}[.)]))\s+/, '').trim();
         if (noBullet.length < 20) continue;
         if (navRe.test(noBullet)) continue;
 
         const tokens = noBullet.split(/\s+/).filter(Boolean);
         if (tokens.length < 4) continue;
 
-        let quote = ln;
-        quote = cutRelativeTime(ln, noBullet);
-        pushCandidate(out, seen, `cand#${chunkId}#${idx++}`, quote.slice(0, maxLen), 'product_line');
+        pushCandidate(out, seen, `cand#${chunkId}#${idx++}`, ln.slice(0, maxLen), 'product_line');
       }
     }
 
@@ -1650,6 +1997,17 @@ if (intents?.wants?.list_items && !intents?.wants?.ranking && out.length < maxCa
 
 function candidatePriority(kind, intents) {
   const wants = intents?.wants || {};
+
+if (wants.fx_rate) {
+  if (kind === 'fx_rate_line') return 1;
+}
+if (wants.ranking_set) {
+  if (kind === 'rank_set_item') return 1;
+}
+if (wants.price_main) {
+  if (kind === 'price_currency') return 1;
+}
+
   if (wants.new_item && !wants.ranking) {
     if (kind === 'product_line') return 1;
     if (kind === 'brand_line') return 2;
@@ -1798,7 +2156,72 @@ function stableProductKeyForEvidence(line) {
   return out;
 }
 
-function deterministicSelectNewItemEvidence(chunksWithCandidates, { maxItemsTotal } = {}) {
+function deterministicSelectNewsListEvidence(chunksWithCandidates, { maxItemsTotal, logger } = {}) {
+  const totalMax = clamp(Number.isFinite(maxItemsTotal) ? maxItemsTotal : 8, 3, 8);
+  const byChunk = {};
+  const focusChunkIds = [];
+
+  for (const ch of chunksWithCandidates || []) {
+    const chunkId = String(ch?.id || '');
+    if (!byChunk[chunkId]) byChunk[chunkId] = { relevant: false, chosen: [] };
+  }
+
+  const chunkScores = (chunksWithCandidates || [])
+    .map((ch) => {
+      const newsCands = (ch.candidates || []).filter(
+        (c) => c.kind === 'news_line' || c.kind === 'news_header'
+      );
+      const density = newsCands.reduce((acc, c) => acc + (c.kind === 'news_header' ? 0.6 : 1), 0);
+      return {
+        id: String(ch?.id || ''),
+        order: Number.isFinite(ch?.order) ? ch.order : 0,
+        candidates: newsCands,
+        density,
+      };
+    })
+    .filter((c) => c.density > 0);
+
+  if (!chunkScores.length) return null;
+
+  chunkScores.sort((a, b) => {
+    if (b.density !== a.density) return b.density - a.density;
+    return a.order - b.order;
+  });
+
+  const chosenChunks = chunkScores.slice(0, 2);
+
+  const parseCandIdx = (id) => {
+    const m = /#(\d+)$/.exec(String(id || ''));
+    return m ? Number.parseInt(m[1], 10) : 999999;
+  };
+
+  const items = [];
+  for (const ch of chosenChunks) {
+    if (items.length >= totalMax) break;
+    const ordered = [...ch.candidates].sort((a, b) => parseCandIdx(a.id) - parseCandIdx(b.id));
+    for (const cand of ordered) {
+      if (items.length >= totalMax) break;
+      const evidId = `evidence#${cand.id}`;
+      items.push({ id: evidId, chunk_id: ch.id, quote: cand.quote });
+      byChunk[ch.id].relevant = true;
+      byChunk[ch.id].chosen.push(cand.id);
+      if (!focusChunkIds.includes(ch.id)) focusChunkIds.push(ch.id);
+    }
+  }
+
+  if (items.length === 0 && logger?.info) {
+    const counts = (chunksWithCandidates || []).map((c) => ({
+      chunkId: c.id,
+      candidates: (c.candidates || []).length,
+      newsCandidates: (c.candidates || []).filter((x) => x.kind === 'news_line' || x.kind === 'news_header').length,
+    }));
+    logger.info('evidence_empty', { reason: 'news_list_no_items', counts });
+  }
+
+  return { items, focusChunkIds, byChunk };
+}
+
+function deterministicSelectNewItemEvidence(chunksWithCandidates, { maxItemsTotal, intents, logger } = {}) {
   const totalMax = clamp(
     Number.isFinite(maxItemsTotal) ? maxItemsTotal : DEFAULT_MAX_ITEMS_TOTAL_NEW_ITEM,
     6,
@@ -1814,22 +2237,6 @@ function deterministicSelectNewItemEvidence(chunksWithCandidates, { maxItemsTota
     let s = String(q || '');
     s = s.replace(/^\s*[-*•]\s+/, '');
 
-    // Relative time / timestamps (PL+EN)
-    s = s.replace(/\b\d+\s*(?:minut(?:y)?|min|minutes?|mins?)\s+temu\b/gi, ' ');
-    s = s.replace(/\b\d+\s*(?:h|hrs?|hours?)\s+ago\b/gi, ' ');
-    s = s.replace(/\b\d+\s*(?:godz\.?|godzin(?:y)?)\s*(?:\d+\s*minut(?:y)?)?\s+temu\b/gi, ' ');
-
-    // Day labels
-    s = s.replace(/\b(?:dziś|dzisiaj|wczoraj|today|yesterday)\b[, ]*/gi, ' ');
-    s = s.replace(/\b(?:poniedziałek|poniedzialek|wtorek|środa|sroda|czwartek|piątek|piatek|sobota|niedziela)\b[, ]*/gi, ' ');
-
-    // Date fragments with month names (PL)
-    s = s.replace(/\b\d{1,2}\s+(?:stycznia|lutego|marca|kwietnia|maja|czerwca|lipca|sierpnia|września|wrzesnia|października|pazdziernika|listopada|grudnia)\b/gi, ' ');
-
-    // Times
-    s = s.replace(/\(\s*\d{1,2}:\d{2}\s*\)/g, ' ');
-    s = s.replace(/\b\d{1,2}:\d{2}\b/g, ' ');
-
     // De-dupe leading word duplicates (e.g., "Kraków Kraków ...")
     s = s.replace(/^([\p{L}-]{3,})\s+\1\b/ui, '$1');
 
@@ -1837,6 +2244,14 @@ function deterministicSelectNewItemEvidence(chunksWithCandidates, { maxItemsTota
     s = s.replace(/\s+/g, ' ').trim();
     return s;
   };
+
+  if (intents?.wants?.news_list) {
+    const news = deterministicSelectNewsListEvidence(chunksWithCandidates, {
+      maxItemsTotal: 8,
+      logger,
+    });
+    if (news && news.items.length) return news;
+  }
 
   // Collect candidates across chunks.
   for (const ch of chunksWithCandidates || []) {
@@ -1932,7 +2347,69 @@ function deterministicSelectNewItemEvidence(chunksWithCandidates, { maxItemsTota
     if (!focusChunkIds.includes(p.chunkId)) focusChunkIds.push(p.chunkId);
   }
 
+  if (items.length === 0 && logger?.info) {
+    const counts = (chunksWithCandidates || []).map((c) => ({
+      chunkId: c.id,
+      candidates: (c.candidates || []).length,
+    }));
+    logger.info('evidence_empty', { reason: 'new_item_no_items', counts });
+  }
+
   return { items, focusChunkIds, byChunk };
+}
+
+function logEmptyEvidence(logger, reason, chunksWithCandidates = []) {
+  if (!logger?.info) return;
+  const counts = (chunksWithCandidates || []).map((c) => ({
+    chunkId: c.id,
+    candidates: (c.candidates || []).length,
+  }));
+  logger.info('evidence_empty', { reason, counts });
+}
+
+function buildKeywordsForRouterLabels(labels, userPrompt) {
+  const set = new Set((Array.isArray(labels) ? labels : []).map((x) => String(x || '').toLowerCase()));
+  if (set.has('ranking')) set.add('ranking_order');
+  if (set.has('price')) set.add('price_any');
+  if (set.has('paragraphs')) set.add('paragraph_range');
+
+  const out = [];
+  const pushMany = (arr) => {
+    for (const x of arr) {
+      const s = String(x || '').toLowerCase();
+      if (!s) continue;
+      if (!out.includes(s)) out.push(s);
+    }
+  };
+
+  if (set.has('fx_rate')) {
+    pushMany(['kurs', 'notowanie', 'walut', 'tabela', 'nbp', 'usd', 'eur', 'pln', 'chf', 'gbp', 'usdpln', 'eurpln']);
+  }
+  if (set.has('price_main') || set.has('price_any')) {
+    pushMany(['cena', 'price', 'koszt', 'pln', 'zł', 'zl', 'brutto', 'netto', 'promocja', 'rabat', 'taniej', 'drożej', 'drozej']);
+  }
+  if (set.has('availability')) {
+    pushMany(['dostęp', 'dostep', 'dostępny', 'dostepny', 'niedostęp', 'niedostep', 'brak', 'stock', 'available', 'unavailable', 'sold', 'out']);
+  }
+  if (set.has('ranking_order') || set.has('ranking_set')) {
+    pushMany(['top', 'ranking', 'pozycja', 'pozycje', 'najlepsze', 'best', 'bestseller', 'lista']);
+  }
+  if (set.has('item_list')) {
+    pushMany(['lista', 'oferty', 'produkty', 'warianty', 'pozycje', 'elements', 'items']);
+  }
+  if (set.has('reviews') || set.has('rating_summary')) {
+    pushMany(['opinie', 'opinia', 'recenzje', 'recenzja', 'ocena', 'oceny', 'review', 'rating', 'gwiazd']);
+  }
+  if (set.has('announcement_news')) {
+    pushMany(['aktualno', 'ogłosze', 'oglosze', 'wiadomo', 'news', 'wpis', 'post', 'komunikat']);
+  }
+  if (set.has('paragraph_range')) {
+    pushMany(['paragraf', 'akapit', 'p00', 'p0', 'p1', 'p2', 'p3']);
+  }
+
+  const fallback = extractPromptKeywords(userPrompt, 12);
+  for (const k of fallback) if (!out.includes(k)) out.push(k);
+  return out.slice(0, 18);
 }
 
 export async function extractEvidenceFromChunksLLM({
@@ -1949,17 +2426,15 @@ export async function extractEvidenceFromChunksLLM({
   timeoutMs,
   trace,
 } = {}) {
-  const prompt = String(userPrompt || '').trim();
 
-let intents = detectPromptIntents(prompt);
-const promptKeywords = extractPromptKeywords(prompt);
+const prompt = String(userPrompt || '').trim();
 
-// Optional: use LLM router to assign labels to the prompt.
-// If router returns labels, we may run deterministic evidence modes (ranking/item-list/new-item).
-// If router returns NO labels, we intentionally skip deterministic shortcuts and fallback to classic LLM evidence selection.
+// --- Router FIRST (if enabled) ---
+// Router decides whether we should bind deterministic heuristics via labels.
 let routerUsed = false;
 let routerLabels = [];
 let routerOk = false;
+
 if (DEFAULT_LLM_ROUTER_ENABLED && prompt) {
   routerUsed = true;
   const routed = await routePromptLabelsLLM(prompt, {
@@ -1969,13 +2444,24 @@ if (DEFAULT_LLM_ROUTER_ENABLED && prompt) {
   });
   routerOk = !!routed?.ok;
   routerLabels = Array.isArray(routed?.labels) ? routed.labels : [];
-  if (routerOk && routerLabels.length) {
-    intents = applyRouterLabelsToIntents(intents, routerLabels);
-  }
 }
 
+// Deterministic intent parsing (always).
+let intents = detectPromptIntents(prompt);
 
-  const list = Array.isArray(chunks) ? chunks : [];
+// If router returned labels, attach them to intents (so scoring/candidates can adapt).
+if (routerUsed && routerOk && routerLabels.length) {
+  intents = applyRouterLabelsToIntents(intents, routerLabels);
+}
+
+// Prompt keywords:
+// - Router labels -> label-specific keywords (keeps short tokens like "USD", "zł", "PLN")
+// - Otherwise -> classic keywords (>=4 chars)
+const promptKeywords = (routerUsed && routerOk && routerLabels.length)
+  ? buildKeywordsForRouterLabels(routerLabels, prompt)
+  : extractPromptKeywords(prompt);
+
+const list = Array.isArray(chunks) ? chunks : [];
 
   // --- Deterministic paragraph evidence (explicit [Pxxx] constraints) ---
   // If the user explicitly asks to monitor specific paragraph(s), return full paragraph blocks
@@ -2049,6 +2535,9 @@ if (DEFAULT_LLM_ROUTER_ENABLED && prompt) {
   for (const c of chunksWithCandidates) byChunk[c.id] = { relevant: false, chosen: [] };
 
   if (!prompt || totalCandidates === 0) {
+    if (prompt && totalCandidates === 0) {
+      logEmptyEvidence(trace?.logger, 'no_candidates', chunksWithCandidates);
+    }
     return { items: [], focusChunkIds: [], byChunk };
   }
 
@@ -2058,16 +2547,28 @@ if (DEFAULT_LLM_ROUTER_ENABLED && prompt) {
 const routerHasLabels = routerUsed && routerOk && Array.isArray(routerLabels) && routerLabels.length > 0;
 
 // Decide determinism mode:
-// - router enabled: only run shortcuts when router assigned labels
-// - router disabled: keep previous heuristic-based behavior
+// - router enabled + labels: use router labels
+// - router enabled + no labels: disable deterministic shortcuts -> let LLM choose evidence
+// - router disabled: keep heuristic behavior
 const detMode = DEFAULT_LLM_ROUTER_ENABLED ? (routerHasLabels ? 'router' : 'none') : 'heuristic';
 
-// In router mode rely on labels, but accept a generic LIST alias too.
-const detWantsRanking = detMode === 'router'
-  ? (routerLabels.includes('RANKING') || routerLabels.includes('LIST'))
+// In router mode rely on labels (new + legacy).
+const detWantsRankingOrder = detMode === 'router'
+  ? (routerLabels.includes('RANKING_ORDER') || routerLabels.includes('RANKING') || routerLabels.includes('LIST'))
   : intents?.wants?.ranking;
+
+const detWantsRankingSet = detMode === 'router' ? routerLabels.includes('RANKING_SET') : false;
+
 const detWantsItemList = detMode === 'router' ? routerLabels.includes('ITEM_LIST') : false; // only via router
-const detWantsReviews = detMode === 'router' ? routerLabels.includes('REVIEWS') : false; // only via router
+const detWantsReviews = detMode === 'router'
+  ? (routerLabels.includes('REVIEWS') || routerLabels.includes('RATING_SUMMARY'))
+  : false; // only via router
+
+const detWantsFx = detMode === 'router' ? routerLabels.includes('FX_RATE') : false;
+const detWantsPriceMain = detMode === 'router' ? routerLabels.includes('PRICE_MAIN') : false;
+const detWantsPriceAny = detMode === 'router' ? (routerLabels.includes('PRICE_ANY') || routerLabels.includes('PRICE')) : false;
+const detWantsAvailability = detMode === 'router' ? routerLabels.includes('AVAILABILITY') : false;
+const detWantsAnnouncement = detMode === 'router' ? routerLabels.includes('ANNOUNCEMENT_NEWS') : false;
 
 const detWantsDiff =
   ((detMode === 'router')
@@ -2075,28 +2576,85 @@ const detWantsDiff =
     : false)
   || intents?.wants?.new_item;
 
-// Ranking prompts: stable evidence without LLM selection.
-if (DEFAULT_DETERMINISTIC_RANKING && detWantsRanking) {
-  return deterministicSelectRankingEvidence(chunksWithCandidates, {
-    intents,
-    maxItemsTotal: Number.isFinite(maxItemsTotal) ? maxItemsTotal : undefined,
-  });
-}
+// --- Router-labeled deterministic modes (no second LLM call) ---
+if (detMode === 'router') {
+  // Ranking SET: ignore order (stable by product key).
+  if (DEFAULT_DETERMINISTIC_RANKING && detWantsRankingSet) {
+    return deterministicSelectRankingSetEvidence(chunksWithCandidates, {
+      intents,
+      maxItemsTotal: Number.isFinite(maxItemsTotal) ? maxItemsTotal : undefined,
+    });
+  }
 
-// Full item list evidence (stable, complete rows with details).
-// Used when router assigned ITEM_LIST.
-if (DEFAULT_DETERMINISTIC_ITEM_LIST && detWantsItemList && !detWantsRanking) {
-  const maxTotal = Number.isFinite(maxItemsTotal)
-    ? maxItemsTotal
-    : (detWantsDiff ? DEFAULT_MAX_ITEMS_TOTAL_ITEM_LIST_DIFF : DEFAULT_MAX_ITEMS_TOTAL_ITEM_LIST);
-  return deterministicSelectNewItemEvidence(chunksWithCandidates, { maxItemsTotal: maxTotal });
-}
+  // Ranking ORDER: keep order (stable by rank index).
+  if (DEFAULT_DETERMINISTIC_RANKING && detWantsRankingOrder) {
+    return deterministicSelectRankingEvidence(chunksWithCandidates, {
+      intents,
+      maxItemsTotal: Number.isFinite(maxItemsTotal) ? maxItemsTotal : undefined,
+    });
+  }
 
-// Reviews/ratings monitoring prompts: stable evidence lines with rating + counts.
-// Used when router assigned REVIEWS.
-if (DEFAULT_DETERMINISTIC_REVIEWS && detWantsReviews) {
-  const maxTotal = Number.isFinite(maxItemsTotal) ? maxItemsTotal : DEFAULT_MAX_ITEMS_TOTAL_REVIEWS;
-  return deterministicSelectReviewsEvidence(chunksWithCandidates, { intents, maxItemsTotal: maxTotal });
+  // FX rates
+  if (detWantsFx) {
+    const maxTotal = Number.isFinite(maxItemsTotal) ? maxItemsTotal : 10;
+    return deterministicSelectFxEvidence(chunksWithCandidates, { intents, maxItemsTotal: maxTotal });
+  }
+
+  // Prices
+  if (detWantsPriceMain || detWantsPriceAny) {
+    const maxTotal = Number.isFinite(maxItemsTotal) ? maxItemsTotal : (detWantsPriceMain ? 4 : 10);
+    return deterministicSelectPriceEvidence(chunksWithCandidates, {
+      intents,
+      maxItemsTotal: maxTotal,
+      mainOnly: detWantsPriceMain && !detWantsPriceAny,
+    });
+  }
+
+  // Availability
+  if (detWantsAvailability) {
+    const maxTotal = Number.isFinite(maxItemsTotal) ? maxItemsTotal : 8;
+    return deterministicSelectAvailabilityEvidence(chunksWithCandidates, { intents, maxItemsTotal: maxTotal });
+  }
+
+  // Full item list evidence (stable, complete rows with details).
+  if (DEFAULT_DETERMINISTIC_ITEM_LIST && detWantsItemList) {
+    const maxTotal = Number.isFinite(maxItemsTotal)
+      ? maxItemsTotal
+      : (detWantsDiff ? DEFAULT_MAX_ITEMS_TOTAL_ITEM_LIST_DIFF : DEFAULT_MAX_ITEMS_TOTAL_ITEM_LIST);
+    return deterministicSelectNewItemEvidence(chunksWithCandidates, {
+      maxItemsTotal: maxTotal,
+      intents,
+      logger: trace?.logger,
+    });
+  }
+
+  // Reviews/ratings monitoring prompts: stable evidence lines with rating + counts.
+  if (DEFAULT_DETERMINISTIC_REVIEWS && detWantsReviews) {
+    const maxTotal = Number.isFinite(maxItemsTotal) ? maxItemsTotal : DEFAULT_MAX_ITEMS_TOTAL_REVIEWS;
+    return deterministicSelectReviewsEvidence(chunksWithCandidates, { intents, maxItemsTotal: maxTotal });
+  }
+
+  // Announcement/news or diff-like prompts: broad stable pool for comparison.
+  if (DEFAULT_DETERMINISTIC_NEW_ITEM && (detWantsDiff || detWantsAnnouncement) && !detWantsItemList) {
+    const maxTotal = Number.isFinite(maxItemsTotal)
+      ? maxItemsTotal
+      : DEFAULT_MAX_ITEMS_TOTAL_NEW_ITEM;
+    return deterministicSelectNewItemEvidence(chunksWithCandidates, {
+      maxItemsTotal: maxTotal,
+      intents,
+      logger: trace?.logger,
+    });
+  }
+
+  // If router returned labels but none matched a dedicated deterministic mode,
+  // still avoid a second LLM call: pick best candidates deterministically.
+  if (routerHasLabels) {
+    const out = fallbackSelectCandidatesDeterministic(chunksWithCandidates, intents, {
+      maxItemsTotal: Number.isFinite(maxItemsTotal) ? maxItemsTotal : DEFAULT_MAX_ITEMS_TOTAL,
+    });
+    if (out?.meta) out.meta.llmFailed = false;
+    return out;
+  }
 }
 
 // Provide a broad, stable pool of product rows so the judge can compare snapshots.
@@ -2104,9 +2662,13 @@ if (DEFAULT_DETERMINISTIC_REVIEWS && detWantsReviews) {
 // Diff-oriented prompts ("co nowego", "co się zmieniło", "czy potaniało"):
 // Provide a broad, stable pool of product rows so the judge can compare snapshots.
 
-if (DEFAULT_DETERMINISTIC_NEW_ITEM && detWantsDiff && !detWantsRanking && !detWantsItemList) {
+if (DEFAULT_DETERMINISTIC_NEW_ITEM && detWantsDiff && !detWantsRankingOrder && !detWantsRankingSet && !detWantsItemList) {
   const maxTotal = Number.isFinite(maxItemsTotal) ? maxItemsTotal : DEFAULT_MAX_ITEMS_TOTAL_NEW_ITEM;
-  return deterministicSelectNewItemEvidence(chunksWithCandidates, { maxItemsTotal: maxTotal });
+  return deterministicSelectNewItemEvidence(chunksWithCandidates, {
+    maxItemsTotal: maxTotal,
+    intents,
+    logger: trace?.logger,
+  });
 }
 
 // 2) Ask LLM to select candidate IDs.
@@ -2220,7 +2782,7 @@ Wynik: WYŁĄCZNIE JSON zgodny ze schematem. Dla KAŻDEGO podanego chunka zwró�
     if (finalRelevant && !focusChunkIds.includes(chunkId)) focusChunkIds.push(chunkId);
 
     // Enforce total max items + per-chunk max again (defensive)
-    const already = selectedPerChunk.get(chunkId) || 0;
+    let already = selectedPerChunk.get(chunkId) || 0;
     for (const cid of validChosen) {
       if (items.length >= totalMax) break;
       if ((selectedPerChunk.get(chunkId) || 0) >= perChunkMax) break;
@@ -2230,7 +2792,7 @@ Wynik: WYŁĄCZNIE JSON zgodny ze schematem. Dla KAŻDEGO podanego chunka zwró�
         const evidId = `evidence#${cid}`;
         items.push({ id: evidId, chunk_id: chunkId, quote: info.quote });
         if (Number.isFinite(info.rank)) evidenceRank.set(evidId, info.rank);
-        selectedPerChunk.set(chunkId, already + 1);
+        selectedPerChunk.set(chunkId, ++already);
       }
     }
   }
@@ -2252,6 +2814,10 @@ Wynik: WYŁĄCZNIE JSON zgodny ze schematem. Dla KAŻDEGO podanego chunka zwró�
     });
   } else {
     items.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  }
+
+  if (items.length === 0) {
+    logEmptyEvidence(trace?.logger, 'llm_no_items', chunksWithCandidates);
   }
 
   return { items, focusChunkIds, byChunk };
