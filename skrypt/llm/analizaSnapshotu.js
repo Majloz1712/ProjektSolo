@@ -46,22 +46,6 @@ function normalizeNumberOrNull(value) {
   return Number.isFinite(n) ? n : null;
 }
 
-function normalizeUniversalData(value) {
-  const arr = Array.isArray(value) ? value : [];
-  const out = [];
-  for (const it of arr) {
-    if (!it || typeof it !== 'object') continue;
-    const key = String(it.key || '').trim();
-    if (!key) continue;
-    out.push({
-      key,
-      label: String(it.label || '').trim() || key,
-      value: String(it.value ?? '').trim() || 'unknown',
-    });
-  }
-  return out;
-}
-
 async function safeInsertAnalysis(doc, { logger, snapshotId } = {}) {
   const log = logger || console;
   try {

@@ -165,19 +165,6 @@ function multisetJaccard(aVals, bVals) {
   return inter / uni;
 }
 
-function tokenSet(text) {
-  const toks = tokenizeNonNumeric(text);
-  return new Set(toks);
-}
-
-function jaccardSet(a, b) {
-  if (!a.size && !b.size) return 1;
-  let inter = 0;
-  for (const x of a) if (b.has(x)) inter++;
-  const uni = a.size + b.size - inter;
-  return uni === 0 ? 1 : inter / uni;
-}
-
 export function buildDeterministicChunksFromText(
   text,
   { source, maxCharsPerChunk, maxLinesPerChunk, overlapLines } = {},

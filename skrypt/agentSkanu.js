@@ -1589,87 +1589,6 @@ if (FORCE_PLUGIN_SCREENSHOT || forcePluginScreenshotForMonitor) {
 
 
 
-function buildCleanSnapshot({
-  extracted,
-  monitorId,
-  targetUrl,
-  finalUrl,
-  mode,
-  blocked,
-  screenshotB64,
-  hash,
-  domPriceText,
-}) {
-  // 1) baza z extractora
-  let price = extracted?.price || null;
-  let currency = extracted?.currency || null;
-
-  // 2) fallback: jeśli extractor nie znalazł ceny, spróbujmy z domPriceText
-  if (!price && domPriceText) {
-    const text = domPriceText.trim();
-
-    const currencyRe = /(zł|pln|eur|€|usd|\$|£)/i;
-    const priceWithCurrRe = /(\d[\d\s.,]*\d?)\s*(zł|pln|eur|€|usd|\$|£)/i;
-    const numberRe = /(\d[\d\s.,]*\d?)/;
-
-    const withCurr = text.match(priceWithCurrRe);
-    if (withCurr) {
-      const valuePart = withCurr[1].trim();
-      const currPart = withCurr[2].trim().toLowerCase();
-
-      price = `${valuePart} ${withCurr[2].trim()}`;
-
-      if (currPart.includes('zł') || currPart === 'pln') currency = 'PLN';
-      else if (currPart.includes('eur') || currPart === '€') currency = 'EUR';
-      else if (currPart.includes('usd') || currPart === '$') currency = 'USD';
-      else if (currPart.includes('£')) currency = 'GBP';
-    } else {
-      // brak waluty – weźmy samą liczbę (np. "9 876" z widgetu Booking)
-      const num = text.match(numberRe);
-      if (num) {
-        price = num[1].trim();
-        // currency zostaje null – LLM sobie poradzi, że to "cena bez waluty"
-      }
-    }
-  }
-
-  const clean = {
-    monitor_id: monitorId,
-    url: targetUrl,
-    final_url: finalUrl,
-    ts: new Date(),
-    mode,
-    blocked: !!blocked,
-    block_reason: blocked ? (extracted?.block_reason || 'BOT_PROTECTION') : null,
-    screenshot_b64: blocked ? screenshotB64 || null : null,
-    hash,
-
-    title: extracted?.title || null,
-    description: extracted?.description || null,
-    text: extracted?.text || null,
-    content_type: extracted?.contentType || null,
-
-    price: price || null,
-    currency: currency || null,
-
-    images: Array.isArray(extracted?.images) ? extracted.images.slice(0, 10) : [],
-    attributes: extracted?.attributes || {},
-
-    extractor: extracted?.extractor || null,
-    confidence: extracted?.confidence || null,
-
-    html_truncated: null,
-
-    // do debugowania – surowy tekst ceny z DOM
-    price_dom_text: domPriceText || null,
-  };
-
-  return clean;
-}
-
-
-
-
 
 function parseSelector(raw) {
   if (!raw) return null;
@@ -1691,33 +1610,6 @@ function normalizeUrl(raw) {
 function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
-
-
-function extractPlainTextFromHtml(html) {
-  if (!html) return null;
-  try {
-    const dom = new JSDOM(html);
-    const doc = dom.window.document;
-    if (!doc || !doc.body) return null;
-
-    // bierzemy tekst z body
-    let text = doc.body.textContent || '';
-
-    // normalizacja białych znaków
-    text = text.replace(/\s+/g, ' ').trim();
-
-    // globalne przycięcie, żeby nie mieć kilkuset KB
-    const MAX_LEN = 20000; // ~20k znaków wystarczy pod LLM-a
-    if (text.length > MAX_LEN) {
-      text = text.slice(0, MAX_LEN);
-    }
-
-    return text || null;
-  } catch {
-    return null;
-  }
-}
-
 
 
 

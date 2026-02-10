@@ -1,43 +1,38 @@
-# Node.js
+# dependencies
 node_modules/
+
+# environment
 .env
+.env.*
+!.env.example
+skrypt/.env
+skrypt/.env.*
+!skrypt/.env.example
+
+# logs
 *.log
-
-# Systemowe
-.DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
-node_modules/
 log*.txt
-*.log
-
-# ignore runtime folders
 logs/
+
+# build/test artifacts
+coverage/
+dist-*/
+build/
+.tmp/
+tmp/
 exports/
 
-# python venv
+# python
 .venv/
 skrypt/.venv/
 __pycache__/
 *.pyc
 
-# logs/exports
-logs/
-exports/
-
-# python venv
-.venv/
-skrypt/.venv/
-
-# python venv
-.venv/
-skrypt/.venv/
-
 # archives
 *.zip
 
-# archives
-*.zip
+# IDE/system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

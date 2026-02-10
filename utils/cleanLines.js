@@ -9,14 +9,6 @@
 
 // NOTE: This module intentionally contains no project-specific imports.
 
-// Structural markers that should survive dedupe/boilerplate filters (used by DOM->clean_lines).
-const STRUCTURAL_MARKERS = new Set(['<PARA>']);
-
-function isStructuralMarker(line) {
-  const v = String(line || '').trim();
-  return STRUCTURAL_MARKERS.has(v);
-}
-
 
 /**
  * Aggressively remove non-content blobs that break LLM analysis:

@@ -551,16 +551,6 @@ function normalizeParagraphSelection(paragraphsLike) {
   return null;
 }
 
-function countParagraphHits(text, allowedSet) {
-  if (!allowedSet || allowedSet.size === 0) return 0;
-  const nums = extractParagraphNumbersFromText(text);
-  let hits = 0;
-  for (const n of nums) {
-    if (allowedSet.has(n)) hits += 1;
-  }
-  return hits;
-}
-
 /**
  * Keep only the paragraphs (and their following lines) whose [Pxxx] id is in allowedSet.
  * A paragraph span is defined as: from its [Pxxx] tag up to (but excluding) the next [Pyyy] tag.

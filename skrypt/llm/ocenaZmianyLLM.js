@@ -114,36 +114,6 @@ function extractReviewsCountFromEvidenceQuotes(quotes) {
   return extractReviewsCountFromText(quotes.join(' '));
 }
 
-const UNIVERSAL_KEYWORDS = {
-  rating: ['ocen', 'rating', 'gwiazdk', 'star'],
-  reviews_count: ['recenz', 'opini', 'review', 'komentarz'],
-  main_price: ['cen', 'price', 'koszt', 'pln', 'zł'],
-  delivery: ['dostaw', 'shipping', 'wysyłk'],
-  availability: ['dostęp', 'stock', 'availability', 'stan'],
-  seller: ['sprzed', 'seller', 'merchant', 'sklep'],
-};
-
-function promptMentions(promptLower, keywords) {
-  return keywords.some((k) => promptLower.includes(k));
-}
-
-function userCaresAboutKey(userPrompt, key) {
-  const p = String(userPrompt || '').toLowerCase();
-  if (!p) return false;
-  if (p.includes(String(key).toLowerCase())) return true;
-  const kw = UNIVERSAL_KEYWORDS[key];
-  if (!kw) return false;
-  return promptMentions(p, kw);
-}
-
-function userIgnoresKey(userPrompt, key) {
-  const p = String(userPrompt || '').toLowerCase();
-  if (!p.includes('ignoruj') && !p.includes('pomi')) return false;
-  const kw = UNIVERSAL_KEYWORDS[key];
-  if (!kw) return false;
-  return promptMentions(p, kw);
-}
-
 function normalizeKey(s) {
   return String(s || '').trim();
 }

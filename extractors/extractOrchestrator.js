@@ -409,16 +409,6 @@ function createDocument(html, url) {
   return new JSDOM(html, { url }).window.document;
 }
 
-function isResultAcceptable(result) {
-  if (!result) return false;
-  if (result.confidence < 0.5) return false;
-  const hasKey = KEY_FIELDS.some((field) => {
-    const value = result[field];
-    return typeof value === "string" && value.trim().length > 0;
-  });
-  return hasKey;
-}
-
 function fallbackExtraction(doc, url) {
   const title = normalizeWhitespace(
     doc.querySelector("title")?.textContent || "",
