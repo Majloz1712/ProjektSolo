@@ -1,11 +1,14 @@
 {
   "name": "inzynierka",
   "version": "1.0.0",
-  "description": "Test inicjazlizacji gita",
+  "description": "System monitorowania zmian treści i powiadomień",
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "node scripts/testExtractors.js && node --test test/*.test.js"
+    "start": "node skrypt/serwerStart.js",
+    "start:agent": "node skrypt/agentSkanu.js",
+    "start:worker": "node skrypt/workerPowiadomien.js",
+    "test": "node --test"
   },
   "repository": {
     "type": "git",
@@ -19,8 +22,6 @@
   },
   "homepage": "https://github.com/TardnoobiS/Inzynierka-2025#readme",
   "dependencies": {
-    "20": "^3.1.9",
-    "@mongodb-js/saslprep": "^1.3.2",
     "@mozilla/readability": "^0.6.0",
     "bcryptjs": "^3.0.2",
     "dotenv": "^17.2.3",
@@ -28,16 +29,12 @@
     "jsdom": "^27.0.1",
     "jsonwebtoken": "^9.0.2",
     "mongodb": "^6.20.0",
-    "mongoose": "^8.18.1",
     "nodemailer": "^7.0.11",
-    "nvm": "^0.0.4",
     "p-queue": "^9.0.0",
-    "p-timeout": "^7.0.1",
     "pg": "^8.16.3",
     "puppeteer": "^24.26.1",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-anonymize-ua": "^2.4.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "tesseract.js": "^7.0.0"
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
   }
 }
