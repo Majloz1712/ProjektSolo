@@ -754,7 +754,8 @@ function detectPromptIntents(userPrompt) {
   );
 
   const wants = {
-    price: /\b(cen|price|koszt|pln|zł|zl|€|\$)\b/.test(p),
+    // Accept Polish inflections: cena/ceny/cenie/cenę etc.
+    price: /\b(cen\w*|price|koszt\w*|pln|zł|zl|€|\$)\b/.test(p),
     reviews: hasReviewIntent,
     first_paragraph: /\b(pierwszy\s+akapit|1\.?\s+akapit|first\s+paragraph)\b/.test(p),
     list_items: /\b(lista|pozycj|elementy\s+listy|produkty|wyniki|katalog|asortyment)\b/.test(p),
@@ -2146,9 +2147,10 @@ if (DEFAULT_LLM_ROUTER_ENABLED && prompt) {
 const routerHasLabels = routerUsed && routerOk && Array.isArray(routerLabels) && routerLabels.length > 0;
 
 // Decide determinism mode:
-// - router enabled: only run shortcuts when router assigned labels
-// - router disabled: keep previous heuristic-based behavior
-const detMode = DEFAULT_LLM_ROUTER_ENABLED ? (routerHasLabels ? 'router' : 'none') : 'heuristic';
+// - router enabled + labels: use router labels
+// - router enabled + no labels: fall back to prompt heuristics (prevents empty/random selections)
+// - router disabled: keep heuristic behavior
+const detMode = DEFAULT_LLM_ROUTER_ENABLED ? (routerHasLabels ? 'router' : 'heuristic') : 'heuristic';
 
 // In router mode rely on labels, but accept a generic LIST alias too.
 const detWantsRanking = detMode === 'router'
@@ -2316,7 +2318,7 @@ Wynik: WYŁĄCZNIE JSON zgodny ze schematem. Dla KAŻDEGO podanego chunka zwró�
     if (finalRelevant && !focusChunkIds.includes(chunkId)) focusChunkIds.push(chunkId);
 
     // Enforce total max items + per-chunk max again (defensive)
-    const already = selectedPerChunk.get(chunkId) || 0;
+    let already = selectedPerChunk.get(chunkId) || 0;
     for (const cid of validChosen) {
       if (items.length >= totalMax) break;
       if ((selectedPerChunk.get(chunkId) || 0) >= perChunkMax) break;
@@ -2326,7 +2328,7 @@ Wynik: WYŁĄCZNIE JSON zgodny ze schematem. Dla KAŻDEGO podanego chunka zwró�
         const evidId = `evidence#${cid}`;
         items.push({ id: evidId, chunk_id: chunkId, quote: info.quote });
         if (Number.isFinite(info.rank)) evidenceRank.set(evidId, info.rank);
-        selectedPerChunk.set(chunkId, already + 1);
+        selectedPerChunk.set(chunkId, ++already);
       }
     }
   }
