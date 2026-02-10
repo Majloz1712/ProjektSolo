@@ -6,8 +6,6 @@ Szczegółowy opis wszystkich plików w repozytorium. Ścieżki są pogrupowane 
 - `README.md` – ogólny opis monorepo, szybki start oraz odnośniki do kluczowych komponentów i dokumentacji architektury.
 - `package.json` – manifest npm z zależnościami (Express, Puppeteer, JSDOM, bcrypt, nodemailer) oraz skryptem `npm test` uruchamiającym sprawdzenie ekstraktorów.
 - `package-lock.json` – zamrożone wersje zależności npm dla deterministycznych instalacji.
-- `readme.txt` – krótka notatka inicjalizacyjna repozytorium git.
-- `struktura_czysta.txt` – tekstowy zrzut struktury katalogów z wczesnego etapu projektu.
 
 ## `docs/`
 - `architecture.md` – przekrojowy opis architektury (pipeline ekstrakcji, API Express, plugin, LLM, powiadomienia).
@@ -31,7 +29,7 @@ Szczegółowy opis wszystkich plików w repozytorium. Ścieżki są pogrupowane 
 - `testExtractors.js` – prosty runner testowy wywołujący `fetchAndExtract` na kilku przykładowych stronach (wiki, sklep, strona statyczna) i wypisujący wyniki.
 
 ## `skrypt/` – backend, agent i logika LLM
-- `.env` – przykładowa konfiguracja środowiska dla Postgresa/Mongo/portu serwera Express.
+- `.env.example` – szablon konfiguracji środowiska dla Postgresa/Mongo/portu serwera Express i usług pomocniczych.
 - `serwerStart.js` – uruchamia Express, podpina połączenia PG/Mongo do `req`, montuje route'y `/auth`, `/api/monitory`, `/api/plugin-tasks`, serwuje statyczne pliki i startuje serwer na porcie 3001.
 - `polaczeniePG.js` – konfiguracja puli połączeń do Postgresa na podstawie zmiennych `.env`.
 - `polaczenieMDB.js` – klient MongoDB i funkcje `connectMongo`/`getDb` z prostym cachem połączenia.

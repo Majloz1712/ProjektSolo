@@ -47,7 +47,7 @@ Dokument opisuje, jak poszczególne komponenty repozytorium współpracują ze s
   - chroni strony inne niż publiczne (`logowanie.html`, `rejestracja.html`, `resetHasla.html`) przed dostępem bez tokenu.
 
 ## 8. Wymagane zmienne środowiskowe
-Umieść je w `skrypt/.env` (plik `.env` w repo jest przykładowy):
+Umieść je w `skrypt/.env` (szablon znajdziesz w `skrypt/.env.example`):
 - `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE` – dostęp do Postgresa.
 - `MONGO_URI`, `MONGO_DB` – dostęp do MongoDB.
 - `JWT_SECRET`, opcjonalnie `JWT_EXPIRES` – podpis JWT.
