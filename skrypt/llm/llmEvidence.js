@@ -2042,7 +2042,7 @@ const promptKeywords = extractPromptKeywords(prompt);
 
 // Optional: use LLM router to assign labels to the prompt.
 // If router returns labels, we may run deterministic evidence modes (ranking/item-list/new-item).
-// If router returns NO labels, we intentionally skip deterministic shortcuts and fallback to classic LLM evidence selection.
+// If router returns NO labels, we skip deterministic shortcuts and fall back to classic LLM evidence selection (LLM picks evidence).
 let routerUsed = false;
 let routerLabels = [];
 let routerOk = false;
@@ -2148,9 +2148,9 @@ const routerHasLabels = routerUsed && routerOk && Array.isArray(routerLabels) &&
 
 // Decide determinism mode:
 // - router enabled + labels: use router labels
-// - router enabled + no labels: fall back to prompt heuristics (prevents empty/random selections)
+// - router enabled + no labels: disable deterministic shortcuts -> let LLM choose evidence
 // - router disabled: keep heuristic behavior
-const detMode = DEFAULT_LLM_ROUTER_ENABLED ? (routerHasLabels ? 'router' : 'heuristic') : 'heuristic';
+const detMode = DEFAULT_LLM_ROUTER_ENABLED ? (routerHasLabels ? 'router' : 'none') : 'heuristic';
 
 // In router mode rely on labels, but accept a generic LIST alias too.
 const detWantsRanking = detMode === 'router'
