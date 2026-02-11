@@ -1,43 +1,34 @@
-# Node.js
+# Dependencies
 node_modules/
+
+# Environment files
 .env
+.env.*
+!.env.example
+
+# Logs
 *.log
-
-# Systemowe
-.DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
-node_modules/
 log*.txt
-*.log
-
-# ignore runtime folders
 logs/
-exports/
 
-# python venv
+# Build/test artifacts
+coverage/
+dist/
+build/
+exports/
+tmp/
+
+# Python artifacts (OCR helper)
 .venv/
 skrypt/.venv/
 __pycache__/
 *.pyc
 
-# logs/exports
-logs/
-exports/
+# System / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
 
-# python venv
-.venv/
-skrypt/.venv/
-
-# python venv
-.venv/
-skrypt/.venv/
-
-# archives
-*.zip
-
-# archives
+# Archives
 *.zip
