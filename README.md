@@ -58,3 +58,8 @@ Podstawowe zmienne (pełna lista startowa w `.env.example`):
 - `strona/` — statyczne widoki HTML panelu użytkownika.
 - `styl/` — arkusze CSS frontendu.
 - `utils/` — funkcje pomocnicze (normalizacja, retry, czyszczenie tekstu).
+
+## Dokumentacja techniczna
+
+- Szczegółowa dokumentacja architektury, API, komunikacji i modułów: `docs/ARCHITEKTURA_API_KOMUNIKACJA.md`
+- Pełny inwentarz funkcji (auto-zebrany z kodu): `docs/FUNCTION_INVENTORY.md`
