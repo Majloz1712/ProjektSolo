@@ -1,4 +1,4 @@
-# ProjektSolo
+# Trackly
 
 System monitorowania zmian na stronach WWW: backend Express + panel web + agent skanujący + pipeline analizy zmian (LLM/OCR) + worker powiadomień e-mail.
 
