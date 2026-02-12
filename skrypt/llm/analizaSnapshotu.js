@@ -347,56 +347,62 @@ export async function ensureSnapshotAnalysis(snapshotRef, options = {}) {
   // Evidence extraction for judge: for the given user prompt, extract SHORT verbatim quotes
   // from chunk texts. This runs regardless of whether a change is "important" – it is just
   // building a compact, prompt-specific view of the snapshot.
-  let evidenceV1 = null;
-  let promptChunksV1 = null;
-  if (normalizedUserPrompt) {
-    try {
-      const chunkDoc = await ensureSnapshotChunks(snapshot, {
-        logger: log,
-        chunkTemplate: chunkTemplate || null,
-      });
 
-      const chunks = Array.isArray(chunkDoc?.chunks) ? chunkDoc.chunks : [];
-      if (chunks.length) {
-        const ev = await extractEvidenceFromChunksLLM({
-          model: OLLAMA_MODEL,
-          userPrompt: normalizedUserPrompt,
-          chunks,
-          maxQuotesPerChunk: 30,
-          maxQuoteChars: 300,
-          timeoutMs: Number(process.env.LLM_EVIDENCE_TIMEOUT_MS || 40000),
-          trace: {
-            snapshotId: String(snapshot?._id || ''),
-            monitorId: String(snapshot?.monitor_id || ''),
-          },
-        });
+let evidenceV1 = null;
+let promptChunksV1 = null;
 
-        evidenceV1 = {
-          version: 'evidence_v1',
-          promptHash: userPromptHash,
-          source: chunkDoc?.source || null,
-          model: OLLAMA_MODEL,
-          createdAt: new Date(),
-          // [{ quote, chunk_id }]
-          items: ev.items,
-          // { [chunkId]: boolean }
-          chunk_relevance: ev.byChunk,
-        };
+// Evidence extraction for judge:
+// - With user prompt: extract prompt-relevant short quotes.
+// - Without user prompt: Option A (paragraphs) is handled inside llmEvidence.js (deterministic).
+try {
+  const chunkDoc = await ensureSnapshotChunks(snapshot, {
+    logger: log,
+    chunkTemplate: chunkTemplate || null,
+  });
 
-        promptChunksV1 = {
-          version: 'prompt_chunks_v1',
-          promptHash: userPromptHash,
-          source: chunkDoc?.source || null,
-          focus_chunk_ids: ev.focusChunkIds,
-        };
-      }
-    } catch (err) {
-      log?.warn?.('snapshot_evidence_failed', {
+  const chunks = Array.isArray(chunkDoc?.chunks) ? chunkDoc.chunks : [];
+  if (chunks.length) {
+    const ev = await extractEvidenceFromChunksLLM({
+      model: OLLAMA_MODEL,
+      userPrompt: normalizedUserPrompt || '',
+      chunks,
+      maxQuotesPerChunk: 30,
+      maxQuoteChars: 300,
+      timeoutMs: Number(process.env.LLM_EVIDENCE_TIMEOUT_MS || 40000),
+      trace: {
         snapshotId: String(snapshot?._id || ''),
-        err: err?.message || String(err),
-      });
+        monitorId: String(snapshot?.monitor_id || ''),
+      },
+    });
+
+    evidenceV1 = {
+      version: 'evidence_v1',
+      promptHash: userPromptHash,
+      source: chunkDoc?.source || null,
+      model: OLLAMA_MODEL,
+      createdAt: new Date(),
+      // [{ quote, chunk_id }]
+      items: ev.items,
+      // { [chunkId]: { relevant: boolean, chosen: string[] } }
+      chunk_relevance: ev.byChunk,
+    };
+
+    // Keep prompt_chunks_v1 only when the user actually provided a prompt (to avoid mislabeling).
+    if (normalizedUserPrompt) {
+      promptChunksV1 = {
+        version: 'prompt_chunks_v1',
+        promptHash: userPromptHash,
+        source: chunkDoc?.source || null,
+        focus_chunk_ids: ev.focusChunkIds,
+      };
     }
   }
+} catch (err) {
+  log?.warn?.('snapshot_evidence_failed', {
+    snapshotId: String(snapshot?._id || ''),
+    err: err?.message || String(err),
+  });
+}
 
   const doc = {
     zadanieId: String(snapshot.zadanie_id || snapshot.zadanieId || ''),

@@ -12,6 +12,7 @@
 // and prefer out.json when calling Ollama with JSON schema.
 
 import { generateTextWithOllama } from './ollamaClient.js';
+import { extractEvidenceSnippetsFromPair } from './analysisUtils.js';
 import { pool } from '../polaczeniePG.js';
 import { mongoClient } from '../polaczenieMDB.js';
 import { performance } from 'node:perf_hooks';
@@ -49,6 +50,13 @@ function normalizeUserPrompt(value) {
   const prompt = String(value || '').trim();
   return prompt.length ? prompt : null;
 }
+
+
+const DEFAULT_GENERIC_USER_PROMPT =
+  (process.env.JUDGE_GENERIC_USER_PROMPT || '').trim() ||
+  'Wykryj najważniejsze SEMANTYCZNE zmiany na stronie (treść, liczby, ceny, dostępność, listy, daty). ' +
+    'Ignoruj zmiany kosmetyczne (formatowanie, odstępy, kolejność bez zmiany znaczenia).';
+
 
 function extractRatingFromText(text) {
   if (!text) return null;
@@ -112,6 +120,36 @@ function extractReviewsCountFromEvidenceQuotes(quotes) {
     if (v != null) return v;
   }
   return extractReviewsCountFromText(quotes.join(' '));
+}
+
+function normalizeMoneyNumber(val) {
+  if (val == null) return null;
+  const s = String(val).trim().replace(/\s+/g, '');
+  if (!s) return null;
+  // 1 234,56 / 1234.56 / 1234,56
+  const cleaned = s.replace(/\.(?=\d{3}(?:\D|$))/g, '').replace(',', '.');
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Heuristic-but-safe: pull the number that sits next to "trend cenowy" / "historia cen".
+// This is only a HINT for the judge (derivedMetrics).
+function extractTrendPriceFromText(text) {
+  if (!text) return null;
+  const s = String(text);
+  const re = /(?:trend\s*cenowy|historia\s*cen)[^\d]{0,60}(\d{1,6}(?:[\s\u00A0]?\d{3})*(?:[\.,]\d{1,2})?)/i;
+  const m = s.match(re);
+  if (!m) return null;
+  return normalizeMoneyNumber(m[1]);
+}
+
+function extractTrendPriceFromEvidenceQuotes(quotes) {
+  if (!Array.isArray(quotes) || !quotes.length) return null;
+  for (const q of quotes) {
+    const v = extractTrendPriceFromText(q);
+    if (v != null) return v;
+  }
+  return extractTrendPriceFromText(quotes.join(' '));
 }
 
 const UNIVERSAL_KEYWORDS = {
@@ -346,7 +384,7 @@ function mapEvidenceUsedQuotesToIds(evidenceUsed, quoteToId) {
 }
 
 async function judgeImportanceWithLLM(
-  { userPrompt, prevSummary, newSummary, diffMetrics },
+  { userPrompt, prevSummary, newSummary, diffMetrics, genericPromptUsed = false },
   { logger } = {}
 ) {
   const log = logger || console;
@@ -367,7 +405,42 @@ async function judgeImportanceWithLLM(
     beforeNormSet.size === afterNormSet.size &&
     [...beforeNormSet].every((x) => afterNormSet.has(x));
 
-  if (setsEqual) {
+
+
+  const summaryChanged =
+    String(prevSummary || '').replace(/\s+/g, ' ').trim().toLowerCase() !==
+    String(newSummary || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+  const hasNonEvidenceSignals = (() => {
+    if (!genericPromptUsed) return false;
+
+    const dm = diffMetrics || {};
+    const ud = dm.universalDataDiff || null;
+    if (ud && ud.any === true) return true;
+    if (dm.universalDataChanged === true) return true;
+
+    const price = dm.price;
+    if (
+      price &&
+      (price.absChange != null
+        ? Number(price.absChange) !== 0
+        : price.oldVal != null && price.newVal != null && price.oldVal !== price.newVal)
+    ) {
+      return true;
+    }
+
+    if (dm.screenshotChanged === true) return true;
+    if (dm.pluginPricesChanged === true) return true;
+
+    if (dm.textChunkDiff && dm.textChunkDiff.significant === true) return true;
+
+    if (typeof dm.textDiffScore === 'number' && dm.textDiffScore > 0.001) return true;
+    if (typeof dm.ocrTextDiffScore === 'number' && dm.ocrTextDiffScore > 0.001) return true;
+
+    return false;
+  })();
+
+  if (setsEqual && (!genericPromptUsed || (!summaryChanged && !hasNonEvidenceSignals))) {
     return {
       prompt: null,
       raw: null,
@@ -394,16 +467,56 @@ async function judgeImportanceWithLLM(
   const ratingAfter = extractRatingFromEvidenceQuotes(afterQuotes);
   const reviewsCountBefore = extractReviewsCountFromEvidenceQuotes(beforeQuotes);
   const reviewsCountAfter = extractReviewsCountFromEvidenceQuotes(afterQuotes);
+  const trendPriceBefore = extractTrendPriceFromEvidenceQuotes(beforeQuotes);
+  const trendPriceAfter = extractTrendPriceFromEvidenceQuotes(afterQuotes);
 
   const derivedMetrics = {
     rating_before: ratingBefore,
     rating_after: ratingAfter,
     reviews_count_before: reviewsCountBefore,
     reviews_count_after: reviewsCountAfter,
+    trend_price_before: trendPriceBefore,
+    trend_price_after: trendPriceAfter,
   };
 
-  const evidenceTextBefore = evidenceBefore.map((e) => `- ${e.id}: "${e.quote}"`).join('\n');
-  const evidenceTextAfter = evidenceAfter.map((e) => `- ${e.id}: "${e.quote}"`).join('\n');
+  // For very long OCR paragraphs, showing the full text makes the judge miss numeric deltas.
+  // We therefore show 1–2 SHORT verbatim snippets per evidence ID, centered around diffs/numbers.
+  const evidenceTextBeforeLines = [];
+  const evidenceTextAfterLines = [];
+  const pairCount = Math.max(evidenceBefore.length, evidenceAfter.length);
+
+  for (let i = 0; i < pairCount; i++) {
+    const b = evidenceBefore[i];
+    const a = evidenceAfter[i];
+    const btxt = b?.quote ? String(b.quote) : '';
+    const atxt = a?.quote ? String(a.quote) : '';
+
+    const sn = extractEvidenceSnippetsFromPair(btxt, atxt, {
+      windowChars: 180,
+      maxChars: 520,
+      maxSnippets: 2,
+      includeNumbers: true,
+    });
+
+    const bSnips = (sn?.before_snippets || []).filter(Boolean);
+    const aSnips = (sn?.after_snippets || []).filter(Boolean);
+
+    if (b) {
+      const list = bSnips.length ? bSnips : [btxt.slice(0, 520).trim()].filter(Boolean);
+      for (const frag of list.slice(0, 2)) {
+        evidenceTextBeforeLines.push(`- ${b.id}: ${JSON.stringify(frag)}`);
+      }
+    }
+    if (a) {
+      const list = aSnips.length ? aSnips : [atxt.slice(0, 520).trim()].filter(Boolean);
+      for (const frag of list.slice(0, 2)) {
+        evidenceTextAfterLines.push(`- ${a.id}: ${JSON.stringify(frag)}`);
+      }
+    }
+  }
+
+  const evidenceTextBefore = evidenceTextBeforeLines.join('\n');
+  const evidenceTextAfter = evidenceTextAfterLines.join('\n');
 
 const prompt = `
 Jesteś sędzią zmian na stronie.
@@ -421,6 +534,7 @@ Dane (kontekst):
 - newSummary: ${newSummary || '(brak)'}
 
 Dowody (verbatim cytaty wybrane na etapie analizy, pod USER_PROMPT):
+UWAGA: jeśli cytat jest bardzo długi, pokazane są krótkie WYCIĄGI (ciągłe fragmenty) przypięte do tego samego ID.
 BEFORE:
 ${evidenceTextBefore || '- (brak)'}
 AFTER:
@@ -597,7 +711,10 @@ export async function evaluateChangeWithLLM(
   let usedPrompt = null;
   let usedRaw = null;
 
-  if (normalizedUserPrompt) {
+  const effectiveUserPrompt = normalizedUserPrompt || DEFAULT_GENERIC_USER_PROMPT;
+  const genericPromptUsed = !normalizedUserPrompt;
+
+  try {
     const prevSummary = prevAnalysis?.summary || '';
     const newSummary = newAnalysis?.summary || '';
     const diffMetrics = {
@@ -608,15 +725,16 @@ export async function evaluateChangeWithLLM(
 
     const judge = await judgeImportanceWithLLM(
       {
-        userPrompt: normalizedUserPrompt,
+        userPrompt: effectiveUserPrompt,
         prevSummary,
         newSummary,
         diffMetrics,
+        genericPromptUsed,
       },
       { logger: log }
     );
 
-    usedMode = 'judge';
+    usedMode = genericPromptUsed ? 'judge_generic' : 'judge';
     usedPrompt = judge.prompt;
     usedRaw = judge.raw;
 
@@ -628,6 +746,30 @@ export async function evaluateChangeWithLLM(
       short_title: judge.result.important ? 'Zmiana na monitorowanej stronie' : 'Brak istotnej zmiany',
       short_description: judge.result.reason || 'Brak istotnych zmian.',
       llm_fallback_used: judge.result.llm_fallback_used === true,
+    };
+  } catch (err) {
+    log?.warn?.('judge_failed', {
+      monitorId: String(monitorId || ''),
+      zadanieId: String(zadanieId || ''),
+      err: err?.message || String(err),
+    });
+  }
+
+
+
+
+  // Preserve deterministic metric signal (rating/reviews) even when we run the generic judge.
+  // This avoids missing metric-only changes when evidence is empty or unchanged.
+  const detMetric = buildDeterministicDecision({ mDiff });
+  if (detMetric?.important === true && decision?.important !== true) {
+    decision = {
+      ...decision,
+      important: true,
+      category: 'metric_change',
+      importance_reason: detMetric.reason || decision?.importance_reason || 'Wykryto zmianę metryki liczbowej.',
+      short_title: 'Zmiana metryki na monitorowanej stronie',
+      short_description: detMetric.reason || decision?.short_description || 'Wykryto zmianę metryki liczbowej.',
+      llm_fallback_used: true,
     };
   }
 
@@ -653,7 +795,7 @@ export async function evaluateChangeWithLLM(
     zadanieId,
     url,
     llm_mode: usedMode,
-    model: usedMode === 'judge' ? OLLAMA_MODEL : null,
+    model: usedMode && String(usedMode).startsWith('judge') ? OLLAMA_MODEL : null,
     prompt_used: usedPrompt,
     raw_response: usedRaw,
     llm_decision: decision,

@@ -2075,6 +2075,28 @@ export async function extractEvidenceFromChunksLLM({
     prompt: _shortText(prompt),
   });
 
+  // No-prompt mode (Option A): include ALL paragraph blocks as evidence.
+  // This is deterministic and does NOT use the LLM/router. It relies on chunk texts containing [P n] markers.
+  if (!prompt) {
+    const list = Array.isArray(chunks) ? chunks : [];
+    const allParas = new Set();
+    for (const c of list) {
+      const paras = extractParagraphNumbersFromText(c?.text);
+      for (const p of paras) allParas.add(p);
+    }
+    const paragraphs = Array.from(allParas).sort((a, b) => a - b);
+
+    if (!paragraphs.length) {
+      logger?.info('extract:done', { items: 0, focusChunkIds: [] });
+      return { items: [], focusChunkIds: [], byChunk: {} };
+    }
+
+    const res = deterministicSelectParagraphEvidenceFromChunks(list, paragraphs, { maxItemsTotal });
+    logger?.info('extract:done', { items: res.items.length, focusChunkIds: res.focusChunkIds });
+    return res;
+  }
+
+
   let intents = detectPromptIntents(prompt);
   const promptKeywords = extractPromptKeywords(prompt);
 
@@ -2182,8 +2204,8 @@ export async function extractEvidenceFromChunksLLM({
   const byChunk = {};
   for (const c of chunksWithCandidates) byChunk[c.id] = { relevant: false, chosen: [] };
 
-  if (!prompt || totalCandidates === 0) {
-    if (prompt && totalCandidates === 0) logEmptyEvidence(logger, 'no_candidates', chunksWithCandidates);
+  if (totalCandidates === 0) {
+    logEmptyEvidence(logger, 'no_candidates', chunksWithCandidates);
     logger?.info('extract:done', { items: 0, focusChunkIds: [] });
     return { items: [], focusChunkIds: [], byChunk };
   }
