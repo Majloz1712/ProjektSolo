@@ -350,7 +350,6 @@ export async function runBrowserFlow({ browser, url, mongoDb, monitorId, takeScr
   // wartości zwrotne (żeby return działał nawet jak coś poleci po drodze)
   let html = null;
   let screenshot = null;
-  let domPriceText = null;
   let finalUrl = url;
   let effectiveOk = false;
 
@@ -389,83 +388,6 @@ export async function runBrowserFlow({ browser, url, mongoDb, monitorId, takeScr
       ? await page.screenshot({ type: 'jpeg', quality: 60, fullPage: false })
       : null;
 
-    domPriceText = await page.evaluate(() => {
-      const currencyRe = /(zł|pln|eur|€|usd|\$|£)/i;
-      const priceWithCurrRe = /(\d[\d\s.,]*\d?)\s*(zł|pln|eur|€|usd|\$|£)/i;
-      const numberRe = /(\d[\d\s.,]*\d?)/;
-
-      const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
-      const globalMatch = bodyText.match(priceWithCurrRe);
-      if (globalMatch) return globalMatch[0];
-
-      const candidates = [];
-
-      const addCandidate = (el, reason, opts = {}) => {
-        const { requireCurrency = true } = opts;
-        if (!el) return;
-        const raw = el.textContent || '';
-        const text = raw.replace(/\s+/g, ' ').trim();
-        if (!text) return;
-
-        if (requireCurrency && !currencyRe.test(text)) return;
-        if (!priceWithCurrRe.test(text) && !numberRe.test(text)) return;
-
-        let score = 0;
-        const t = text.toLowerCase();
-        const cls = (el.className || '').toLowerCase();
-        const id = (el.id || '').toLowerCase();
-
-        if (cls.includes('price') || id.includes('price')) score += 3;
-        if (cls.includes('amount') || cls.includes('total')) score += 1;
-        if (t.includes('noc') || t.includes('night') || t.includes('pobyt')) score += 1;
-
-        const len = text.length;
-        if (len < 8) score += 1;
-        if (len > 120) score -= 1;
-
-        if (!currencyRe.test(text) && (cls.includes('price') || id.includes('price'))) score += 1;
-
-        if (/personel|czystość|komfort|lokalizacja|wifi|udogodnienia/i.test(t)) score -= 3;
-
-        candidates.push({ text, score, reason });
-      };
-
-      const strongSelectors = [
-        '[itemprop="price"]',
-        '[data-testid*="price"]',
-        '[class*="price"]',
-        '[id*="price"]',
-        '[aria-label*="price"]',
-        '[aria-label*="cena"]',
-        '[class*="prco-"]',
-        '[class*="bui-price-display"]',
-        '[class*="hprt-price"]',
-      ];
-      strongSelectors.forEach((sel) => {
-        document.querySelectorAll(sel).forEach((el) =>
-          addCandidate(el, `selector:${sel}`, { requireCurrency: false }),
-        );
-      });
-
-      if (!candidates.length) {
-        const all = Array.from(document.querySelectorAll('span,div,strong,b,p'));
-        for (const el of all) {
-          const raw = el.textContent || '';
-          const text = raw.replace(/\s+/g, ' ').trim();
-          if (!text) continue;
-          if (text.length < 4 || text.length > 120) continue;
-          if (!currencyRe.test(text)) continue;
-          addCandidate(el, 'fallback_generic', { requireCurrency: true });
-        }
-      }
-
-      if (candidates.length) {
-        candidates.sort((a, b) => b.score - a.score);
-        return candidates[0].text;
-      }
-      return null;
-    });
-
     finalUrl = page.url();
 
     // persist sesji – best effort
@@ -473,7 +395,7 @@ export async function runBrowserFlow({ browser, url, mongoDb, monitorId, takeScr
       await persistSession(page, mongoDb, { monitorId, origin });
     } catch (_) {}
 
-    return { ok: effectiveOk, html, screenshot, finalUrl, domPriceText };
+    return { ok: effectiveOk, html, screenshot, finalUrl };
   } finally {
     // NAJWAŻNIEJSZE: strona ma się zawsze zamknąć
     if (page) {
@@ -694,13 +616,13 @@ async function withPg(fn) {
 
 // ===== plugin tasks helper (3-ci tryb) =====
 
-// Dodawanie zadania dla pluginu (fallback / price_only / plugin_screenshot)
+// Dodawanie zadania dla pluginu (fallback / plugin_screenshot)
 // Dedup: nie twórz kolejnego taska, jeśli dla tego monitora i trybu już jest pending albo in_progress
 async function createPluginTask({
   monitorId,
   taskId,
   url,
-  mode = 'fallback', // 'fallback' | 'price_only' | 'plugin_screenshot'
+  mode = 'fallback', // 'fallback' | 'plugin_screenshot'
 }) {
   if (!monitorId || !taskId || !url) return;
 
@@ -884,27 +806,6 @@ async function loadMonitor(pg, monitorId) {
   );
   if (!rows.length) return null;
   return rows[0];
-}
-
-function isPriceMissing(extracted) {
-  if (!extracted) return true;
-  if (extracted.price === undefined || extracted.price === null || extracted.price === '') {
-    return true;
-  }
-  // w przyszłości możesz tu dodać np. extracted.attributes.price itp.
-  return false;
-}
-
-// Na podstawie llm_prompt monitora sprawdzamy,
-// czy użytkownik oczekuje monitorowania CENY.
-function wantsPricePlugin(monitor) {
-  const prompt = (monitor.llm_prompt || '').toString();
-
-  // szukamy słowa "cena" lub "price" jako osobnego słowa (case-insensitive)
-  if (/\bcena\b/i.test(prompt)) return true;
-  if (/\bprice\b/i.test(prompt)) return true;
-
-  return false;
 }
 
 
@@ -1178,9 +1079,6 @@ async function processTask(task) {
     const targetUrl = normalizeUrl(monitor.url);
     const selector = parseSelector(monitor.css_selector);
     const mongoDb = await ensureMongo();
-
-    // Czy użytkownik ewidentnie oczekuje ceny? (llm_prompt zawiera "cena"/"price")
-    const monitorWantsPrice = wantsPricePlugin(monitor);
     const monitorScanMode = normalizeTrybSkanu(monitor.tryb_skanu);
     const forcePluginScreenshotForMonitor = (monitorScanMode === 'screenshot');
 
@@ -1190,7 +1088,7 @@ async function processTask(task) {
     // ===== 0) WYMUSZENIE "OSTATNIEJ DESKI RATUNKU" – PRZEZ PLUGIN CHROME =====
     // To NIE uruchamia Puppeteera. Zamiast tego:
     // - tworzymy "pusty" snapshot (żeby plugin mógł go wzbogacić po zadanie_id)
-    // - tworzymy plugin_task (price_only lub fallback)
+    // - tworzymy plugin_task (plugin_screenshot)
     // - kończymy zadanie odpowiednim statusem
 if (FORCE_PLUGIN_SCREENSHOT || forcePluginScreenshotForMonitor) {
   const now = new Date();
@@ -1356,7 +1254,7 @@ if (FORCE_PLUGIN_SCREENSHOT || forcePluginScreenshotForMonitor) {
     }
 
     // ===== 2.5) TOTALNA PORAŻKA HTML/BLOKADA → tryb plugin Fallback =====
-    if (!monitorWantsPrice && (!html || blocked)) {
+    if (!html || blocked) {
       await createPluginTask({
         monitorId,
         taskId,
@@ -1441,7 +1339,7 @@ if (FORCE_PLUGIN_SCREENSHOT || forcePluginScreenshotForMonitor) {
     }
 
     // ===== 3.5) BOT PROTECTION mimo wszystko =====
-    if (blocked && !monitorWantsPrice) {
+    if (blocked) {
       if (
         POLICY.cookieScreenshotOnBlock
         && mode === 'static'
@@ -1480,36 +1378,8 @@ if (FORCE_PLUGIN_SCREENSHOT || forcePluginScreenshotForMonitor) {
       return;
     }
 
-    // ===== 4) PRICE-ONLY: brak ceny, ale user w promptcie zaznaczył "CENA" =====
-    const shouldCreatePriceOnlyTask =
-      monitorWantsPrice && isPriceMissing(extracted);
-
-    if (shouldCreatePriceOnlyTask) {
-      try {
-        await createPluginTask({
-          monitorId,
-          taskId,
-          url: targetUrl,
-          mode: 'price_only',
-        });
-        log.info('price_only_plugin_task_created', {
-          monitorId,
-          zadanieId: taskId,
-        });
-        console.log(
-          `[task] monitor=${monitorId} task=${taskId} -> plugin_task(mode=price_only) created (missing price, llm_prompt wants price)`,
-        );
-      } catch (err) {
-        log.warn('price_only_plugin_task_failed', {
-          monitorId,
-          zadanieId: taskId,
-          error: err?.message || String(err),
-        });
-      }
-    }
-
-    // Jeśli NIE tworzymy price_only i mamy snapshot → odpal pipeline LLM
-    if (!shouldCreatePriceOnlyTask && snapshot) {
+    // ===== 4) PIPELINE LLM (ocena zmian + zapis decyzji) =====
+    if (snapshot) {
       try {
         await handleNewSnapshot(snapshot, { logger: log, userPrompt: monitor.llm_prompt || null });
       } catch (err) {
@@ -1583,88 +1453,6 @@ if (FORCE_PLUGIN_SCREENSHOT || forcePluginScreenshotForMonitor) {
   } finally {
     try { logger?.close?.(); } catch (_) {}
   }
-}
-
-
-
-
-
-function buildCleanSnapshot({
-  extracted,
-  monitorId,
-  targetUrl,
-  finalUrl,
-  mode,
-  blocked,
-  screenshotB64,
-  hash,
-  domPriceText,
-}) {
-  // 1) baza z extractora
-  let price = extracted?.price || null;
-  let currency = extracted?.currency || null;
-
-  // 2) fallback: jeśli extractor nie znalazł ceny, spróbujmy z domPriceText
-  if (!price && domPriceText) {
-    const text = domPriceText.trim();
-
-    const currencyRe = /(zł|pln|eur|€|usd|\$|£)/i;
-    const priceWithCurrRe = /(\d[\d\s.,]*\d?)\s*(zł|pln|eur|€|usd|\$|£)/i;
-    const numberRe = /(\d[\d\s.,]*\d?)/;
-
-    const withCurr = text.match(priceWithCurrRe);
-    if (withCurr) {
-      const valuePart = withCurr[1].trim();
-      const currPart = withCurr[2].trim().toLowerCase();
-
-      price = `${valuePart} ${withCurr[2].trim()}`;
-
-      if (currPart.includes('zł') || currPart === 'pln') currency = 'PLN';
-      else if (currPart.includes('eur') || currPart === '€') currency = 'EUR';
-      else if (currPart.includes('usd') || currPart === '$') currency = 'USD';
-      else if (currPart.includes('£')) currency = 'GBP';
-    } else {
-      // brak waluty – weźmy samą liczbę (np. "9 876" z widgetu Booking)
-      const num = text.match(numberRe);
-      if (num) {
-        price = num[1].trim();
-        // currency zostaje null – LLM sobie poradzi, że to "cena bez waluty"
-      }
-    }
-  }
-
-  const clean = {
-    monitor_id: monitorId,
-    url: targetUrl,
-    final_url: finalUrl,
-    ts: new Date(),
-    mode,
-    blocked: !!blocked,
-    block_reason: blocked ? (extracted?.block_reason || 'BOT_PROTECTION') : null,
-    screenshot_b64: blocked ? screenshotB64 || null : null,
-    hash,
-
-    title: extracted?.title || null,
-    description: extracted?.description || null,
-    text: extracted?.text || null,
-    content_type: extracted?.contentType || null,
-
-    price: price || null,
-    currency: currency || null,
-
-    images: Array.isArray(extracted?.images) ? extracted.images.slice(0, 10) : [],
-    attributes: extracted?.attributes || {},
-
-    extractor: extracted?.extractor || null,
-    confidence: extracted?.confidence || null,
-
-    html_truncated: null,
-
-    // do debugowania – surowy tekst ceny z DOM
-    price_dom_text: domPriceText || null,
-  };
-
-  return clean;
 }
 
 

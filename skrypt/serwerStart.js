@@ -92,4 +92,3 @@ connectMongo()
     console.error('❌ Błąd połączenia z MongoDB:', err);
     process.exit(1);
   });
-

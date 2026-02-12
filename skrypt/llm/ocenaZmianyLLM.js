@@ -405,8 +405,13 @@ async function judgeImportanceWithLLM(
   const evidenceTextBefore = evidenceBefore.map((e) => `- ${e.id}: "${e.quote}"`).join('\n');
   const evidenceTextAfter = evidenceAfter.map((e) => `- ${e.id}: "${e.quote}"`).join('\n');
 
-  const prompt = `
+const prompt = `
 Jesteś sędzią zmian na stronie.
+
+CEL:
+Na podstawie USER_PROMPT oceń, czy zmiana między BEFORE i AFTER jest ISTOTNA.
+Używaj WYŁĄCZNIE dowodów (cytatów) poniżej. Nie dopisuj faktów spoza cytatów.
+derivedMetrics traktuj tylko jako pomocniczy hint — jeśli są sprzeczne z cytatami, IGNORUJ je.
 
 USER_PROMPT:
 ${userPrompt}
@@ -421,21 +426,50 @@ ${evidenceTextBefore || '- (brak)'}
 AFTER:
 ${evidenceTextAfter || '- (brak)'}
 
-Pochodne metryki z dowodów (tylko z powyższych cytatów; mogą być null):
+derivedMetrics (hint; mogą być null):
 ${JSON.stringify(derivedMetrics)}
 
-Zasady oceny:
-- Porównuj BEFORE vs AFTER WYŁĄCZNIE na podstawie powyższych cytatów (ich treści).
-- Jeśli cytaty są takie same po obu stronach (może różnić się kolejność lub identyfikatory) -> important=false.
-- Jeśli USER_PROMPT oczekuje zmiany typu "pojawia się / znika / zostaje dodany" -> important=true tylko, gdy w cytatach widać KONKRET.
-- Ignoruj liczby, jeśli USER_PROMPT mówi, aby je ignorować.
+PRIORYTET (BARDZO WAŻNE):
+- Najpierw ustal, jakie ASPEKTY są monitorowane przez USER_PROMPT (np. "nowa recenzja", "zmiana oceny", "cena", "dostępność").
+- Uznaj zmianę za ISTOTNĄ tylko wtedy, gdy dotyczy tych aspektów. Zmiany poza zakresem USER_PROMPT ignoruj.
+
+Zasady oceny (KLUCZOWE):
+1) KOSMETYKA vs SEMANTYKA
+- Zmiana jest KOSMETYCZNA, jeśli dotyczy tylko: literówek, odmiany, interpunkcji, wielkości liter, kolejności słów,
+  skrót vs pełna forma, formatowanie, brak spacji, podwójne znaki, artefakty ekstrakcji/OCR.
+- Same ozdobniki/ikonki (np. ★★★, emoji, separatory) bez zmiany liczb/treści -> KOSMETYCZNE.
+-> wtedy important=false.
+
+2) ISTOTNOŚĆ (tylko zmiana faktu w zakresie USER_PROMPT)
+- Zmiana jest ISTOTNA tylko jeśli potrafisz wskazać zmianę FAKTU/STATUSU jako "BEFORE: X -> AFTER: Y"
+  i dotyczy aspektu z USER_PROMPT.
+- Negacje i odwrócenie sensu ("nie", "brak", "bez", "niedostępny" vs "dostępny") traktuj jako ISTOTNE.
+- Liczby/jednostki (ocena, liczba ocen, liczba recenzji/opinii, cena, %, daty, ilości, godziny) traktuj jako ISTOTNE
+  tylko gdy są w zakresie USER_PROMPT (chyba że USER_PROMPT każe liczby ignorować).
+
+3) SPRZECZNOŚCI / SZUM DOWODÓW
+- Jeśli dowody AFTER (lub BEFORE) są wewnętrznie sprzeczne (np. różne liczby dla tego samego parametru),
+  nie zgaduj. Ustaw category="uncertain_noise" i wybierz important=false, opisując konflikt w reason.
+- Jeśli brakuje dowodów do jednoznacznej oceny -> important=false i evidence_used=[].
+
+HEURYSTYKA:
+- Jeśli różnica to 1–2 wyrazy i NIE zmienia faktu/znaczenia -> important=false.
+- W razie wątpliwości wybierz important=false.
+
+- Jeśli dowody są długimi paragrafami: najpierw znajdź 1–3 zdania, które różnią się między BEFORE i AFTER.
+- Jeśli wykryjesz zmianę ISTOTNĄ, w reason zacytuj dokładnie zmienione zdanie lub jego kluczowy fragment:
+  "BEFORE: <fragment> -> AFTER: <fragment>".
+- Jeśli nie potrafisz wskazać konkretnego zmienionego zdania na podstawie cytatów -> important=false.
+
 
 Zasady zwrotu:
-- Zwróć WYŁĄCZNIE JSON.
+- Zwróć WYŁĄCZNIE JSON (bez markdown).
 - evidence_used MUSI być tablicą stringów wybranych DOKŁADNIE z evidence_pool.
-- Jeśli important=true, evidence_used MUSI zawierać przynajmniej jeden identyfikator.
-- Jeśli istnieją identyfikatory evidence_before#* ORAZ evidence_after#*, to przy important=true evidence_used MUSI zawierać co najmniej jeden dowód z KAŻDEJ strony.
-- Jeśli nie masz wystarczających dowodów -> important=false i evidence_used=[].
+- Jeśli important=true:
+  - evidence_used MUSI zawierać min. 1 ID,
+  - oraz jeśli istnieją evidence_before#* i evidence_after#*, to evidence_used MUSI zawierać min. 1 z BEFORE i 1 z AFTER,
+  - reason MUSI zawierać krótkie "BEFORE: ... -> AFTER: ..." (zmiana faktu w zakresie USER_PROMPT).
+- Jeśli important=false -> evidence_used MUSI być [].
 
 evidence_pool:
 ${JSON.stringify(evidencePool)}
@@ -448,6 +482,7 @@ Zwróć JSON:
   "evidence_used": string[]
 }
 `.trim();
+
 
   const system = 'Jesteś sędzią zmian na stronie. Zwracaj wyłącznie JSON.';
 

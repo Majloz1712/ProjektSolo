@@ -1,14 +1,5 @@
-// background.js
-// FULLPAGE screenshot (scroll + stitch) z poprawkami:
-// - zapisuje REALNE scrollY (actualY) po scrollu
-// - zawsze dobija do maxScrollY
-// - docina canvas do realnie złapanego dołu (maxBottomCss)
-// - wypełnia białe tło (JPEG nie ma alpha -> nie będzie czarnego)
-// - anti-gap: koryguje destY w device px, żeby nie robić dziur przez rounding/DPR
-// + DODATKOWO:
-// - retry+focus gdy captureVisibleTab zwraca null
-// - waitTwoRafs po scrollu (anti “puste/ciemne” klatki)
-// - próba auto-kliknięcia banera cookies (Allegro i podobne)
+// background.js (screenshot-only)
+// Zadanie pluginu: otworzyć URL, zrobić fullpage screenshot (scroll + stitch) i wysłać do backendu.
 
 import { BACKEND_BASE_URL, POLL_INTERVAL_SECONDS, AUTH_TOKEN } from './config.js';
 
@@ -20,84 +11,36 @@ let isPolling = false;
 async function apiFetch(path, options = {}) {
   const url = `${BACKEND_BASE_URL}${path}`;
   const headers = options.headers || {};
-  if (AUTH_TOKEN) {
-    headers.Authorization = AUTH_TOKEN;
-  }
+  if (AUTH_TOKEN) headers.Authorization = AUTH_TOKEN;
   return fetch(url, { ...options, headers });
 }
 
 async function fetchNextPluginTask() {
   try {
     const res = await apiFetch('/api/plugin-tasks/next', { method: 'GET' });
-
     if (res.status === 204) return null;
     if (!res.ok) {
       console.warn('[plugin] fetchNextPluginTask non-OK', res.status);
       return null;
     }
 
-    let data;
-    try {
-      data = await res.json();
-    } catch (e) {
-      console.warn('[plugin] fetchNextPluginTask json parse error', e);
-      return null;
-    }
+    const data = await res.json().catch(() => null);
     if (!data || !data.url || !data.task_id) return null;
 
-    // Normalizacja pól ID (backend/wersje mogą zwracać snake_case albo camelCase)
     const normId = (v) => {
       const s = String(v ?? '').trim();
       return s.length ? s : null;
     };
 
-    const task = {
+    return {
       task_id: normId(data.task_id ?? data.taskId ?? data.id),
       monitor_id: normId(data.monitor_id ?? data.monitorId),
       zadanie_id: normId(data.zadanie_id ?? data.zadanieId),
       url: data.url,
-      mode: data.mode || 'fallback',
     };
-
-    if (!task.task_id || !task.url) return null;
-
-    // Jeżeli te pola są puste, backend i tak zwróci 400 (MISSING_FIELDS) – więc logujmy to wcześnie.
-    if (!task.monitor_id || !task.zadanie_id) {
-      console.warn('[plugin] task missing monitor_id/zadanie_id', {
-        task_id: task.task_id,
-        keys: Object.keys(data || {}),
-        monitor_id: task.monitor_id,
-        zadanie_id: task.zadanie_id,
-      });
-    }
-
-    return task;
-} catch (err) {
+  } catch (err) {
     console.error('[plugin] fetchNextPluginTask error', err);
     return null;
-  }
-}
-
-// ===== DOM extractor do backendu (HTML + tekst) =====
-function extractDomForBackend() {
-  try {
-    const htmlEl = document.documentElement;
-    const body = document.body;
-
-    const html = htmlEl ? htmlEl.outerHTML : null;
-    const text = body ? body.innerText : null;
-
-    return {
-      html,
-      text,
-      finalUrl: window.location.href,
-    };
-  } catch (e) {
-    return {
-      html: null,
-      text: null,
-      finalUrl: window.location.href,
-    };
   }
 }
 
@@ -113,7 +56,7 @@ function waitTwoRafsInPage() {
   });
 }
 
-// W kontekście strony: spróbuj kliknąć cookies
+// W kontekście strony: spróbuj kliknąć cookies (żeby overlay nie zasłaniał treści na screenie)
 function tryAcceptCookies() {
   const targets = [
     'ok, zgadzam się',
@@ -152,17 +95,8 @@ function getPageMetrics() {
   const doc = document.documentElement;
   const body = document.body;
 
-  const totalWidth = Math.max(
-    doc?.scrollWidth || 0,
-    body?.scrollWidth || 0,
-    doc?.clientWidth || 0,
-  );
-
-  const totalHeight = Math.max(
-    doc?.scrollHeight || 0,
-    body?.scrollHeight || 0,
-    doc?.clientHeight || 0,
-  );
+  const totalWidth = Math.max(doc?.scrollWidth || 0, body?.scrollWidth || 0, doc?.clientWidth || 0);
+  const totalHeight = Math.max(doc?.scrollHeight || 0, body?.scrollHeight || 0, doc?.clientHeight || 0);
 
   const viewportWidth = window.innerWidth || doc?.clientWidth || 0;
   const viewportHeight = window.innerHeight || doc?.clientHeight || 0;
@@ -183,7 +117,7 @@ async function scrollToYAndWait(y) {
   const doc = document.documentElement;
   const body = document.body;
 
-  // Wymuś brak smooth scroll (często rozwiązuje "scrollTo nie rusza od razu")
+  // wymuś brak smooth scroll
   const prevDocSB = doc?.style?.scrollBehavior;
   const prevBodySB = body?.style?.scrollBehavior;
   try {
@@ -199,7 +133,7 @@ async function scrollToYAndWait(y) {
     window.scrollTo(0, y);
   }
 
-  // Poczekaj aż scroll się ustabilizuje (lub timeout). Bez tego "actualY" bywa stare.
+  // poczekaj aż scroll się ustabilizuje (lub timeout)
   let lastY = -1;
   let stableFrames = 0;
   const t0 = performance.now();
@@ -217,7 +151,7 @@ async function scrollToYAndWait(y) {
     }
   }
 
-  // Przywróć style
+  // przywróć style
   try {
     if (doc?.style) doc.style.scrollBehavior = prevDocSB ?? '';
     if (body?.style) body.style.scrollBehavior = prevBodySB ?? '';
@@ -225,21 +159,12 @@ async function scrollToYAndWait(y) {
     // ignore
   }
 
-  const totalHeight = Math.max(
-    doc?.scrollHeight || 0,
-    body?.scrollHeight || 0,
-    doc?.clientHeight || 0,
-  );
+  const totalHeight = Math.max(doc?.scrollHeight || 0, body?.scrollHeight || 0, doc?.clientHeight || 0);
   const viewportHeight = window.innerHeight || doc?.clientHeight || 0;
   const maxScrollY = Math.max(0, totalHeight - viewportHeight);
 
-  return {
-    ok: true,
-    y: window.scrollY || 0,
-    maxScrollY,
-  };
+  return { ok: true, y: window.scrollY || 0, maxScrollY };
 }
-
 
 // Wykonuje screenshot aktywnej zakładki w danym oknie.
 function captureVisibleTabDataUrl(windowId, { format = 'jpeg', quality = 90 } = {}) {
@@ -248,10 +173,7 @@ function captureVisibleTabDataUrl(windowId, { format = 'jpeg', quality = 90 } = 
       windowId,
       format === 'jpeg' ? { format: 'jpeg', quality } : { format: 'png' },
       (dataUrl) => {
-        if (chrome.runtime.lastError || !dataUrl) {
-          resolve(null);
-          return;
-        }
+        if (chrome.runtime.lastError || !dataUrl) return resolve(null);
         resolve(dataUrl);
       },
     );
@@ -273,8 +195,7 @@ async function captureVisibleTabDataUrlWithRetry(windowId, tabId, opts) {
   if (shot) return shot;
 
   await sleep(250);
-  shot = await captureVisibleTabDataUrl(windowId, opts);
-  return shot;
+  return await captureVisibleTabDataUrl(windowId, opts);
 }
 
 async function dataUrlToImageBitmap(dataUrl) {
@@ -302,17 +223,13 @@ async function blobToDataUrl(blob) {
 }
 
 /**
- * Full-page screenshot: scroll + captureVisibleTab + stitch na OffscreenCanvas.
- * Poprawki na "czarne tło":
- * - canvas docinany do realnie złapanego dołu (maxBottomCss)
- * - białe tło w canvasie (JPEG)
- * - anti-gap przy destY (clamp do poprzedniej klatki)
- * Dodatkowo:
- * - waitTwoRafs po scrollu (anti “puste/ciemne” klatki)
+ * Full-page screenshot: scroll + captureVisibleTab + stitch (OffscreenCanvas).
+ * - anti “puste/ciemne” klatki (2 RAFy + sleep)
  * - retry+focus gdy captureVisibleTab zwróci null
+ * - białe tło dla JPEG
+ * - docinanie canvas do realnie złapanego dołu
  */
 async function captureFullPageScreenshotDataUrl(windowId, tabId, { format = 'jpeg', quality = 90 } = {}) {
-  // 1) pobierz metryki
   const [mRes] = await chrome.scripting.executeScript({
     target: { tabId },
     func: getPageMetrics,
@@ -323,7 +240,6 @@ async function captureFullPageScreenshotDataUrl(windowId, tabId, { format = 'jpe
     return await captureVisibleTabDataUrlWithRetry(windowId, tabId, { format, quality });
   }
 
-  // limity bezpieczeństwa (żeby nie wywalić pamięci)
   const dpr = Math.max(1, Math.min(3, Number(m.devicePixelRatio) || 1));
   const estW = Math.round(m.viewportWidth * dpr);
   const estH = Math.round(m.totalHeight * dpr);
@@ -331,34 +247,22 @@ async function captureFullPageScreenshotDataUrl(windowId, tabId, { format = 'jpe
 
   const MAX_PIXELS = 35_000_000;
   if (!Number.isFinite(estPixels) || estPixels > MAX_PIXELS) {
-    console.warn('[plugin] fullpage too large, fallback to visible', {
-      estW,
-      estH,
-      estPixels,
-      totalHeight: m.totalHeight,
-      viewportHeight: m.viewportHeight,
-      dpr,
-    });
+    console.warn('[plugin] fullpage too large, fallback to visible', { estW, estH, estPixels });
     return await captureVisibleTabDataUrlWithRetry(windowId, tabId, { format, quality });
   }
 
   const originalY = m.scrollY || 0;
 
-  // 2) listę pozycji scrolla (CSS px)
   const step = Math.max(1, m.viewportHeight);
   const maxScrollY = Math.max(0, m.totalHeight - m.viewportHeight);
 
   const positions = [];
   for (let y = 0; y <= maxScrollY; y += step) {
     positions.push(y);
-    if (positions.length >= 60) break; // limit
+    if (positions.length >= 60) break;
   }
-  // zawsze dobij do końca
-  if (positions.length && positions[positions.length - 1] !== maxScrollY) {
-    positions.push(maxScrollY);
-  }
+  if (positions.length && positions[positions.length - 1] !== maxScrollY) positions.push(maxScrollY);
 
-  // 3) przejedź stronę i zbierz viewporty
   const shots = [];
   let lastActualY = -1;
 
@@ -374,8 +278,6 @@ async function captureFullPageScreenshotDataUrl(windowId, tabId, { format = 'jpe
 
     let actualY = await scrollOnce();
 
-    // Brak postępu -> często oznacza smooth scroll / throttling / brak focusu.
-    // Spróbuj raz z focusem i dopiero potem uznaj, że jesteś na dole.
     if (actualY === lastActualY && shots.length > 0) {
       if (requestedY > lastActualY) {
         await focusAndActivate(windowId, tabId);
@@ -384,11 +286,7 @@ async function captureFullPageScreenshotDataUrl(windowId, tabId, { format = 'jpe
       if (actualY === lastActualY) break;
     }
 
-    // poczekaj aż strona się dorysuje po scrollu
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: waitTwoRafsInPage,
-    });
+    await chrome.scripting.executeScript({ target: { tabId }, func: waitTwoRafsInPage });
     await sleep(550);
 
     const shot = await captureVisibleTabDataUrlWithRetry(windowId, tabId, { format, quality });
@@ -401,7 +299,6 @@ async function captureFullPageScreenshotDataUrl(windowId, tabId, { format = 'jpe
     lastActualY = actualY;
   }
 
-  // 4) przywróć scroll
   await chrome.scripting.executeScript({
     target: { tabId },
     func: scrollToYAndWait,
@@ -412,56 +309,41 @@ async function captureFullPageScreenshotDataUrl(windowId, tabId, { format = 'jpe
     return shots[0]?.dataUrl || (await captureVisibleTabDataUrlWithRetry(windowId, tabId, { format, quality }));
   }
 
-  // 5) stitch
   const firstBitmap = await dataUrlToImageBitmap(shots[0].dataUrl);
   const canvasWidth = firstBitmap.width;
 
-  // REALNY dół na podstawie złapanych klatek
   const maxBottomCss = Math.max(...shots.map((s) => (Number(s.y) || 0) + m.viewportHeight));
   const effectiveCssHeight = Math.min(m.totalHeight, maxBottomCss);
   const canvasHeight = Math.max(1, Math.round(effectiveCssHeight * dpr));
 
   const canvas = new OffscreenCanvas(canvasWidth, canvasHeight);
   const ctx = canvas.getContext('2d');
-
   if (!ctx) {
-    console.warn('[plugin] OffscreenCanvas 2d ctx missing, fallback to visible');
+    console.warn('[plugin] OffscreenCanvas ctx missing, fallback to visible');
     return await captureVisibleTabDataUrlWithRetry(windowId, tabId, { format, quality });
   }
 
-  // JPEG nie ma alpha -> wypełnij tło na biało (usuwa "czarne")
   ctx.fillStyle = '#fff';
   ctx.fillRect(0, 0, canvasWidth, canvasHeight);
 
-  // Anti-gap: pilnujemy, by destY nie zostawiał dziur między kaflami
   let lastDestYDev = 0;
   let lastBitmapH = firstBitmap.height;
 
-  // pierwsza klatka
   ctx.drawImage(firstBitmap, 0, 0);
 
   for (let i = 1; i < shots.length; i++) {
     const bm = await dataUrlToImageBitmap(shots[i].dataUrl);
-
     let destYDev = Math.round((Number(shots[i].y) || 0) * dpr);
 
-    // Jeśli destY wskazuje "za nisko" (powstałaby dziura) -> dociśnij do końca poprzedniej bitmapy
     const expectedMin = lastDestYDev + lastBitmapH;
     if (destYDev > expectedMin) destYDev = expectedMin;
-
-    // Jeśli cofnięcie (rzadkie) -> ignoruj
     if (destYDev < lastDestYDev) continue;
 
-    // Jeśli bitmapa wychodzi poza canvas -> docięcie do dołu
     const remaining = canvasHeight - destYDev;
     if (remaining <= 0) continue;
 
     if (bm.height > remaining) {
-      ctx.drawImage(
-        bm,
-        0, 0, bm.width, remaining,
-        0, destYDev, bm.width, remaining,
-      );
+      ctx.drawImage(bm, 0, 0, bm.width, remaining, 0, destYDev, bm.width, remaining);
       lastDestYDev = destYDev;
       lastBitmapH = remaining;
     } else {
@@ -471,7 +353,6 @@ async function captureFullPageScreenshotDataUrl(windowId, tabId, { format = 'jpe
     }
   }
 
-  // 6) export do dataURL
   let blob;
   if (format === 'png') {
     blob = await canvas.convertToBlob({ type: 'image/png' });
@@ -485,125 +366,17 @@ async function captureFullPageScreenshotDataUrl(windowId, tabId, { format = 'jpe
   return await blobToDataUrl(blob);
 }
 
-// ===== Fallback: screenshot =====
-
-async function sendPluginScreenshotResult({ task_id, monitor_id, zadanie_id, screenshotDataUrl, url }) {
-  try {
-    const base64 = screenshotDataUrl.split(',')[1] || screenshotDataUrl;
-
-    const res = await apiFetch(`/api/plugin-tasks/${encodeURIComponent(task_id)}/result`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        monitor_id,
-        zadanie_id,
-        screenshot_b64: base64,
-        url: url || null,
-      }),
-    });
-
-    if (!res.ok) {
-      console.warn('[plugin] sendPluginScreenshotResult non-OK', res.status);
-    } else {
-      console.log('[plugin] sendPluginScreenshotResult OK');
-    }
-  } catch (err) {
-    console.error('[plugin] sendPluginScreenshotResult error', err);
-  }
-}
-
-async function sendPluginScreenshotOnly({ task_id, monitor_id, zadanie_id, screenshotDataUrl, url }) {
-  try {
-    const base64 = screenshotDataUrl.split(',')[1] || screenshotDataUrl;
-    const res = await apiFetch(`/api/plugin-tasks/${encodeURIComponent(task_id)}/screenshot`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        monitor_id,
-        zadanie_id,
-        screenshot_b64: base64,
-        url: url || null,
-      }),
-    });
-
-    if (!res.ok) {
-      console.warn('[plugin] sendPluginScreenshotOnly non-OK', res.status);
-    } else {
-      console.log('[plugin] sendPluginScreenshotOnly OK');
-    }
-  } catch (err) {
-    console.error('[plugin] sendPluginScreenshotOnly error', err);
-  }
-}
-
-// ===== Fallback: DOM (plus opcjonalny screenshot) =====
-
-async function sendPluginDomResult({
-  task_id,
-  monitor_id,
-  zadanie_id,
-  url,
-  html,
-  text,
-}) {
-  try {
-    const body = {
-      monitor_id,
-      zadanie_id,
-      url: url || null,
-    };
-
-    if (typeof html === 'string') body.html = html;
-    if (typeof text === 'string') body.text = text;
-
-    const res = await apiFetch(
-      `/api/plugin-tasks/${encodeURIComponent(task_id)}/result`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      },
-    );
-
-    if (!res.ok) {
-      console.warn('[plugin] sendPluginDomResult non-OK', res.status);
-    } else {
-      console.log('[plugin] sendPluginDomResult OK');
-    }
-  } catch (err) {
-    console.error('[plugin] sendPluginDomResult error', err);
-  }
-}
-
 async function captureBestEffortScreenshot(windowId, tabId) {
-  const capture = (focused) => new Promise((resolve) => {
-    const doCap = async () => {
-      const shot = await captureVisibleTabDataUrlWithRetry(windowId, tabId, { format: 'jpeg', quality: 90 });
-      resolve(shot);
-    };
-
-    if (focused) {
-      chrome.windows.update(windowId, { focused: true }, () => {
-        chrome.tabs.update(tabId, { active: true }, () => doCap());
-      });
-    } else {
-      chrome.tabs.update(tabId, { active: true }, () => doCap());
-    }
-  });
-
-  let shot = await capture(false);
+  let shot = await captureVisibleTabDataUrlWithRetry(windowId, tabId, { format: 'jpeg', quality: 90 });
   if (shot) return shot;
-  shot = await capture(true);
-  return shot;
+  await focusAndActivate(windowId, tabId);
+  return await captureVisibleTabDataUrlWithRetry(windowId, tabId, { format: 'jpeg', quality: 90 });
 }
 
 async function captureBestEffortFullPageScreenshot(windowId, tabId) {
   const tryCap = async (focused) => {
-    if (focused) {
-      await focusAndActivate(windowId, tabId);
-    } else {
-      await new Promise((r) => chrome.tabs.update(tabId, { active: true }, () => r()));
-    }
+    if (focused) await focusAndActivate(windowId, tabId);
+    else await new Promise((r) => chrome.tabs.update(tabId, { active: true }, () => r()));
 
     try {
       return await captureFullPageScreenshotDataUrl(windowId, tabId, { format: 'jpeg', quality: 90 });
@@ -622,208 +395,41 @@ async function captureBestEffortFullPageScreenshot(windowId, tabId) {
   return await captureBestEffortScreenshot(windowId, tabId);
 }
 
-function openWindowForTask(task) {
-  return new Promise((resolve, reject) => {
-    chrome.windows.create(
-      {
-        url: task.url,
-        state: 'normal',
-        focused: false,
-      },
-      (win) => {
-        if (chrome.runtime.lastError || !win || !win.tabs || !win.tabs.length) {
-          console.error('[plugin] windows.create error', chrome.runtime.lastError);
-          reject(chrome.runtime.lastError || new Error('windows.create failed'));
-        } else {
-          const tab = win.tabs[0];
-          resolve({ windowId: win.id, tabId: tab.id });
-        }
-      },
-    );
-  });
-}
-
-function waitForLoadAndScreenshot(windowId, tabId, task) {
-  return new Promise((resolve) => {
-    const listener = (updatedTabId, changeInfo, tab) => {
-      if (updatedTabId === tabId && changeInfo.status === 'complete') {
-        chrome.tabs.onUpdated.removeListener(listener);
-
-        setTimeout(async () => {
-          try {
-            const [result] = await chrome.scripting.executeScript({
-              target: { tabId },
-              func: extractDomForBackend,
-            });
-
-            const payload = (result && result.result) || {};
-            const html = payload?.html || null;
-            const text = payload?.text || null;
-            const finalUrl = payload?.finalUrl || tab.url;
-
-            if (html || text) {
-              console.log('[plugin] DOM extracted, sending to backend (DOM only)...');
-
-              await sendPluginDomResult({
-                task_id: task.task_id,
-                monitor_id: task.monitor_id,
-                zadanie_id: task.zadanie_id,
-                url: finalUrl,
-                html,
-                text,
-              });
-
-              chrome.windows.remove(windowId, () => {
-                if (chrome.runtime.lastError) {
-                  console.warn('[plugin] windows.remove error', chrome.runtime.lastError);
-                }
-              });
-
-              resolve(true);
-              return;
-            }
-
-            console.warn('[plugin] DOM empty/undefined – robimy FULLPAGE screenshot jako fallback...');
-
-            // spróbuj kliknąć cookies zanim zaczniemy stitchować
-            await chrome.scripting.executeScript({
-              target: { tabId },
-              func: tryAcceptCookies,
-            });
-            await sleep(500);
-
-            const dataUrl = await captureBestEffortFullPageScreenshot(windowId, tabId);
-            if (!dataUrl) {
-              console.warn('[plugin] fullpage screenshot fallback: capture failed');
-              resolve(false);
-              return;
-            }
-
-            await sendPluginScreenshotOnly({
-              task_id: task.task_id,
-              monitor_id: task.monitor_id,
-              zadanie_id: task.zadanie_id,
-              screenshotDataUrl: dataUrl,
-              url: finalUrl,
-            });
-
-            chrome.windows.remove(windowId, () => {
-              if (chrome.runtime.lastError) {
-                console.warn('[plugin] windows.remove error', chrome.runtime.lastError);
-              }
-            });
-
-            resolve(true);
-          } catch (err) {
-            console.error('[plugin] waitForLoadAndScreenshot error', err);
-            resolve(false);
-          }
-        }, 3000);
-      }
-    };
-
-    chrome.tabs.onUpdated.addListener(listener);
-  });
-}
-
-// ===== Price only: wyciąganie cen z DOM =====
-
-async function sendPluginPriceResult({
-  task_id,
-  monitor_id,
-  zadanie_id,
-  url,
-  prices,
-}) {
+async function sendPluginScreenshotOnly({ task_id, monitor_id, zadanie_id, screenshotDataUrl, url }) {
   try {
-    const body = {
-      monitor_id: monitor_id,
-      zadanie_id: zadanie_id,
-      url: url || null,
-      prices,
-    };
+    const base64 = screenshotDataUrl.split(',')[1] || screenshotDataUrl;
 
-    const res = await apiFetch(`/api/plugin-tasks/${encodeURIComponent(task_id)}/price`, {
+    const res = await apiFetch(`/api/plugin-tasks/${encodeURIComponent(task_id)}/screenshot`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        monitor_id,
+        zadanie_id,
+        screenshot_b64: base64,
+        url: url || null,
+      }),
     });
 
-    if (!res.ok) {
-      console.warn('[plugin] sendPluginPriceResult non-OK', res.status);
-    } else {
-      console.log('[plugin] sendPluginPriceResult OK');
-    }
+    if (!res.ok) console.warn('[plugin] sendPluginScreenshotOnly non-OK', res.status);
+    else console.log('[plugin] sendPluginScreenshotOnly OK');
   } catch (err) {
-    console.error('[plugin] sendPluginPriceResult error', err);
+    console.error('[plugin] sendPluginScreenshotOnly error', err);
   }
 }
 
-function extractPricesFromDom() {
-  const currencyRegex = /(zł|pln|eur|€|usd|\$)/i;
-  const digitRegex = /\d/;
-
-  const candidates = [];
-  const elements = Array.from(document.querySelectorAll('body *'));
-
-  for (const el of elements) {
-    const text = (el.innerText || el.textContent || '').trim();
-    if (!text) continue;
-    if (!currencyRegex.test(text)) continue;
-    if (!digitRegex.test(text)) continue;
-    if (text.length > 100) continue;
-
-    candidates.push(text.replace(/\s+/g, ' ').trim());
-  }
-
-  const unique = Array.from(new Set(candidates));
-  return unique.slice(0, 50);
-}
-
-function waitForLoadAndExtractPrices(windowId, tabId, task) {
-  return new Promise((resolve) => {
-    const listener = (updatedTabId, changeInfo, tab) => {
-      if (updatedTabId === tabId && changeInfo.status === 'complete') {
-        chrome.tabs.onUpdated.removeListener(listener);
-
-        setTimeout(async () => {
-          try {
-            const [result] = await chrome.scripting.executeScript({
-              target: { tabId },
-              func: extractPricesFromDom,
-            });
-
-            const prices = (result && result.result) || [];
-            console.log('[plugin] extracted prices:', prices);
-
-            await sendPluginPriceResult({
-              task_id: task.task_id,
-              monitor_id: task.monitor_id,
-              zadanie_id: task.zadanie_id,
-              url: tab.url,
-              prices,
-            });
-
-            chrome.windows.remove(windowId, () => {
-              if (chrome.runtime.lastError) {
-                console.warn('[plugin] windows.remove error', chrome.runtime.lastError);
-              }
-            });
-
-            resolve(true);
-          } catch (err) {
-            console.error('[plugin] waitForLoadAndExtractPrices error', err);
-            resolve(false);
-          }
-        }, 3000);
+function openWindowForTask(task) {
+  return new Promise((resolve, reject) => {
+    chrome.windows.create({ url: task.url, state: 'normal', focused: false }, (win) => {
+      if (chrome.runtime.lastError || !win || !win.tabs || !win.tabs.length) {
+        reject(chrome.runtime.lastError || new Error('windows.create failed'));
+      } else {
+        const tab = win.tabs[0];
+        resolve({ windowId: win.id, tabId: tab.id });
       }
-    };
-
-    chrome.tabs.onUpdated.addListener(listener);
+    });
   });
 }
 
-// ===== Dispatcher: wybór trybu =====
 function waitForLoadAndSendScreenshot(windowId, tabId, task) {
   return new Promise((resolve) => {
     const listener = (updatedTabId, changeInfo, tab) => {
@@ -832,18 +438,13 @@ function waitForLoadAndSendScreenshot(windowId, tabId, task) {
 
         setTimeout(async () => {
           try {
-            // spróbuj kliknąć cookies zanim zaczniemy stitchować
-            await chrome.scripting.executeScript({
-              target: { tabId },
-              func: tryAcceptCookies,
-            });
+            await chrome.scripting.executeScript({ target: { tabId }, func: tryAcceptCookies });
             await sleep(500);
 
             const screenshotDataUrl = await captureBestEffortFullPageScreenshot(windowId, tabId);
             if (!screenshotDataUrl) {
-              console.warn('[plugin] screenshot_only: capture failed');
-              resolve(false);
-              return;
+              console.warn('[plugin] screenshot: capture failed');
+              return resolve(false);
             }
 
             await sendPluginScreenshotOnly({
@@ -855,9 +456,7 @@ function waitForLoadAndSendScreenshot(windowId, tabId, task) {
             });
 
             chrome.windows.remove(windowId, () => {
-              if (chrome.runtime.lastError) {
-                console.warn('[plugin] windows.remove error', chrome.runtime.lastError);
-              }
+              if (chrome.runtime.lastError) console.warn('[plugin] windows.remove error', chrome.runtime.lastError);
             });
 
             resolve(true);
@@ -876,30 +475,16 @@ function waitForLoadAndSendScreenshot(windowId, tabId, task) {
 async function processTask(task) {
   console.log('[plugin] got task', task);
   const startTime = performance.now();
-  console.log('[plugin] task_started', { task_id: task.task_id, monitor_id: task.monitor_id, zadanie_id: task.zadanie_id, started_at: new Date().toISOString() });
 
   try {
     const { windowId, tabId } = await openWindowForTask(task);
-
-    if (task.mode === 'price_only') {
-      const ok = await waitForLoadAndExtractPrices(windowId, tabId, task);
-      console.log('[plugin] price_only task done ok=', ok);
-    } else if (task.mode === 'screenshot' || task.mode === 'plugin_screenshot') {
-      const ok = await waitForLoadAndSendScreenshot(windowId, tabId, task);
-      console.log('[plugin] screenshot task done ok=', ok);
-    } else {
-      const ok = await waitForLoadAndScreenshot(windowId, tabId, task);
-      console.log('[plugin] fallback task done ok=', ok);
-    }
+    const ok = await waitForLoadAndSendScreenshot(windowId, tabId, task);
+    console.log('[plugin] screenshot task done ok=', ok);
   } catch (err) {
     console.error('[plugin] processTask error', err);
   } finally {
     const durationMs = Math.round(performance.now() - startTime);
-    console.log('[plugin] task_finished', {
-      task_id: task.task_id,
-      duration_ms: durationMs,
-      finished_at: new Date().toISOString(),
-    });
+    console.log('[plugin] task_finished', { task_id: task.task_id, duration_ms: durationMs });
   }
 }
 
@@ -907,6 +492,7 @@ function drainQueue() {
   while (inFlightCount < MAX_CONCURRENT_TASKS && taskQueue.length > 0) {
     const nextTask = taskQueue.shift();
     if (!nextTask) continue;
+
     inFlightCount += 1;
     processTask(nextTask)
       .catch((err) => console.error('[plugin] task error', err))
@@ -937,11 +523,8 @@ async function pollForTasks() {
   }
 }
 
-// alarm – automatyczne pytanie o zadania
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.alarms.create('pollPluginTasks', {
-    periodInMinutes: POLL_INTERVAL_SECONDS / 60,
-  });
+  chrome.alarms.create('pollPluginTasks', { periodInMinutes: POLL_INTERVAL_SECONDS / 60 });
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -950,7 +533,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
-// klik w ikonę – ręczne odpalenie (debug)
 chrome.action.onClicked.addListener(() => {
   pollForTasks().catch((err) => console.error('[plugin] pollForTasks click error', err));
 });
+
